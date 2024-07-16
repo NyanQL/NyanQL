@@ -1,0 +1,26 @@
+{
+  "name": "にゃんくる",
+  "profile": "サンプル用のにゃんくるです。スタンプカードのためのAPIです。",
+  "version": "0.0.1",
+  "Port": 8443,
+  "BasicAuth": {
+    "Username": "neko",
+    "Password": "nyan"
+  },
+  "certPath": "./ssl/localhost.crt",
+  "keyPath": "./ssl/localhost.key",
+  "DBType": "sqlite",
+  "DBUser": "",
+  "DBPassword": "",
+  "DBName": "./stamps.db",
+  "DBHost": "",
+  "DBPort": "",
+  "log": {
+    "Filename": "./logs/nyanql.log",
+    "MaxSize": 5,
+    "MaxBackups": 3,
+    "MaxAge": 7,
+    "Compress": true,
+    "EnableLogging": false
+  }
+}
