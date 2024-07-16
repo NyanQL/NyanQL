@@ -1,0 +1,1 @@
+INSERT INTO stamps (date) VALUES (DATE('now'));

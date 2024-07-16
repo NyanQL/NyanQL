@@ -1,0 +1,18 @@
+{
+  "list": {
+    "sql": ["./sql/sqlite/list.sql"],
+    "description": "当月の一覧を表示します。"
+  },
+  "check": {
+    "sql": ["./sql/sqlite/checkToday.sql"],
+    "description": "本日の登録があるか確認します。"
+  },
+  "stamp":{
+    "sql": ["./sql/sqlite/insert_stamp.sql"],
+    "description": "本日のスタンプを記録します。"
+  },
+  "target_month_list": {
+    "sql": ["./sql/sqlite/target_month_list.sql"],
+    "description": "年と月を指定し、一覧を表示します。"
+  }
+}
