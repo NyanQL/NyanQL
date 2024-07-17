@@ -14,7 +14,7 @@ NyanQLには、JavaScriptを実行してJSONを生成するNyan8（にゃんぱ�
 * PostgreSQL
 * SQLite
 
-## 設定ファイル
+## 設定ファイル config.json
 
 config.jsonにNyanQLの設定を記述します。各項目の説明は下記の通りです。SSL証明書を利用しない場合は、対応する項目を空白にしてください。
 
@@ -67,28 +67,10 @@ api.jsonは、APIエンドポイントごとに実行するSQLファイルを定
 NyanQLは、複数のSQLファイルを登録してAPIとして利用できます。各APIごとにSQLファイルを指定し、その説明を記述します。
 複数のSQLファイルを登録した場合、トランザクションが実行され、最後に実行されたSQLファイルの結果がJSONで返されます。
 
-### api.json サンプル
+### api.json について
 
 ```json
 {
-  "list": {
-    "sql": [
-      "sql/list.sql"
-    ],
-    "description": "リストを取得するAPI"
-  },
-  "check": {
-    "sql": [
-      "sql/check.sql"
-    ],
-    "description": "チェックするAPI"
-  },
-  "stamp": {
-    "sql": [
-      "sql/stamp.sql"
-    ],
-    "description": "スタンプを登録するAPI"
-  },
   "target_month_list": {
     "sql": [
       "sql/target_month_list.sql"
@@ -134,7 +116,7 @@ https://localhost:8443/?sql=target_month_list&year=2024&month=7
 * https://localhost:8443/?sql=stamp
 * https://localhost:8443/?sql=target_month_list&year=2024&month=7
 
-## DBによるcreate table文
+## DB別 create table 
 
 ### MySQL
 
@@ -159,7 +141,7 @@ CREATE TABLE stamps
 );
 ```
 
-S### QLite
+### SQLite
 
 ```sql
 CREATE TABLE stamps
