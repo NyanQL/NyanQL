@@ -18,7 +18,7 @@ NyanQLには、JavaScriptを実行してJSONを生成するNyan8（にゃんぱ�
 
 config.jsonにNyanQLの設定を記述します。各項目の説明は下記の通りです。SSL証明書を利用しない場合は、対応する項目を空白にしてください。
 
-### config.json サンプル
+### config.json について
 
 ```json
 {
@@ -59,19 +59,6 @@ config.jsonで指定するログ設定の詳細は以下の通りです。
 * MaxAge: ログファイルを保持する最大日数（日単位）。例: 7（7日間のログファイルを保持し、それを超えると削除）
 * Compress: 古いログファイルを圧縮するかどうか。trueに設定すると、古いログファイルがgzip形式で圧縮されます。例: true
 * EnableLogging: ログの出力を有効にするかどうか。falseに設定すると、ログは標準出力（コンソール）に出力されます。例: false
-
-#### 設定例
-
-```
-"log": {
-  "Filename": "./logs/nyanql.log",
-  "MaxSize": 5, // ログファイルの最大サイズを5MBに設定
-  "MaxBackups": 3, // 最新の3つのログファイルを保持
-  "MaxAge": 7, // 7日間ログファイルを保持
-  "Compress": true, // 古いログファイルをgzip形式で圧縮
-  "EnableLogging": true // ログの出力を有効にする
-}
-```
 
 ## API設定ファイル: api.json
 
