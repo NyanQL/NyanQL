@@ -75,7 +75,7 @@ logの設定について
 }
 ```
 SSL証明書を利用する場合はhttpsで、使用しない場合はhttpのURLでアクセスください。
-https://localhost:8443/?sql=APIの名前を記載してアクセスするとqueryが実行された結果がjsonで表示されます。
+https://localhost:8443/?api=APIの名前を記載してアクセスするとqueryが実行された結果がjsonで表示されます。
 またパラメータでSQLを動的にすることが可能です。
 
 # サンプルについて
@@ -84,10 +84,10 @@ https://localhost:8443/?sql=APIの名前を記載してアクセスするとquer
 * 以下にそれぞれのDB用のcreate table文を用意しました。
 * sqlファイルのパスはapi.jsonで確認することができます。
 
-* https://localhost:8443/?sql=list
-* https://localhost:8443/?sql=check
-*  https://localhost:8443/?sql=stamp
-* https://localhost:8443/?sql=target_month_list&year=2024&month=7
+* https://localhost:8443/?api=list
+* https://localhost:8443/?api=check
+*  https://localhost:8443/?api=stamp
+* https://localhost:8443/?api=target_month_list&year=2024&month=7
 
 
 ## MySQL
