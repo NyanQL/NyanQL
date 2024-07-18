@@ -67,10 +67,12 @@ var sqlFiles map[string]APIConfig
 var dbType string
 
 func main() {
-	execDir, err := os.Getwd() // 現在の作業ディレクトリを取得
+	// 現在の作業ディレクトリを取得
+	execDir, err := os.Executable()
 	if err != nil {
-		log.Fatalf("Failed to get current working directory: %v", err)
+		log.Fatalf("Failed to get executable path: %v", err)
 	}
+	execDir = filepath.Dir(execDir) // 実行ファイルのディレクトリを取得
 
 	configFilePath := filepath.Join(execDir, "config.json")
 	configFile, err := os.Open(configFilePath)
@@ -118,6 +120,38 @@ func main() {
 	} else {
 		log.Printf("Server starting on HTTP port %d\n", config.Port)
 		log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", config.Port), nil))
+	}
+}
+
+func adjustPaths(execDir string, config *Config) {
+	if config.CertPath != "" && !filepath.IsAbs(config.CertPath) {
+		config.CertPath = filepath.Join(execDir, config.CertPath)
+	}
+	if config.KeyPath != "" && !filepath.IsAbs(config.KeyPath) {
+		config.KeyPath = filepath.Join(execDir, config.KeyPath)
+	}
+	if config.DatabaseType == "sqlite" && config.DBName != "" && !filepath.IsAbs(config.DBName) {
+		config.DBName = filepath.Join(execDir, config.DBName)
+	}
+}
+
+func loadSQLFiles(execDir string) {
+	apiFilePath := filepath.Join(execDir, "api.json")
+	data, err := ioutil.ReadFile(apiFilePath)
+	if err != nil {
+		log.Fatalf("Failed to read SQL files config: %v", err)
+	}
+	if err := json.Unmarshal(data, &sqlFiles); err != nil {
+		log.Fatalf("Failed to decode SQL files JSON: %v", err)
+	}
+
+	// Update SQL file paths to be absolute if they are relative
+	for apiKey, apiConfig := range sqlFiles {
+		for i, sqlPath := range apiConfig.SQL {
+			if !filepath.IsAbs(sqlPath) {
+				sqlFiles[apiKey].SQL[i] = filepath.Join(execDir, sqlPath)
+			}
+		}
 	}
 }
 
@@ -352,38 +386,6 @@ func RowsToJSON(rows *sql.Rows) ([]byte, error) {
 		results = append(results, entry)
 	}
 	return json.Marshal(results)
-}
-
-func loadSQLFiles(execDir string) {
-	apiFilePath := filepath.Join(execDir, "api.json")
-	data, err := ioutil.ReadFile(apiFilePath)
-	if err != nil {
-		log.Fatalf("Failed to read SQL files config: %v", err)
-	}
-	if err := json.Unmarshal(data, &sqlFiles); err != nil {
-		log.Fatalf("Failed to decode SQL files JSON: %v", err)
-	}
-
-	// Update SQL file paths to be absolute if they are relative
-	for apiKey, apiConfig := range sqlFiles {
-		for i, sqlPath := range apiConfig.SQL {
-			if !filepath.IsAbs(sqlPath) {
-				sqlFiles[apiKey].SQL[i] = filepath.Join(execDir, sqlPath)
-			}
-		}
-	}
-}
-
-func adjustPaths(execDir string, config *Config) {
-	if config.CertPath != "" && !filepath.IsAbs(config.CertPath) {
-		config.CertPath = filepath.Join(execDir, config.CertPath)
-	}
-	if config.KeyPath != "" && !filepath.IsAbs(config.KeyPath) {
-		config.KeyPath = filepath.Join(execDir, config.KeyPath)
-	}
-	if config.DatabaseType == "sqlite" && config.DBName != "" && !filepath.IsAbs(config.DBName) {
-		config.DBName = filepath.Join(execDir, config.DBName)
-	}
 }
 
 func basicAuth(next http.HandlerFunc, config Config) http.HandlerFunc {
