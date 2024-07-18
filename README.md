@@ -94,15 +94,15 @@ NyanQLは、複数のSQLファイルを登録してAPIとして利用できま�
 * sql: 実行するSQLファイルのパスを配列で指定します。複数のSQLファイルを指定することで、順次実行されます。
 * description: このAPIの説明。APIの目的や機能について簡潔に記述します。
 
-SSL証明書を利用する場合はhttps://localhost:8443/?sql=APIの名前、
-使用しない場合はhttp://localhost:8080/?sql=APIの名前
+SSL証明書を利用する場合はhttps://localhost:8443/?api=APIの名前、
+使用しない場合はhttp://localhost:8080/?api=APIの名前
 でアクセスすると、クエリが実行された結果がJSONで返されます。
 
 また、パラメータをURLに含めることで、SQLクエリを動的に制御することが可能です。
 
 ### 例:
 
-https://localhost:8443/?sql=target_month_list&year=2024&month=7
+https://localhost:8443/?api=target_month_list&year=2024&month=7
 このURLは、target_month_listというAPIを実行し、年が2024年、月が7月のリストを取得します。
 
 ## サンプル
@@ -111,10 +111,10 @@ https://localhost:8443/?sql=target_month_list&year=2024&month=7
 
 同梱しているapi.jsonとconfig.jsonが指定しているURLは次の通りです。
 
-* https://localhost:8443/?sql=list
-* https://localhost:8443/?sql=check
-* https://localhost:8443/?sql=stamp
-* https://localhost:8443/?sql=target_month_list&year=2024&month=7
+* https://localhost:8443/?api=list
+* https://localhost:8443/?api=check
+* https://localhost:8443/?api=stamp
+* https://localhost:8443/?api=target_month_list&year=2024&month=7
 
 ## DB別 create table 
 
