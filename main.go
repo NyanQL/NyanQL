@@ -189,6 +189,7 @@ func connectDB(config Config) (*sql.DB, error) {
 	return sql.Open(driverName, dsn)
 }
 
+// リクエストの処理
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/favicon.ico" {
 		http.NotFound(w, r)
@@ -220,6 +221,18 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		for key, values := range r.Form {
 			if len(values) > 0 {
 				params[key] = values[0]
+			}
+		}
+	}
+
+	// URLパスが "/" 以外の場合、apiパラメータとして扱う
+	if r.URL.Path != "/" {
+		// 先頭の "/" を除去して api 名を取得
+		apiName := strings.TrimPrefix(r.URL.Path, "/")
+		if apiName != "" {
+			// すでに "api" が指定されていなければ、URLパスの値を設定
+			if _, exists := params["api"]; !exists {
+				params["api"] = apiName
 			}
 		}
 	}
