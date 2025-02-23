@@ -325,31 +325,51 @@ func isSelectQuery(query string) bool {
 	return strings.HasPrefix(strings.TrimSpace(strings.ToUpper(query)), "SELECT")
 }
 
+// SQLのパラメータ適用
 func prepareQueryWithParams(query string, params map[string]interface{}) (string, []interface{}) {
-	pattern := regexp.MustCompile(`\/\*(.*?)\*\/\s*('([^']*)'|"([^"]*)"|(\S+))`)
-	matches := pattern.FindAllStringSubmatch(query, -1)
+	// 改善版の正規表現:
+	// ・コメント内からパラメータ名（任意の文字列）を抽出
+	// ・続く値は、単一引用符または二重引用符で囲まれているか、
+	//   またはスペースとカンマ以外の文字列として扱う
+	re := regexp.MustCompile(`\/\*([^*]+)\*\/\s*(?:'([^']*)'|"([^"]*)"|([^\s,]+))`)
 
-	args := make([]interface{}, len(matches))
-	placeholderIndex := 1
-	for i, match := range matches {
-		paramName := match[1]
-		value, exists := params[paramName]
-		if !exists {
+	// 同じパラメータ名ごとに一度だけ引数に登録するためのマッピング
+	mapping := make(map[string]string)
+	args := []interface{}{}
+	placeholderCounter := 1
+
+	// 正規表現でマッチした部分を置換する
+	replacedQuery := re.ReplaceAllStringFunc(query, func(match string) string {
+		// グループ: [全体, param名, 値(シングル), 値(ダブル), 値(非引用)]
+		groups := re.FindStringSubmatch(match)
+		paramName := strings.TrimSpace(groups[1])
+
+		// 既に同じパラメータが置換済みの場合は、そのプレースホルダーを返す
+		if placeholder, exists := mapping[paramName]; exists {
+			return placeholder
+		}
+
+		// 初回の場合は引数リストに追加
+		value, ok := params[paramName]
+		if !ok {
 			log.Printf("Parameter %s not found in provided parameters", paramName)
 			value = nil
 		}
-		args[i] = value
+		args = append(args, value)
 
+		var placeholder string
 		if dbType == "postgres" {
-			placeholder := fmt.Sprintf("$%d", placeholderIndex)
-			query = strings.Replace(query, match[0], placeholder, 1)
-			placeholderIndex++
+			placeholder = fmt.Sprintf("$%d", placeholderCounter)
 		} else {
-			query = strings.Replace(query, match[0], "?", 1)
+			placeholder = "?"
 		}
-	}
-	log.Print(query)
-	return query, args
+		mapping[paramName] = placeholder
+		placeholderCounter++
+		return placeholder
+	})
+
+	log.Print(replacedQuery)
+	return replacedQuery, args
 }
 
 func RowsToJSON(rows *sql.Rows) ([]byte, error) {
