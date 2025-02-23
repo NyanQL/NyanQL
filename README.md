@@ -162,6 +162,9 @@ CREATE TABLE stamps
 * Mac環境 NyanQL_Mac
 * Linux環境 NyanQL_Linux_amd64
 
+# このAPIサーバの情報を取得する場合
+http(s)://<hostname>:<port>/nyan にアクセスすると、このAPIサーバの情報を取得することができます。
+
 # 予約語について
 
 apiとnyanから始まるものは予約語となります。
