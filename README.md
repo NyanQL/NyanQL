@@ -156,7 +156,6 @@ CREATE TABLE stamps
 
 各環境用にビルド済みバイナリファイルを同梱しています。
 クリックまたはターミナルから起動して実行できます。
-環境別の配布用のバイナリはzip.shを実行して作成します。
 
 * Windows環境 NyanQL_Windows.exe
 * Mac環境 NyanQL_Mac
