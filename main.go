@@ -109,6 +109,11 @@ func main() {
 		AllowedHeaders: []string{"Content-Type", "Authorization"},
 	})
 
+	// /nyan エンドポイントの登録（Basic Auth も適用）
+	http.Handle("/nyan", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		basicAuth(handleNyan, config)(w, r)
+	})))
+
 	// Wrap handler with CORS and basic auth
 	http.Handle("/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		basicAuth(handleRequest, config)(w, r)
@@ -441,4 +446,30 @@ func sendJSONError(w http.ResponseWriter, message string, statusCode int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(ErrorResponse{Error: message})
+}
+
+// /nyan 用のハンドラー
+// NyanResponse は JSON レスポンスの順序を保証するための構造体です。
+type NyanResponse struct {
+	Name    string               `json:"name"`
+	Profile string               `json:"profile"`
+	Version string               `json:"version"`
+	Apis    map[string]APIConfig `json:"apis"`
+}
+
+func handleNyan(w http.ResponseWriter, r *http.Request) {
+	// config.jsonから必要な情報を抽出
+	response := NyanResponse{
+		Name:    config.Name,
+		Profile: config.Profile,
+		Version: config.Version,
+		Apis:    sqlFiles, // sqlFiles は api.json の内容が格納されている変数
+	}
+
+	// JSON として出力（構造体を利用することで、フィールドの順序が保証される）
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Failed to encode JSON: %v", err)
+		sendJSONError(w, "Internal server error", http.StatusInternalServerError)
+	}
 }
