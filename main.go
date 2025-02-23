@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -65,6 +66,13 @@ var config Config
 var db *sql.DB
 var sqlFiles map[string]APIConfig
 var dbType string
+var reParams = regexp.MustCompile(`(?s)\/\*\s*([^*\/]+)\s*\*\/\s*(?:'([^']*)'|([^\s,;]+))`)
+
+type DetailResponse struct {
+	API                string                 `json:"api"`
+	Description        string                 `json:"description"`
+	NyanAcceptedParams map[string]interface{} `json:"nyanAcceptedParams"`
+}
 
 func main() {
 	// 現在の作業ディレクトリを取得
@@ -110,8 +118,9 @@ func main() {
 	})
 
 	// /nyan エンドポイントの登録（Basic Auth も適用）
-	http.Handle("/nyan", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		basicAuth(handleNyan, config)(w, r)
+	http.Handle("/nyan/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Basic Auth はまとめて掛けたい場合、ここでラップ
+		basicAuth(handleNyanOrDetail, config)(w, r)
 	})))
 
 	// Wrap handler with CORS and basic auth
@@ -472,4 +481,191 @@ func handleNyan(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to encode JSON: %v", err)
 		sendJSONError(w, "Internal server error", http.StatusInternalServerError)
 	}
+}
+
+// nyanとdetailの切り分け
+func handleNyanOrDetail(w http.ResponseWriter, r *http.Request) {
+	// 先頭の "/nyan" を除去し、残りのサブパスを判定する
+	subPath := strings.TrimPrefix(r.URL.Path, "/nyan")
+
+	// /nyan のみ (実際には /nyan にアクセスすると net/http が /nyan/ にリダイレクトする場合が多い)
+	// /nyan/ でアクセスされた場合、subPath は "/" になる
+	if subPath == "" || subPath == "/" {
+		// => /nyan/ の場合は既存の機能 (handleNyan)
+		handleNyan(w, r)
+	} else {
+		// => /nyan/以降に何か続いている場合 (/nyan/apiName)
+		handleNyanDetail(w, r)
+	}
+}
+
+// /nyan/{API名} の詳細を返すハンドラー
+// /nyan/{API名} の詳細を返すハンドラー
+func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
+	type detailResponse struct {
+		API                string                 `json:"api"`
+		Description        string                 `json:"description"`
+		NyanAcceptedParams map[string]interface{} `json:"nyanAcceptedParams"`
+		// ← ここを追加
+		NyanOutputColumns []string `json:"nyanOutputColumns,omitempty"`
+	}
+
+	apiName := strings.TrimPrefix(r.URL.Path, "/nyan/")
+	if apiName == "" {
+		sendJSONError(w, "API name is required", http.StatusBadRequest)
+		return
+	}
+
+	apiConfig, exists := sqlFiles[apiName]
+	if !exists {
+		sendJSONError(w, "API not found", http.StatusNotFound)
+		return
+	}
+
+	// 1) パラメータを解析
+	paramsMap, err := parseSQLParams(apiConfig.SQL)
+	if err != nil {
+		log.Printf("Failed to parse SQL comments: %v", err)
+		sendJSONError(w, "Failed to parse SQL comments", http.StatusInternalServerError)
+		return
+	}
+
+	// 2) 最後のSQLファイルがあればSELECTカラムを解析
+	var outputCols []string
+	if len(apiConfig.SQL) > 0 {
+		lastFile := apiConfig.SQL[len(apiConfig.SQL)-1]
+		cols, err := parseSelectColumns(lastFile)
+		if err != nil {
+			log.Printf("Failed to parse columns from last SQL file: %v", err)
+		} else {
+			outputCols = cols
+		}
+	}
+
+	// 3) レスポンスを作成
+	resp := detailResponse{
+		API:                apiName,
+		Description:        apiConfig.Description,
+		NyanAcceptedParams: paramsMap,
+		NyanOutputColumns:  outputCols,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("Failed to encode JSON: %v", err)
+		sendJSONError(w, "Internal server error", http.StatusInternalServerError)
+	}
+}
+
+// SQLのパース
+func parseSQLParams(filePaths []string) (map[string]interface{}, error) {
+	result := make(map[string]interface{})
+	for _, filePath := range filePaths {
+		data, err := ioutil.ReadFile(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read file %s: %v", filePath, err)
+		}
+		content := string(data)
+
+		// コメント + デフォルト値を全て取得
+		matches := reParams.FindAllStringSubmatch(content, -1)
+		for _, m := range matches {
+			// m[1] = paramName
+			// m[2] = '...' (シングルクオート文字列) の中身
+			// m[3] = クオートなし
+			paramName := strings.TrimSpace(m[1])
+
+			var rawValue string
+			if m[2] != "" {
+				// シングルクオートの中身を使用する
+				rawValue = m[2]
+			} else {
+				// クオートなしの値
+				rawValue = m[3]
+			}
+
+			// 既に同じparamNameがあった場合は上書き or スキップ 等、要件に合わせて調整
+			result[paramName] = convertToNumberIfPossible(rawValue)
+		}
+	}
+	return result, nil
+}
+
+// convertToNumberIfPossible は、文字列が数値なら int/float64 に、
+// それ以外は string として返します。
+func convertToNumberIfPossible(s string) interface{} {
+	if isInteger(s) {
+		if i, err := strconv.Atoi(s); err == nil {
+			return i
+		}
+	}
+	if isFloat(s) {
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f
+		}
+	}
+	return s // 数字でなければ文字列として扱う
+}
+
+func isInteger(s string) bool {
+	// 先頭に + - がついた整数をざっくり判定
+	return regexp.MustCompile(`^[+-]?\d+$`).MatchString(s)
+}
+
+func isFloat(s string) bool {
+	// 小数点を含む数値をざっくり判定 (指数部や厳密な形式は非考慮)
+	return regexp.MustCompile(`^[+-]?\d+(\.\d+)?$`).MatchString(s)
+}
+
+// parseSelectColumns は、指定したファイルを読み込み
+// 例: "SELECT count(id) AS today_count, name FROM stamps" のような文から
+// ["today_count", "name"] を取り出す簡易実装です。
+func parseSelectColumns(filePath string) ([]string, error) {
+	data, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file %s: %v", filePath, err)
+	}
+	content := string(data)
+
+	upper := strings.ToUpper(content)
+	selectIdx := strings.Index(upper, "SELECT")
+	if selectIdx == -1 {
+		// SELECTが見つからない場合はカラムリストなし
+		return nil, nil
+	}
+	fromIdx := strings.Index(upper, "FROM")
+	if fromIdx == -1 || fromIdx < selectIdx {
+		// FROMがない or SELECTより手前にある場合もカラムリストなし
+		return nil, nil
+	}
+
+	// SELECT と FROM の間を抽出
+	between := content[selectIdx+len("SELECT") : fromIdx]
+	between = strings.TrimSpace(between)
+	if between == "*" {
+		// SELECT * の場合はとりあえず ["*"] とする
+		return []string{"*"}, nil
+	}
+
+	// カラムリストをカンマで分割
+	colExprs := strings.Split(between, ",")
+	var cols []string
+
+	for _, expr := range colExprs {
+		exprTrim := strings.TrimSpace(expr)
+		upperExpr := strings.ToUpper(exprTrim)
+		// " AS " の箇所を探す (例: "COUNT(id) AS today_count")
+		pos := strings.Index(upperExpr, " AS ")
+		if pos >= 0 {
+			// AS より後ろを alias として取り出す
+			aliasPart := exprTrim[pos+4:]
+			aliasPart = strings.TrimSpace(aliasPart)
+			cols = append(cols, aliasPart)
+		} else {
+			// AS がなければ式全体をカラム名とみなす
+			cols = append(cols, exprTrim)
+		}
+	}
+
+	return cols, nil
 }
