@@ -109,6 +109,11 @@ func main() {
 		AllowedHeaders: []string{"Content-Type", "Authorization"},
 	})
 
+	// /nyan エンドポイントの登録（Basic Auth も適用）
+	http.Handle("/nyan", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		basicAuth(handleNyan, config)(w, r)
+	})))
+
 	// Wrap handler with CORS and basic auth
 	http.Handle("/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		basicAuth(handleRequest, config)(w, r)
@@ -189,6 +194,7 @@ func connectDB(config Config) (*sql.DB, error) {
 	return sql.Open(driverName, dsn)
 }
 
+// リクエストの処理
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/favicon.ico" {
 		http.NotFound(w, r)
@@ -220,6 +226,18 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		for key, values := range r.Form {
 			if len(values) > 0 {
 				params[key] = values[0]
+			}
+		}
+	}
+
+	// URLパスが "/" 以外の場合、apiパラメータとして扱う
+	if r.URL.Path != "/" {
+		// 先頭の "/" を除去して api 名を取得
+		apiName := strings.TrimPrefix(r.URL.Path, "/")
+		if apiName != "" {
+			// すでに "api" が指定されていなければ、URLパスの値を設定
+			if _, exists := params["api"]; !exists {
+				params["api"] = apiName
 			}
 		}
 	}
@@ -325,31 +343,51 @@ func isSelectQuery(query string) bool {
 	return strings.HasPrefix(strings.TrimSpace(strings.ToUpper(query)), "SELECT")
 }
 
+// SQLのパラメータ適用
 func prepareQueryWithParams(query string, params map[string]interface{}) (string, []interface{}) {
-	pattern := regexp.MustCompile(`\/\*(.*?)\*\/\s*('([^']*)'|"([^"]*)"|(\S+))`)
-	matches := pattern.FindAllStringSubmatch(query, -1)
+	// 改善版の正規表現:
+	// ・コメント内からパラメータ名（任意の文字列）を抽出
+	// ・続く値は、単一引用符または二重引用符で囲まれているか、
+	//   またはスペースとカンマ以外の文字列として扱う
+	re := regexp.MustCompile(`\/\*([^*]+)\*\/\s*(?:'([^']*)'|"([^"]*)"|([^\s,]+))`)
 
-	args := make([]interface{}, len(matches))
-	placeholderIndex := 1
-	for i, match := range matches {
-		paramName := match[1]
-		value, exists := params[paramName]
-		if !exists {
+	// 同じパラメータ名ごとに一度だけ引数に登録するためのマッピング
+	mapping := make(map[string]string)
+	args := []interface{}{}
+	placeholderCounter := 1
+
+	// 正規表現でマッチした部分を置換する
+	replacedQuery := re.ReplaceAllStringFunc(query, func(match string) string {
+		// グループ: [全体, param名, 値(シングル), 値(ダブル), 値(非引用)]
+		groups := re.FindStringSubmatch(match)
+		paramName := strings.TrimSpace(groups[1])
+
+		// 既に同じパラメータが置換済みの場合は、そのプレースホルダーを返す
+		if placeholder, exists := mapping[paramName]; exists {
+			return placeholder
+		}
+
+		// 初回の場合は引数リストに追加
+		value, ok := params[paramName]
+		if !ok {
 			log.Printf("Parameter %s not found in provided parameters", paramName)
 			value = nil
 		}
-		args[i] = value
+		args = append(args, value)
 
+		var placeholder string
 		if dbType == "postgres" {
-			placeholder := fmt.Sprintf("$%d", placeholderIndex)
-			query = strings.Replace(query, match[0], placeholder, 1)
-			placeholderIndex++
+			placeholder = fmt.Sprintf("$%d", placeholderCounter)
 		} else {
-			query = strings.Replace(query, match[0], "?", 1)
+			placeholder = "?"
 		}
-	}
-	log.Print(query)
-	return query, args
+		mapping[paramName] = placeholder
+		placeholderCounter++
+		return placeholder
+	})
+
+	log.Print(replacedQuery)
+	return replacedQuery, args
 }
 
 func RowsToJSON(rows *sql.Rows) ([]byte, error) {
@@ -408,4 +446,30 @@ func sendJSONError(w http.ResponseWriter, message string, statusCode int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(ErrorResponse{Error: message})
+}
+
+// /nyan 用のハンドラー
+// NyanResponse は JSON レスポンスの順序を保証するための構造体です。
+type NyanResponse struct {
+	Name    string               `json:"name"`
+	Profile string               `json:"profile"`
+	Version string               `json:"version"`
+	Apis    map[string]APIConfig `json:"apis"`
+}
+
+func handleNyan(w http.ResponseWriter, r *http.Request) {
+	// config.jsonから必要な情報を抽出
+	response := NyanResponse{
+		Name:    config.Name,
+		Profile: config.Profile,
+		Version: config.Version,
+		Apis:    sqlFiles, // sqlFiles は api.json の内容が格納されている変数
+	}
+
+	// JSON として出力（構造体を利用することで、フィールドの順序が保証される）
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Failed to encode JSON: %v", err)
+		sendJSONError(w, "Internal server error", http.StatusInternalServerError)
+	}
 }

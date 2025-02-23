@@ -156,11 +156,13 @@ CREATE TABLE stamps
 
 各環境用にビルド済みバイナリファイルを同梱しています。
 クリックまたはターミナルから起動して実行できます。
-環境別の配布用のバイナリはzip.shを実行して作成します。
 
 * Windows環境 NyanQL_Windows.exe
 * Mac環境 NyanQL_Mac
 * Linux環境 NyanQL_Linux_amd64
+
+# このAPIサーバの情報を取得する場合
+http(s)://<hostname>:<port>/nyan にアクセスすると、このAPIサーバの情報を取得することができます。
 
 # 予約語について
 
