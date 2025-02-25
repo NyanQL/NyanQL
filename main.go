@@ -620,52 +620,105 @@ func isFloat(s string) bool {
 // parseSelectColumns は、指定したファイルを読み込み
 // 例: "SELECT count(id) AS today_count, name FROM stamps" のような文から
 // ["today_count", "name"] を取り出す簡易実装です。
-func parseSelectColumns(filePath string) ([]string, error) {
-	data, err := ioutil.ReadFile(filePath)
+// parseSelectColumns は、SELECT～FROM の間を取り出し、トップレベルの列区切りカンマで分割し、
+// "AS エイリアス" があればエイリアスを抽出して返す簡易実装です。
+func parseSelectColumns(sqlFilePath string) ([]string, error) {
+	data, err := ioutil.ReadFile(sqlFilePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read file %s: %v", filePath, err)
+		return nil, fmt.Errorf("failed to read file %s: %v", sqlFilePath, err)
 	}
 	content := string(data)
 
+	// 大文字小文字を無視して「SELECT」「FROM」の位置を探す
 	upper := strings.ToUpper(content)
 	selectIdx := strings.Index(upper, "SELECT")
 	if selectIdx == -1 {
-		// SELECTが見つからない場合はカラムリストなし
-		return nil, nil
+		return nil, nil // SELECT がなければ空
 	}
 	fromIdx := strings.Index(upper, "FROM")
 	if fromIdx == -1 || fromIdx < selectIdx {
-		// FROMがない or SELECTより手前にある場合もカラムリストなし
+		// FROM がない、または SELECT より前にある場合は対象外
 		return nil, nil
 	}
 
-	// SELECT と FROM の間を抽出
-	between := content[selectIdx+len("SELECT") : fromIdx]
-	between = strings.TrimSpace(between)
-	if between == "*" {
-		// SELECT * の場合はとりあえず ["*"] とする
+	// SELECT と FROM の間を取り出し、前後の空白を削除
+	selectPart := strings.TrimSpace(content[selectIdx+len("SELECT") : fromIdx])
+	if selectPart == "" {
+		return nil, nil
+	}
+
+	// "SELECT * FROM" のように一発で終わる場合
+	if selectPart == "*" {
 		return []string{"*"}, nil
 	}
 
-	// カラムリストをカンマで分割
-	colExprs := strings.Split(between, ",")
-	var cols []string
+	// トップレベルの列区切りとなるカンマを見つけて分割
+	colExprs := splitTopLevelColumns(selectPart)
 
+	var aliases []string
 	for _, expr := range colExprs {
-		exprTrim := strings.TrimSpace(expr)
-		upperExpr := strings.ToUpper(exprTrim)
-		// " AS " の箇所を探す (例: "COUNT(id) AS today_count")
-		pos := strings.Index(upperExpr, " AS ")
-		if pos >= 0 {
-			// AS より後ろを alias として取り出す
-			aliasPart := exprTrim[pos+4:]
-			aliasPart = strings.TrimSpace(aliasPart)
-			cols = append(cols, aliasPart)
+		// 大文字小文字無視で " AS " を探して、あればエイリアス部分を抽出
+		upperExpr := strings.ToUpper(expr)
+		asIdx := strings.Index(upperExpr, " AS ")
+		if asIdx >= 0 {
+			aliasPart := strings.TrimSpace(expr[asIdx+4:])
+			aliases = append(aliases, aliasPart)
 		} else {
-			// AS がなければ式全体をカラム名とみなす
-			cols = append(cols, exprTrim)
+			// AS がなければ式全体を格納してもいいが、ここでは式全体をとりあえず返す
+			// 例: "COUNT(stamps.date)" -> "COUNT(stamps.date)"
+			trimmed := strings.TrimSpace(expr)
+			aliases = append(aliases, trimmed)
 		}
 	}
+	return aliases, nil
+}
 
-	return cols, nil
+// splitTopLevelColumns は、SELECT ... FROM の間の文字列を受け取り、
+// トップレベルのカンマ(関数呼び出しやCASE式などの中ではない)で分割したスライスを返す。
+func splitTopLevelColumns(selectPart string) []string {
+	var result []string
+	var sb strings.Builder
+
+	depth := 0 // ( ) の深さ
+	inSingleQuote := false
+
+	runes := []rune(selectPart)
+
+	for i := 0; i < len(runes); i++ {
+		ch := runes[i]
+		switch ch {
+		case '\'':
+			// シングルクオートの開始 or 終了
+			inSingleQuote = !inSingleQuote
+			sb.WriteRune(ch)
+		case '(':
+			if !inSingleQuote {
+				depth++
+			}
+			sb.WriteRune(ch)
+		case ')':
+			if !inSingleQuote && depth > 0 {
+				depth--
+			}
+			sb.WriteRune(ch)
+		case ',':
+			// depth=0 かつ inSingleQuote=false のときだけ、トップレベルの列区切り
+			if depth == 0 && !inSingleQuote {
+				// 列1つ分を確定
+				col := strings.TrimSpace(sb.String())
+				result = append(result, col)
+				sb.Reset()
+			} else {
+				sb.WriteRune(ch)
+			}
+		default:
+			sb.WriteRune(ch)
+		}
+	}
+	// 最後に残っている要素を追加
+	rest := strings.TrimSpace(sb.String())
+	if rest != "" {
+		result = append(result, rest)
+	}
+	return result
 }
