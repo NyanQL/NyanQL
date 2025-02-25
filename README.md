@@ -16,7 +16,8 @@ NyanQLには、JavaScriptを実行してJSONを生成するNyan8（にゃんぱ�
 
 ## 設定ファイル config.json
 
-config.jsonにNyanQLの設定を記述します。各項目の説明は下記の通りです。SSL証明書を利用しない場合は、対応する項目を空白にしてください。
+config.jsonにNyanQLの設定を記述します。各項目の説明は下記の通りです。
+SSL証明書を指定すると、httpsでアクセスできるようになります。
 
 ### config.json について
 
