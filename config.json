@@ -7,8 +7,8 @@
     "Username": "neko",
     "Password": "nyan"
   },
-  "certPath": "./ssl/localhost.crt",
-  "keyPath": "./ssl/localhost.key",
+  "certPath": "",
+  "keyPath": "",
   "DBType": "sqlite",
   "DBUser": "",
   "DBPassword": "",
