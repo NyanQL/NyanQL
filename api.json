@@ -14,5 +14,9 @@
   "target_month_list": {
     "sql": ["./sql/sqlite/target_month_list.sql"],
     "description": "年と月を指定し、一覧を表示します。"
+  },
+  "check_day": {
+    "sql": ["./sql/sqlite/check_day.sql"],
+    "description": "日付で検索します"
   }
 }

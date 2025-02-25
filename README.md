@@ -162,7 +162,8 @@ CREATE TABLE stamps
 * Linux環境 NyanQL_Linux_amd64
 
 # このAPIサーバの情報を取得する場合
-http(s)://<hostname>:<port>/nyan にアクセスすると、このAPIサーバの情報を取得することができます。
+http(s)://{hostname}:{port}/nyan にアクセスすると、このAPIサーバの情報を取得することができます。
+http(s)://{hostname}:{port}/nyan/API名 にアクセスすると、このAPIサーバの指定されたAPIの情報を取得することができます。
 
 # 予約語について
 
