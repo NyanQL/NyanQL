@@ -275,15 +275,27 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		success, statusCode, errorObj, err := runCheckScript(apiConfig.Check, params)
 		if err != nil {
 			log.Printf("Check script error: %v", err)
-			sendJSONError(w, err.Error(), statusCode)
+			// エラー時もチェック結果の全体を返すため、ここでエラーオブジェクトをラップする
+			response := map[string]interface{}{
+				"success": false,
+				"status":  statusCode,
+				"error":   err.Error(),
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(statusCode)
+			json.NewEncoder(w).Encode(response)
 			return
 		}
 		if !success {
-			// errorObj が nil ならデフォルトメッセージを返す
-			if errorObj == nil {
-				errorObj = "Request check failed"
+			// チェックスクリプトが返した結果全体をレスポンスとして出力する
+			response := map[string]interface{}{
+				"success": success,
+				"status":  statusCode,
+				"error":   errorObj,
 			}
-			sendJSONError(w, errorObj, statusCode)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(statusCode)
+			json.NewEncoder(w).Encode(response)
 			return
 		}
 	}
@@ -770,11 +782,42 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}) (b
 	combinedScript.WriteString("\n")
 
 	// デバッグ用: 合体したスクリプトの内容をログ出力
-	log.Printf("Combined check script:\n%s", combinedScript.String())
+	//log.Printf("Combined check script:\n%s", combinedScript.String())
 
 	// goja VM を作成し、パラメータをセットする
 	vm := goja.New()
 	vm.Set("nyanAllParams", params)
+
+	vm.Set("console", map[string]interface{}{
+		"log": func(call goja.FunctionCall) goja.Value {
+			args := []string{}
+			// JSON.stringify を取得
+			jsonStringifyVal := vm.Get("JSON").ToObject(vm).Get("stringify")
+			// 関数としてアサート
+			jsonStringify, ok := goja.AssertFunction(jsonStringifyVal)
+			if !ok {
+				log.Println("JSON.stringify is not a function")
+				return goja.Undefined()
+			}
+			for _, arg := range call.Arguments {
+				// オブジェクトやスライスの場合、JSON.stringify で変換する
+				exported := arg.Export()
+				switch exported.(type) {
+				case map[string]interface{}, []interface{}:
+					s, err := jsonStringify(goja.Undefined(), arg)
+					if err == nil {
+						args = append(args, s.String())
+					} else {
+						args = append(args, arg.String())
+					}
+				default:
+					args = append(args, arg.String())
+				}
+			}
+			log.Println("[JS:check]", strings.Join(args, " "))
+			return goja.Undefined()
+		},
+	})
 
 	// getAPI 関数を登録
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
@@ -809,36 +852,18 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}) (b
 		return false, 500, nil, fmt.Errorf("check script error: %v", err)
 	}
 
-	// 返り値が undefined または null ならエラー
-	if goja.IsUndefined(value) || value == nil {
-		return false, 500, nil, fmt.Errorf("check script returned no value")
+	jsonStr := value.String()
+	var result struct {
+		Success bool        `json:"success"`
+		Status  int         `json:"status"`
+		Error   interface{} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		return false, 500, nil, fmt.Errorf("failed to unmarshal check result: %v", err)
 	}
 
-	// 戻り値のオブジェクトから success, status, error を取得
-	obj := value.ToObject(vm)
-	successVal := obj.Get("success")
-	statusVal := obj.Get("status")
-	errorVal := obj.Get("error")
-	if goja.IsUndefined(successVal) || goja.IsUndefined(statusVal) {
-		return false, 500, nil, fmt.Errorf("check script did not return proper object with success and status")
-	}
+	return result.Success, result.Status, result.Error, nil
 
-	success := successVal.ToBoolean()
-	statusCode := int(statusVal.ToInteger())
-
-	// errorVal を明示的にネイティブな map に変換する
-	var errorObj interface{}
-	if !goja.IsUndefined(errorVal) && errorVal != nil {
-		var m map[string]interface{}
-		if err := vm.ExportTo(errorVal, &m); err != nil {
-			// 変換できなかった場合は文字列化
-			errorObj = errorVal.String()
-		} else {
-			errorObj = m
-		}
-	}
-
-	return success, statusCode, errorObj, nil
 }
 
 func getAPI(url, username, password string) (string, error) {
