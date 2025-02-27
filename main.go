@@ -278,6 +278,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	nyanMode, _ := params["nyan_mode"].(string)
 
+	if apiConfig.Check == "" && nyanMode == "checkOnly" {
+		// 404エラーをJSONで返す
+		sendJSONError(w, "No check script for this API", http.StatusNotFound)
+		return
+	}
+
 	// チェック用 JavaScript の実行
 	if apiConfig.Check != "" {
 		success, statusCode, errorObj, jsonStr, err := runCheckScript(apiConfig.Check, params, acceptedKeys)
