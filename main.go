@@ -89,7 +89,7 @@ func main() {
 	execDir = filepath.Dir(execDir) // 実行ファイルのディレクトリを取得
 
 	configFilePath := filepath.Join(execDir, "config.json")
-	configFile, err := os.Open(configFilePath)
+	configFile, err := os.Open(configFilePath) // 既に err が宣言されているので "=" を使用
 	if err != nil {
 		log.Fatalf("Failed to open config file: %v", err)
 	}
@@ -125,11 +125,11 @@ func main() {
 
 	// /nyan エンドポイントの登録（Basic Auth も適用）
 	http.Handle("/nyan/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Basic Auth はまとめて掛けたい場合、ここでラップ
+		// Basic Auth を適用
 		basicAuth(handleNyanOrDetail, config)(w, r)
 	})))
 
-	// Wrap handler with CORS and basic auth
+	// その他のリクエストに対しても Basic Auth を適用
 	http.Handle("/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		basicAuth(handleRequest, config)(w, r)
 	})))
@@ -268,26 +268,28 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		sendJSONError(w, "SQL files not found", http.StatusNotFound)
 		return
 	}
-	log.Print(apiConfig.SQL)
 
-	// チェック用の JavaScript ファイルが指定されている場合、goja を使って事前チェックを実施
+	// SQLファイルから置換対象パラメータのキー配列を取得
+	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
+	if err != nil {
+		log.Printf("Failed to get accepted params keys: %v", err)
+		// エラー時は空配列で進めるなどの対応も考えられる
+		acceptedKeys = []string{}
+	}
+
+	// チェック用 JavaScript の実行（acceptedKeys も渡す）
 	if apiConfig.Check != "" {
-		success, statusCode, errorObj, err := runCheckScript(apiConfig.Check, params)
+		success, statusCode, errorObj, err := runCheckScript(apiConfig.Check, params, acceptedKeys)
 		if err != nil {
 			log.Printf("Check script error: %v", err)
-			// エラー時もチェック結果の全体を返すため、ここでエラーオブジェクトをラップする
-			response := map[string]interface{}{
-				"success": false,
-				"status":  statusCode,
-				"error":   err.Error(),
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(statusCode)
-			json.NewEncoder(w).Encode(response)
+			sendJSONError(w, err.Error(), statusCode)
 			return
 		}
 		if !success {
-			// チェックスクリプトが返した結果全体をレスポンスとして出力する
+			if errorObj == nil {
+				errorObj = "Request check failed"
+			}
+			// チェック結果全体を返す例
 			response := map[string]interface{}{
 				"success": success,
 				"status":  statusCode,
@@ -301,7 +303,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var tx *sql.Tx
-	var err error
+
 	if len(apiConfig.SQL) > 1 {
 		tx, err = db.Begin()
 		if err != nil {
@@ -760,7 +762,7 @@ func sendJSONError(w http.ResponseWriter, errPayload interface{}, statusCode int
 	json.NewEncoder(w).Encode(ErrorResponse{Error: errPayload})
 }
 
-func runCheckScript(apiCheckScriptPath string, params map[string]interface{}) (bool, int, interface{}, error) {
+func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, error) {
 	var combinedScript strings.Builder
 
 	// config.json の javascript_include に指定されたすべてのファイルを読み込む
@@ -781,26 +783,24 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}) (b
 	combinedScript.Write(checkContent)
 	combinedScript.WriteString("\n")
 
-	// デバッグ用: 合体したスクリプトの内容をログ出力
-	//log.Printf("Combined check script:\n%s", combinedScript.String())
+	log.Printf("Combined check script:\n%s", combinedScript.String())
 
-	// goja VM を作成し、パラメータをセットする
 	vm := goja.New()
+	// パラメータをセット
 	vm.Set("nyanAllParams", params)
-
+	// 置換対象パラメータのキー配列をセット
+	vm.Set("nyanAcceptedParamsKeys", acceptedParamsKeys)
+	// その他、必要な関数や console の設定も行う（前述の例を参照）
 	vm.Set("console", map[string]interface{}{
 		"log": func(call goja.FunctionCall) goja.Value {
 			args := []string{}
-			// JSON.stringify を取得
 			jsonStringifyVal := vm.Get("JSON").ToObject(vm).Get("stringify")
-			// 関数としてアサート
 			jsonStringify, ok := goja.AssertFunction(jsonStringifyVal)
 			if !ok {
 				log.Println("JSON.stringify is not a function")
 				return goja.Undefined()
 			}
 			for _, arg := range call.Arguments {
-				// オブジェクトやスライスの場合、JSON.stringify で変換する
 				exported := arg.Export()
 				switch exported.(type) {
 				case map[string]interface{}, []interface{}:
@@ -819,20 +819,19 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}) (b
 		},
 	})
 
-	// getAPI 関数を登録
+	// nyanGetAPI を登録
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
 		username := call.Argument(1).String()
 		password := call.Argument(2).String()
 		result, err := getAPI(url, username, password)
 		if err != nil {
-			// エラーの場合は例外としてスロー（またはエラーメッセージを返す）
 			panic(vm.ToValue(err.Error()))
 		}
-		v := vm.ToValue(result)
-		return v
+		return vm.ToValue(result)
 	})
 
+	// nyanJsonAPI を登録
 	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
 		jsonData := call.Argument(1).String()
@@ -842,11 +841,9 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}) (b
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
-		v := vm.ToValue(result)
-		return v
+		return vm.ToValue(result)
 	})
 
-	// 合体したスクリプトを実行する
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
 		return false, 500, nil, fmt.Errorf("check script error: %v", err)
@@ -863,7 +860,6 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}) (b
 	}
 
 	return result.Success, result.Status, result.Error, nil
-
 }
 
 func getAPI(url, username, password string) (string, error) {
@@ -921,4 +917,17 @@ func jsonAPI(url string, jsonData []byte, username, password string) (string, er
 		return "", err
 	}
 	return string(body), nil
+}
+
+// パラメータの取得
+func getAcceptedParamsKeys(sqlPaths []string) ([]string, error) {
+	paramsMap, err := parseSQLParams(sqlPaths)
+	if err != nil {
+		return nil, err
+	}
+	keys := []string{}
+	for k := range paramsMap {
+		keys = append(keys, k)
+	}
+	return keys, nil
 }

@@ -1,5 +1,6 @@
 function main() {
-    console.log(nyanAllParams);
+    console.log("nyanAllParams:", nyanAllParams);
+    console.log("accepted keys:", nyanAcceptedParamsKeys);
     console.log(typeof nyanGetAPI);
     console.log(typeof nyanJsonAPI);
 
