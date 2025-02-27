@@ -273,13 +273,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
 	if err != nil {
 		log.Printf("Failed to get accepted params keys: %v", err)
-		// エラー時は空配列で進めるなどの対応も考えられる
 		acceptedKeys = []string{}
 	}
 
-	// チェック用 JavaScript の実行（acceptedKeys も渡す）
+	// チェック用 JavaScript の実行
 	if apiConfig.Check != "" {
-		success, statusCode, errorObj, err := runCheckScript(apiConfig.Check, params, acceptedKeys)
+		success, statusCode, errorObj, jsonStr, err := runCheckScript(apiConfig.Check, params, acceptedKeys)
 		if err != nil {
 			log.Printf("Check script error: %v", err)
 			sendJSONError(w, err.Error(), statusCode)
@@ -289,7 +288,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			if errorObj == nil {
 				errorObj = "Request check failed"
 			}
-			// チェック結果全体を返す例
+			// チェックスクリプトの結果全体を返す
 			response := map[string]interface{}{
 				"success": success,
 				"status":  statusCode,
@@ -298,6 +297,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
 			json.NewEncoder(w).Encode(response)
+			return
+		}
+		// SQL も script も未設定の場合は、チェック結果をそのまま返す
+		if len(apiConfig.SQL) == 0 && len(apiConfig.Script) == 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(statusCode)
+			w.Write([]byte(jsonStr))
 			return
 		}
 	}
@@ -762,14 +768,15 @@ func sendJSONError(w http.ResponseWriter, errPayload interface{}, statusCode int
 	json.NewEncoder(w).Encode(ErrorResponse{Error: errPayload})
 }
 
-func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, error) {
+// runCheckScript のシグネチャを変更し、元の JSON 文字列も返すようにする
+func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, string, error) {
 	var combinedScript strings.Builder
 
 	// config.json の javascript_include に指定されたすべてのファイルを読み込む
 	for _, includePath := range config.JavascriptInclude {
 		content, err := ioutil.ReadFile(includePath)
 		if err != nil {
-			return false, 500, nil, fmt.Errorf("failed to read javascript include file %s: %v", includePath, err)
+			return false, 500, nil, "", fmt.Errorf("failed to read javascript include file %s: %v", includePath, err)
 		}
 		combinedScript.Write(content)
 		combinedScript.WriteString("\n")
@@ -778,7 +785,7 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 	// api.json で指定されたチェック用 JavaScript ファイルをそのまま読み込む
 	checkContent, err := ioutil.ReadFile(apiCheckScriptPath)
 	if err != nil {
-		return false, 500, nil, fmt.Errorf("failed to read check script %s: %v", apiCheckScriptPath, err)
+		return false, 500, nil, "", fmt.Errorf("failed to read check script %s: %v", apiCheckScriptPath, err)
 	}
 	combinedScript.Write(checkContent)
 	combinedScript.WriteString("\n")
@@ -786,14 +793,16 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 	log.Printf("Combined check script:\n%s", combinedScript.String())
 
 	vm := goja.New()
-	// パラメータをセット
+	// パラメータと、置換対象パラメータのキー配列をセット
 	vm.Set("nyanAllParams", params)
-	// 置換対象パラメータのキー配列をセット
 	vm.Set("nyanAcceptedParamsKeys", acceptedParamsKeys)
-	// その他、必要な関数や console の設定も行う（前述の例を参照）
+
+	// 必要な console, nyanGetAPI, nyanJsonAPI などの登録（省略可。前述の例を参照）
+	// console.log を登録
 	vm.Set("console", map[string]interface{}{
 		"log": func(call goja.FunctionCall) goja.Value {
 			args := []string{}
+			// JSON.stringify を取得して、オブジェクトの場合に文字列化する
 			jsonStringifyVal := vm.Get("JSON").ToObject(vm).Get("stringify")
 			jsonStringify, ok := goja.AssertFunction(jsonStringifyVal)
 			if !ok {
@@ -819,11 +828,18 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 		},
 	})
 
-	// nyanGetAPI を登録
+	// nyanGetAPI の登録（引数はオプション対応）
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
-		url := call.Argument(0).String()
-		username := call.Argument(1).String()
-		password := call.Argument(2).String()
+		var url, username, password string
+		if len(call.Arguments) >= 1 {
+			url = call.Argument(0).String()
+		}
+		if len(call.Arguments) >= 2 {
+			username = call.Argument(1).String()
+		}
+		if len(call.Arguments) >= 3 {
+			password = call.Argument(2).String()
+		}
 		result, err := getAPI(url, username, password)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
@@ -831,12 +847,21 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 		return vm.ToValue(result)
 	})
 
-	// nyanJsonAPI を登録
+	// nyanJsonAPI の登録（引数はオプション対応）
 	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
-		url := call.Argument(0).String()
-		jsonData := call.Argument(1).String()
-		username := call.Argument(2).String()
-		password := call.Argument(3).String()
+		var url, jsonData, username, password string
+		if len(call.Arguments) >= 1 {
+			url = call.Argument(0).String()
+		}
+		if len(call.Arguments) >= 2 {
+			jsonData = call.Argument(1).String()
+		}
+		if len(call.Arguments) >= 3 {
+			username = call.Argument(2).String()
+		}
+		if len(call.Arguments) >= 4 {
+			password = call.Argument(3).String()
+		}
 		result, err := jsonAPI(url, []byte(jsonData), username, password)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
@@ -846,7 +871,7 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
-		return false, 500, nil, fmt.Errorf("check script error: %v", err)
+		return false, 500, nil, "", fmt.Errorf("check script error: %v", err)
 	}
 
 	jsonStr := value.String()
@@ -856,10 +881,10 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 		Error   interface{} `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
-		return false, 500, nil, fmt.Errorf("failed to unmarshal check result: %v", err)
+		return false, 500, nil, jsonStr, fmt.Errorf("failed to unmarshal check result: %v", err)
 	}
 
-	return result.Success, result.Status, result.Error, nil
+	return result.Success, result.Status, result.Error, jsonStr, nil
 }
 
 func getAPI(url, username, password string) (string, error) {
