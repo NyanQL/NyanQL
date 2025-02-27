@@ -19,5 +19,9 @@
   "check_day": {
     "sql": ["./sql/sqlite/check_day.sql"],
     "description": "日付で検索します"
+  },
+  "test1": {
+    "check": "./javascript/check.js",
+    "description": "checkだけでsqlなしです。"
   }
 }
