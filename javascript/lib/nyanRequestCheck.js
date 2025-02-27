@@ -11,7 +11,7 @@ function nyanRequestCheck(keyArray = [], requiredParams = {}) {
         keyArray = nyanAcceptedParamsKeys;
     }
 
-    // requiredParams 配列の各キーについて、nyanAllParams に存在するか確認
+    // requiredParams 配列の各キーについて、requiredParams に存在するか確認
     keyArray.forEach(param => {
         if (!(param in requiredParams)) {
             nyanErros[param] = "Request does not exist";
