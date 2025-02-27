@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"github.com/dop251/goja"
@@ -774,6 +776,33 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}) (b
 	vm := goja.New()
 	vm.Set("nyanAllParams", params)
 
+	// getAPI 関数を登録
+	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
+		url := call.Argument(0).String()
+		username := call.Argument(1).String()
+		password := call.Argument(2).String()
+		result, err := getAPI(url, username, password)
+		if err != nil {
+			// エラーの場合は例外としてスロー（またはエラーメッセージを返す）
+			panic(vm.ToValue(err.Error()))
+		}
+		v := vm.ToValue(result)
+		return v
+	})
+
+	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
+		url := call.Argument(0).String()
+		jsonData := call.Argument(1).String()
+		username := call.Argument(2).String()
+		password := call.Argument(3).String()
+		result, err := jsonAPI(url, []byte(jsonData), username, password)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		v := vm.ToValue(result)
+		return v
+	})
+
 	// 合体したスクリプトを実行する
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
@@ -810,4 +839,61 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}) (b
 	}
 
 	return success, statusCode, errorObj, nil
+}
+
+func getAPI(url, username, password string) (string, error) {
+	// HTTPクライアントの生成
+	client := &http.Client{}
+
+	// リクエストの生成
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("error creating request: %v", err)
+	}
+
+	// BASIC認証ヘッダーの設定
+	if username != "" {
+		req.SetBasicAuth(username, password)
+	}
+
+	// リクエストの送信
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("error sending request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// レスポンスの読み取り
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("error reading response: %v", err)
+	}
+	return string(body), nil
+}
+
+// POSTリクエストを行うGo関数
+func jsonAPI(url string, jsonData []byte, username, password string) (string, error) {
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", err
+	}
+
+	// Basic認証のセットアップ
+	basicAuth := username + ":" + password
+	basicAuthEncoded := base64.StdEncoding.EncodeToString([]byte(basicAuth))
+	req.Header.Set("Authorization", "Basic "+basicAuthEncoded)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
 }
