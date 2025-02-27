@@ -24,6 +24,7 @@
     "EnableLogging": false
   },
   "javascript_include": [
+    "./javascript/lib/nyanRequestCheck.js",
     "./javascript/base.js"
   ]
 }
