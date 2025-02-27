@@ -1,8 +1,8 @@
 function main() {
-    if (!nyanAllParams.token) {
-        return { status: 500, success: false, error: {"test": "hogehoge" , "2": "エラー2つめ"} };
-    }
-    return { status: 200, success: true };
+    console.log(nyanAllParams);
+    console.log(typeof nyanGetAPI);
+    console.log(typeof nyanJsonAPI);
+
+    return JSON.stringify({ success: true, status: 200 });
 }
 main();
-
