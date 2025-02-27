@@ -1,6 +1,5 @@
 {
   "list": {
-    "check": "./javascript/check.js",
     "sql": ["./sql/sqlite/list.sql"],
     "description": "当月の一覧を表示します。"
   },
@@ -17,6 +16,7 @@
     "description": "年と月を指定し、一覧を表示します。"
   },
   "check_day": {
+    "check": "./javascript/check.js",
     "sql": ["./sql/sqlite/check_day.sql"],
     "description": "日付で検索します"
   },
