@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/dop251/goja"
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
@@ -20,20 +21,21 @@ import (
 )
 
 type Config struct {
-	Name         string          `json:"name"`
-	Profile      string          `json:"profile"`
-	Version      string          `json:"version"`
-	Port         int             `json:"Port"`
-	CertPath     string          `json:"CertPath"`
-	KeyPath      string          `json:"KeyPath"`
-	DatabaseType string          `json:"DBType"`
-	DBUsername   string          `json:"DBUser"`
-	DBPassword   string          `json:"DBPassword"`
-	DBName       string          `json:"DBName"`
-	DBHost       string          `json:"DBHost"`
-	DBPort       string          `json:"DBPort"`
-	BasicAuth    BasicAuthConfig `json:"BasicAuth"`
-	Log          LogConfig       `json:"log"`
+	Name              string          `json:"name"`
+	Profile           string          `json:"profile"`
+	Version           string          `json:"version"`
+	Port              int             `json:"Port"`
+	CertPath          string          `json:"CertPath"`
+	KeyPath           string          `json:"KeyPath"`
+	DatabaseType      string          `json:"DBType"`
+	DBUsername        string          `json:"DBUser"`
+	DBPassword        string          `json:"DBPassword"`
+	DBName            string          `json:"DBName"`
+	DBHost            string          `json:"DBHost"`
+	DBPort            string          `json:"DBPort"`
+	BasicAuth         BasicAuthConfig `json:"BasicAuth"`
+	Log               LogConfig       `json:"log"`
+	JavascriptInclude []string        `json:"javascript_include,omitempty"` // 新規フィールド
 }
 
 // BasicAuthConfig represents basic authentication configuration
@@ -54,12 +56,14 @@ type LogConfig struct {
 
 // ErrorResponse represents a JSON error response
 type ErrorResponse struct {
-	Error string `json:"error"`
+	Error interface{} `json:"error"`
 }
 
 type APIConfig struct {
-	SQL         []string `json:"sql"`
-	Description string   `json:"description"`
+	SQL         []string `json:"sql,omitempty"`    // SQL ファイルのパス。存在しなければ nil または空スライス
+	Script      []string `json:"script,omitempty"` // 任意の JavaScript ファイルを配列で指定可能
+	Check       string   `json:"check,omitempty"`  // 単一のチェック用 JavaScript ファイル。必要に応じて省略可能
+	Description string   `json:"description"`      // 説明文。ここは必須とするか、必要ならomitemptyを付けてもよい
 }
 
 var config Config
@@ -264,6 +268,24 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Print(apiConfig.SQL)
 
+	// チェック用の JavaScript ファイルが指定されている場合、goja を使って事前チェックを実施
+	if apiConfig.Check != "" {
+		success, statusCode, errorObj, err := runCheckScript(apiConfig.Check, params)
+		if err != nil {
+			log.Printf("Check script error: %v", err)
+			sendJSONError(w, err.Error(), statusCode)
+			return
+		}
+		if !success {
+			// errorObj が nil ならデフォルトメッセージを返す
+			if errorObj == nil {
+				errorObj = "Request check failed"
+			}
+			sendJSONError(w, errorObj, statusCode)
+			return
+		}
+	}
+
 	var tx *sql.Tx
 	var err error
 	if len(apiConfig.SQL) > 1 {
@@ -449,12 +471,6 @@ func basicAuth(next http.HandlerFunc, config Config) http.HandlerFunc {
 
 func checkPassword(user, pass string, config Config) bool {
 	return user == config.BasicAuth.Username && pass == config.BasicAuth.Password
-}
-
-func sendJSONError(w http.ResponseWriter, message string, statusCode int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	json.NewEncoder(w).Encode(ErrorResponse{Error: message})
 }
 
 // /nyan 用のハンドラー
@@ -721,4 +737,77 @@ func splitTopLevelColumns(selectPart string) []string {
 		result = append(result, rest)
 	}
 	return result
+}
+
+// sendJSONErrorをinterface{}を受け取るように定義（1箇所だけ定義する）
+func sendJSONError(w http.ResponseWriter, errPayload interface{}, statusCode int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(ErrorResponse{Error: errPayload})
+}
+
+func runCheckScript(apiCheckScriptPath string, params map[string]interface{}) (bool, int, interface{}, error) {
+	var combinedScript strings.Builder
+
+	// config.json の javascript_include に指定されたすべてのファイルを読み込む
+	for _, includePath := range config.JavascriptInclude {
+		content, err := ioutil.ReadFile(includePath)
+		if err != nil {
+			return false, 500, nil, fmt.Errorf("failed to read javascript include file %s: %v", includePath, err)
+		}
+		combinedScript.Write(content)
+		combinedScript.WriteString("\n")
+	}
+
+	// api.json で指定されたチェック用 JavaScript ファイルをそのまま読み込む
+	checkContent, err := ioutil.ReadFile(apiCheckScriptPath)
+	if err != nil {
+		return false, 500, nil, fmt.Errorf("failed to read check script %s: %v", apiCheckScriptPath, err)
+	}
+	combinedScript.Write(checkContent)
+	combinedScript.WriteString("\n")
+
+	// デバッグ用: 合体したスクリプトの内容をログ出力
+	log.Printf("Combined check script:\n%s", combinedScript.String())
+
+	// goja VM を作成し、パラメータをセットする
+	vm := goja.New()
+	vm.Set("nyanAllParams", params)
+
+	// 合体したスクリプトを実行する
+	value, err := vm.RunString(combinedScript.String())
+	if err != nil {
+		return false, 500, nil, fmt.Errorf("check script error: %v", err)
+	}
+
+	// 返り値が undefined または null ならエラー
+	if goja.IsUndefined(value) || value == nil {
+		return false, 500, nil, fmt.Errorf("check script returned no value")
+	}
+
+	// 戻り値のオブジェクトから success, status, error を取得
+	obj := value.ToObject(vm)
+	successVal := obj.Get("success")
+	statusVal := obj.Get("status")
+	errorVal := obj.Get("error")
+	if goja.IsUndefined(successVal) || goja.IsUndefined(statusVal) {
+		return false, 500, nil, fmt.Errorf("check script did not return proper object with success and status")
+	}
+
+	success := successVal.ToBoolean()
+	statusCode := int(statusVal.ToInteger())
+
+	// errorVal を明示的にネイティブな map に変換する
+	var errorObj interface{}
+	if !goja.IsUndefined(errorVal) && errorVal != nil {
+		var m map[string]interface{}
+		if err := vm.ExportTo(errorVal, &m); err != nil {
+			// 変換できなかった場合は文字列化
+			errorObj = errorVal.String()
+		} else {
+			errorObj = m
+		}
+	}
+
+	return success, statusCode, errorObj, nil
 }

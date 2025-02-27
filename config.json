@@ -22,5 +22,8 @@
     "MaxAge": 7,
     "Compress": true,
     "EnableLogging": false
-  }
+  },
+  "javascript_include": [
+    "./javascript/base.js"
+  ]
 }
