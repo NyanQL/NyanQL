@@ -276,6 +276,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		acceptedKeys = []string{}
 	}
 
+	nyanMode, _ := params["nyan_mode"].(string)
+
 	// チェック用 JavaScript の実行
 	if apiConfig.Check != "" {
 		success, statusCode, errorObj, jsonStr, err := runCheckScript(apiConfig.Check, params, acceptedKeys)
@@ -305,6 +307,14 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(statusCode)
 			w.Write([]byte(jsonStr))
 			return
+		}
+
+		if nyanMode == "checkOnly" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(statusCode)
+			// チェックスクリプトの返した JSON をそのまま書き出す
+			w.Write([]byte(jsonStr))
+			return // ここで関数終了 => SQL 等は実行しない
 		}
 	}
 

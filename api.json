@@ -1,5 +1,6 @@
 {
   "list": {
+    "check": "./javascript/check.js",
     "sql": ["./sql/sqlite/list.sql"],
     "description": "当月の一覧を表示します。"
   },
