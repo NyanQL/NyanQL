@@ -1,0 +1,1 @@
+SELECT id, date  FROM stamps  WHERE id in (/*ids*/1);

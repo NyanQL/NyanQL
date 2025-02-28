@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -251,10 +252,35 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			sendJSONError(w, "Error parsing form data", http.StatusBadRequest)
 			return
 		}
+		if err := r.ParseForm(); err != nil {
+			sendJSONError(w, "Error parsing form data", http.StatusBadRequest)
+			return
+		}
 		params = make(map[string]interface{})
 		for key, values := range r.Form {
-			if len(values) > 0 {
-				params[key] = values[0]
+			// 複数の値があればそのままスライスとして設定
+			if len(values) > 1 {
+				params[key] = values
+			} else {
+				val := values[0]
+				// 値がJSON配列の形式かチェック
+				if strings.HasPrefix(val, "[") && strings.HasSuffix(val, "]") {
+					var arr []interface{}
+					if err := json.Unmarshal([]byte(val), &arr); err == nil {
+						params[key] = arr
+						continue
+					}
+				}
+				// カンマ区切りの文字列なら分割
+				if strings.Contains(val, ",") {
+					splitVals := strings.Split(val, ",")
+					for i := range splitVals {
+						splitVals[i] = strings.TrimSpace(splitVals[i])
+					}
+					params[key] = splitVals
+				} else {
+					params[key] = val
+				}
 			}
 		}
 	}
@@ -439,48 +465,65 @@ func isSelectQuery(query string) bool {
 
 // SQLのパラメータ適用
 func prepareQueryWithParams(query string, params map[string]interface{}) (string, []interface{}) {
-	// 改善版の正規表現:
-	// ・コメント内からパラメータ名（任意の文字列）を抽出
-	// ・続く値は、単一引用符または二重引用符で囲まれているか、
-	//   またはスペースとカンマ以外の文字列として扱う
-	re := regexp.MustCompile(`\/\*([^*]+)\*\/\s*(?:'([^']*)'|"([^"]*)"|([^\s,]+))`)
+	// パラメータ置換用の正規表現
+	re := regexp.MustCompile(`\/\*([^*]+)\*\/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
 
 	// 同じパラメータ名ごとに一度だけ引数に登録するためのマッピング
 	mapping := make(map[string]string)
 	args := []interface{}{}
 	placeholderCounter := 1
 
-	// 正規表現でマッチした部分を置換する
+	// 正規表現でマッチした部分を置換
 	replacedQuery := re.ReplaceAllStringFunc(query, func(match string) string {
-		// グループ: [全体, param名, 値(シングル), 値(ダブル), 値(非引用)]
+		// マッチしたグループの取得
 		groups := re.FindStringSubmatch(match)
 		paramName := strings.TrimSpace(groups[1])
 
-		// 既に同じパラメータが置換済みの場合は、そのプレースホルダーを返す
+		// すでに置換済みならそのプレースホルダーを返す
 		if placeholder, exists := mapping[paramName]; exists {
 			return placeholder
 		}
 
-		// 初回の場合は引数リストに追加
+		// パラメータ値の取得
 		value, ok := params[paramName]
 		if !ok {
 			log.Printf("Parameter %s not found in provided parameters", paramName)
 			value = nil
 		}
-		args = append(args, value)
 
-		var placeholder string
-		if dbType == "postgres" {
-			placeholder = fmt.Sprintf("$%d", placeholderCounter)
+		// reflect を用いてスライスかどうかを判定
+		rv := reflect.ValueOf(value)
+		if rv.IsValid() && rv.Kind() == reflect.Slice {
+			// スライスの場合、要素ごとにプレースホルダーを生成
+			placeholders := []string{}
+			for i := 0; i < rv.Len(); i++ {
+				args = append(args, rv.Index(i).Interface())
+				if dbType == "postgres" {
+					placeholders = append(placeholders, fmt.Sprintf("$%d", placeholderCounter))
+				} else {
+					placeholders = append(placeholders, "?")
+				}
+				placeholderCounter++
+			}
+			placeholder := strings.Join(placeholders, ",")
+			mapping[paramName] = placeholder
+			return placeholder
 		} else {
-			placeholder = "?"
+			// スライスでない場合は従来通り単一のプレースホルダーを生成
+			args = append(args, value)
+			var placeholder string
+			if dbType == "postgres" {
+				placeholder = fmt.Sprintf("$%d", placeholderCounter)
+			} else {
+				placeholder = "?"
+			}
+			mapping[paramName] = placeholder
+			placeholderCounter++
+			return placeholder
 		}
-		mapping[paramName] = placeholder
-		placeholderCounter++
-		return placeholder
 	})
 
-	log.Print(replacedQuery)
+	log.Print("Replaced Query: ", replacedQuery)
 	return replacedQuery, args
 }
 
