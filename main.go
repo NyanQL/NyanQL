@@ -1100,8 +1100,8 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 		return vm.ToValue(result)
 	})
 
-	vm.Set("nyanGetSQL", func(call goja.FunctionCall) goja.Value {
-		return nyanGetSQLHandler(vm, call)
+	vm.Set("nyanRunSQL", func(call goja.FunctionCall) goja.Value {
+		return nyanRunSQLHandler(vm, call)
 	})
 
 	// 連結したスクリプトを実行
@@ -1147,11 +1147,11 @@ func parseScriptConstants(scriptPath string) (map[string]interface{}, []string, 
 	return acceptedParams, outputColumns, nil
 }
 
-// nyanGetSQLHandler は、JavaScript から呼ばれた nyanGetSQL の処理を実装します。
-func nyanGetSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
+// nyanRunSQLHandler は、JavaScript から呼ばれた nyanRunSQL の処理を実装します。
+func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	// 第一引数: SQL ファイルのパス
 	if len(call.Arguments) < 1 {
-		panic(vm.ToValue("nyanGetSQL requires at least the SQL file path as argument"))
+		panic(vm.ToValue("nyanRunSQL requires at least the SQL file path as argument"))
 	}
 	sqlFilePath := call.Argument(0).String()
 
