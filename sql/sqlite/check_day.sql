@@ -1,1 +1,1 @@
-SELECT count(id) AS this_days_count FROM stamps  WHERE date = /*date*/'2025-02-15';
+SELECT count(id) AS this_days_count FROM stamps  WHERE date LIKE /*date*/'2025-02-15';

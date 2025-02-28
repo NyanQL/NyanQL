@@ -63,7 +63,7 @@ type ErrorResponse struct {
 
 type APIConfig struct {
 	SQL         []string `json:"sql,omitempty"`    // SQL ファイルのパス。存在しなければ nil または空スライス
-	Script      []string `json:"script,omitempty"` // 任意の JavaScript ファイルを配列で指定可能
+	Script      string   `json:"script,omitempty"` // 任意の JavaScript ファイルを配列で指定可能
 	Check       string   `json:"check,omitempty"`  // 単一のチェック用 JavaScript ファイル。必要に応じて省略可能
 	Description string   `json:"description"`      // 説明文。ここは必須とするか、必要ならomitemptyを付けてもよい
 }
@@ -155,6 +155,7 @@ func adjustPaths(execDir string, config *Config) {
 	}
 }
 
+// SQLファイルの読み込み
 func loadSQLFiles(execDir string) {
 	apiFilePath := filepath.Join(execDir, "api.json")
 	data, err := ioutil.ReadFile(apiFilePath)
@@ -163,6 +164,17 @@ func loadSQLFiles(execDir string) {
 	}
 	if err := json.Unmarshal(data, &sqlFiles); err != nil {
 		log.Fatalf("Failed to decode SQL files JSON: %v", err)
+	}
+
+	// ここで "script" と "sql" の両方が設定されている場合にエラーとして起動を停止
+	for apiKey, apiConfig := range sqlFiles {
+		// script があり、かつ sql のエントリ数が > 0 ならエラー
+		if len(apiConfig.Script) > 0 && len(apiConfig.SQL) > 0 {
+			log.Fatalf(
+				"Configuration error in api.json for API '%s': If 'script' is set, 'sql' cannot be specified. Please remove one of them.",
+				apiKey,
+			)
+		}
 	}
 
 	// Update SQL file paths to be absolute if they are relative
@@ -175,6 +187,7 @@ func loadSQLFiles(execDir string) {
 	}
 }
 
+// ロガーの設定
 func setupLogger(execDir string) {
 	logFilePath := filepath.Join(execDir, config.Log.Filename)
 	if config.Log.EnableLogging {
@@ -211,14 +224,15 @@ func connectDB(config Config) (*sql.DB, error) {
 
 // リクエストの処理
 func handleRequest(w http.ResponseWriter, r *http.Request) {
+	// favicon.ico は無視
 	if r.URL.Path == "/favicon.ico" {
 		http.NotFound(w, r)
 		return
 	}
 
+	// リクエストパラメータを取得（JSON or フォーム）
 	contentType := r.Header.Get("Content-Type")
 	var params map[string]interface{}
-
 	if contentType == "application/json" {
 		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
@@ -245,46 +259,47 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// URLパスが "/" 以外の場合、apiパラメータとして扱う
+	// URLパスが "/" 以外の場合、api パラメータとして扱う
 	if r.URL.Path != "/" {
-		// 先頭の "/" を除去して api 名を取得
 		apiName := strings.TrimPrefix(r.URL.Path, "/")
 		if apiName != "" {
-			// すでに "api" が指定されていなければ、URLパスの値を設定
 			if _, exists := params["api"]; !exists {
 				params["api"] = apiName
 			}
 		}
 	}
 
+	// APIキー（名前）を取得
 	apiKey, ok := params["api"].(string)
 	if !ok || apiKey == "" {
 		sendJSONError(w, "API key is required and must be a string", http.StatusBadRequest)
 		return
 	}
 
+	// api.json から API 設定を取得
 	apiConfig, exists := sqlFiles[apiKey]
 	if !exists {
 		sendJSONError(w, "SQL files not found", http.StatusNotFound)
 		return
 	}
 
-	// SQLファイルから置換対象パラメータのキー配列を取得
+	// 置換対象パラメータキーの配列を取得
 	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
 	if err != nil {
 		log.Printf("Failed to get accepted params keys: %v", err)
 		acceptedKeys = []string{}
 	}
 
+	// リクエストパラメータから nyan_mode を取得（snake_case）
 	nyanMode, _ := params["nyan_mode"].(string)
 
-	if apiConfig.Check == "" && nyanMode == "checkOnly" {
-		// 404エラーをJSONで返す
+	// nyan_mode が "checkOnly" かつチェック用スクリプトが未設定の場合は 404 エラー
+	if nyanMode == "checkOnly" && apiConfig.Check == "" {
 		sendJSONError(w, "No check script for this API", http.StatusNotFound)
 		return
 	}
 
-	// チェック用 JavaScript の実行
+	// チェック用 JavaScript の実行（チェック用スクリプトが指定されている場合）
 	if apiConfig.Check != "" {
 		success, statusCode, errorObj, jsonStr, err := runCheckScript(apiConfig.Check, params, acceptedKeys)
 		if err != nil {
@@ -296,7 +311,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			if errorObj == nil {
 				errorObj = "Request check failed"
 			}
-			// チェックスクリプトの結果全体を返す
 			response := map[string]interface{}{
 				"success": success,
 				"status":  statusCode,
@@ -307,25 +321,38 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(response)
 			return
 		}
-		// SQL も script も未設定の場合は、チェック結果をそのまま返す
-		if len(apiConfig.SQL) == 0 && len(apiConfig.Script) == 0 {
+		// nyan_mode が "checkOnly" の場合はチェック結果のみを返す
+		if nyanMode == "checkOnly" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
 			w.Write([]byte(jsonStr))
 			return
 		}
+		// もし script の設定がある場合は、チェック成功なら script を実行してその結果を返す
+		if apiConfig.Script != "" {
+			scriptResult, err := runScript([]string{apiConfig.Script}, params)
+			if err != nil {
+				log.Printf("Script execution error: %v", err)
+				sendJSONError(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(scriptResult))
+			return
+		}
 
-		if nyanMode == "checkOnly" {
+		// チェックが成功し、なおかつ SQL も script も未設定の場合はチェック結果を返す
+		if len(apiConfig.SQL) == 0 && apiConfig.Script == "" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
-			// チェックスクリプトの返した JSON をそのまま書き出す
 			w.Write([]byte(jsonStr))
-			return // ここで関数終了 => SQL 等は実行しない
+			return
 		}
 	}
 
+	// SQL 実行へ進む場合
 	var tx *sql.Tx
-
 	if len(apiConfig.SQL) > 1 {
 		tx, err = db.Begin()
 		if err != nil {
@@ -347,7 +374,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Print(string(query))
 		queryStr, args := prepareQueryWithParams(string(query), params)
-
 		if isSelectQuery(queryStr) {
 			var rows *sql.Rows
 			if tx != nil {
@@ -361,7 +387,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			defer rows.Close()
-
 			lastJSON, err = RowsToJSON(rows)
 			if err != nil {
 				log.Printf("Failed to convert rows to JSON: %v", err)
@@ -554,14 +579,12 @@ func handleNyanOrDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 // /nyan/{API名} の詳細を返すハンドラー
-// /nyan/{API名} の詳細を返すハンドラー
 func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
 	type detailResponse struct {
 		API                string                 `json:"api"`
 		Description        string                 `json:"description"`
 		NyanAcceptedParams map[string]interface{} `json:"nyanAcceptedParams"`
-		// ← ここを追加
-		NyanOutputColumns []string `json:"nyanOutputColumns,omitempty"`
+		NyanOutputColumns  []string               `json:"nyanOutputColumns,omitempty"`
 	}
 
 	apiName := strings.TrimPrefix(r.URL.Path, "/nyan/")
@@ -576,7 +599,7 @@ func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1) パラメータを解析
+	// SQLファイルからパラメータ解析
 	paramsMap, err := parseSQLParams(apiConfig.SQL)
 	if err != nil {
 		log.Printf("Failed to parse SQL comments: %v", err)
@@ -584,24 +607,28 @@ func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2) 最後のSQLファイルがあればSELECTカラムを解析
-	var outputCols []string
-	if len(apiConfig.SQL) > 0 {
-		lastFile := apiConfig.SQL[len(apiConfig.SQL)-1]
-		cols, err := parseSelectColumns(lastFile)
+	var acceptedParamsFromScript map[string]interface{}
+	var outputColumns []string
+
+	// script が指定されている場合は、スクリプトから定数を抽出
+	if apiConfig.Script != "" {
+		acceptedParamsFromScript, outputColumns, err = parseScriptConstants(apiConfig.Script)
 		if err != nil {
-			log.Printf("Failed to parse columns from last SQL file: %v", err)
+			log.Printf("Failed to parse script constants: %v", err)
+			// 必須でなければログ出力のみ、もしくはエラー応答とするか検討してください
 		} else {
-			outputCols = cols
+			// スクリプトから得た acceptedParams を SQL で解析した内容とマージ（スクリプト側優先）
+			for k, v := range acceptedParamsFromScript {
+				paramsMap[k] = v
+			}
 		}
 	}
 
-	// 3) レスポンスを作成
 	resp := detailResponse{
 		API:                apiName,
 		Description:        apiConfig.Description,
 		NyanAcceptedParams: paramsMap,
-		NyanOutputColumns:  outputCols,
+		NyanOutputColumns:  outputColumns,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -971,4 +998,210 @@ func getAcceptedParamsKeys(sqlPaths []string) ([]string, error) {
 		keys = append(keys, k)
 	}
 	return keys, nil
+}
+
+// runScript は、config.JavascriptInclude で指定されたファイルと、
+// apiConfig.Script に指定されたスクリプト群を連結して実行し、結果の文字列を返します。
+func runScript(scriptPaths []string, params map[string]interface{}) (string, error) {
+	var combinedScript strings.Builder
+
+	// config.JavascriptInclude に指定されたファイルを全て読み込む
+	for _, includePath := range config.JavascriptInclude {
+		content, err := ioutil.ReadFile(includePath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read javascript include file %s: %v", includePath, err)
+		}
+		combinedScript.Write(content)
+		combinedScript.WriteString("\n")
+	}
+
+	// apiConfig.Script に指定された各スクリプトファイルを読み込む
+	for _, scriptPath := range scriptPaths {
+		content, err := ioutil.ReadFile(scriptPath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read script file %s: %v", scriptPath, err)
+		}
+		combinedScript.Write(content)
+		combinedScript.WriteString("\n")
+	}
+
+	// Goja の VM を作成し、パラメータをセット
+	vm := goja.New()
+	vm.Set("nyanAllParams", params)
+
+	//console
+	vm.Set("console", map[string]interface{}{
+		"log": func(call goja.FunctionCall) goja.Value {
+			args := []string{}
+			// JSON.stringify を取得して、オブジェクトの場合に文字列化する
+			jsonStringifyVal := vm.Get("JSON").ToObject(vm).Get("stringify")
+			jsonStringify, ok := goja.AssertFunction(jsonStringifyVal)
+			if !ok {
+				log.Println("JSON.stringify is not a function")
+				return goja.Undefined()
+			}
+			for _, arg := range call.Arguments {
+				exported := arg.Export()
+				switch exported.(type) {
+				case map[string]interface{}, []interface{}:
+					s, err := jsonStringify(goja.Undefined(), arg)
+					if err == nil {
+						args = append(args, s.String())
+					} else {
+						args = append(args, arg.String())
+					}
+				default:
+					args = append(args, arg.String())
+				}
+			}
+			log.Println("[JS:script]", strings.Join(args, " "))
+			return goja.Undefined()
+		},
+	})
+
+	// nyanGetAPI の登録（引数はオプション対応）
+	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
+		var url, username, password string
+		if len(call.Arguments) >= 1 {
+			url = call.Argument(0).String()
+		}
+		if len(call.Arguments) >= 2 {
+			username = call.Argument(1).String()
+		}
+		if len(call.Arguments) >= 3 {
+			password = call.Argument(2).String()
+		}
+		result, err := getAPI(url, username, password)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(result)
+	})
+
+	// nyanJsonAPI の登録（引数はオプション対応）
+	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
+		var url, jsonData, username, password string
+		if len(call.Arguments) >= 1 {
+			url = call.Argument(0).String()
+		}
+		if len(call.Arguments) >= 2 {
+			jsonData = call.Argument(1).String()
+		}
+		if len(call.Arguments) >= 3 {
+			username = call.Argument(2).String()
+		}
+		if len(call.Arguments) >= 4 {
+			password = call.Argument(3).String()
+		}
+		result, err := jsonAPI(url, []byte(jsonData), username, password)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(result)
+	})
+
+	vm.Set("nyanGetSQL", func(call goja.FunctionCall) goja.Value {
+		return nyanGetSQLHandler(vm, call)
+	})
+
+	// 連結したスクリプトを実行
+	value, err := vm.RunString(combinedScript.String())
+	if err != nil {
+		return "", fmt.Errorf("script execution error: %v", err)
+	}
+	return value.String(), nil
+}
+
+// parseScriptConstants は、指定されたスクリプトファイルから
+// const nyanAcceptedParams と const nyanOutputColumns の値を抽出して返します。
+func parseScriptConstants(scriptPath string) (map[string]interface{}, []string, error) {
+	data, err := ioutil.ReadFile(scriptPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read script file %s: %v", scriptPath, err)
+	}
+	content := string(data)
+
+	var acceptedParams map[string]interface{}
+	var outputColumns []string
+
+	// 改善した正規表現：末尾のセミコロンは含めず、括弧の中身のみをキャプチャ
+	reAcceptedParams := regexp.MustCompile(`(?s)const\s+nyanAcceptedParams\s*=\s*({[\s\S]*?})\s*;`)
+	if match := reAcceptedParams.FindStringSubmatch(content); match != nil && len(match) > 1 {
+		jsonStr := match[1]
+		if err := json.Unmarshal([]byte(jsonStr), &acceptedParams); err != nil {
+			return nil, nil, fmt.Errorf("failed to parse nyanAcceptedParams: %v", err)
+		}
+	}
+
+	// 改善した正規表現：[] の中身を正しくキャプチャ（改行や空白も含む）
+	reOutputColumns := regexp.MustCompile(`(?s)const\s+nyanOutputColumns\s*=\s*(\[[\s\S]*?\])\s*;`)
+	if match := reOutputColumns.FindStringSubmatch(content); match != nil && len(match) > 1 {
+		jsonStr := match[1]
+		if err := json.Unmarshal([]byte(jsonStr), &outputColumns); err != nil {
+			return nil, nil, fmt.Errorf("failed to parse nyanOutputColumns: %v", err)
+		}
+	}
+
+	log.Print(outputColumns)
+
+	return acceptedParams, outputColumns, nil
+}
+
+// nyanGetSQLHandler は、JavaScript から呼ばれた nyanGetSQL の処理を実装します。
+func nyanGetSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
+	// 第一引数: SQL ファイルのパス
+	if len(call.Arguments) < 1 {
+		panic(vm.ToValue("nyanGetSQL requires at least the SQL file path as argument"))
+	}
+	sqlFilePath := call.Argument(0).String()
+
+	// 第二引数: オプションのパラメータオブジェクト（存在しなければ空のマップ）
+	var params map[string]interface{}
+	if len(call.Arguments) >= 2 {
+		if obj, ok := call.Argument(1).Export().(map[string]interface{}); ok {
+			params = obj
+		} else {
+			params = make(map[string]interface{})
+		}
+	} else {
+		params = make(map[string]interface{})
+	}
+
+	// SQL ファイルを読み込む
+	sqlContent, err := ioutil.ReadFile(sqlFilePath)
+	if err != nil {
+		panic(vm.ToValue(fmt.Sprintf("failed to read SQL file %s: %v", sqlFilePath, err)))
+	}
+
+	// SQL 内のパラメータを置換
+	queryStr, args := prepareQueryWithParams(string(sqlContent), params)
+
+	// SELECT クエリなら結果を JSON に変換して返す
+	if isSelectQuery(queryStr) {
+		rows, err := db.Query(queryStr, args...)
+		if err != nil {
+			panic(vm.ToValue(fmt.Sprintf("error executing SQL query: %v", err)))
+		}
+		defer rows.Close()
+		jsonBytes, err := RowsToJSON(rows)
+		if err != nil {
+			panic(vm.ToValue(fmt.Sprintf("error converting rows to JSON: %v", err)))
+		}
+		return vm.ToValue(string(jsonBytes))
+	} else {
+		// SELECT 以外の場合は、影響を受けた行数を返す
+		res, err := db.Exec(queryStr, args...)
+		if err != nil {
+			panic(vm.ToValue(fmt.Sprintf("error executing SQL query: %v", err)))
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			panic(vm.ToValue(fmt.Sprintf("error retrieving rows affected: %v", err)))
+		}
+		response := map[string]interface{}{
+			"rowsAffected": affected,
+		}
+		jsonResp, _ := json.Marshal(response)
+		return vm.ToValue(string(jsonResp))
+	}
 }
