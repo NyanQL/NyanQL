@@ -28,5 +28,9 @@
     "check": "./javascript/check_test1.js",
     "script": "./javascript/script.js",
     "description": "checkだけでsqlなしです。"
+  },
+  "ids": {
+    "sql": ["./sql/sqlite/get_by_ids.sql"],
+    "description": "idsをテスト"
   }
 }
