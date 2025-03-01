@@ -507,31 +507,46 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// push 処理
+	// push 処理
 	if apiConfig.Push != "" {
 		pushConfig, exists := sqlFiles[apiConfig.Push]
 		if exists {
-			resultJSON, err := executeAPIConfig(pushConfig)
-			if err != nil {
-				log.Printf("Push API 実行エラー: %v", err)
-			} else {
-				// pushされるJSONも success, status, result の構造にする
-				type SQLResponse struct {
-					Success bool            `json:"success"`
-					Status  int             `json:"status"`
-					Result  json.RawMessage `json:"result"`
-				}
-				pushResponse := SQLResponse{
-					Success: true,
-					Status:  200,
-					Result:  resultJSON,
-				}
-				pushData, err := json.Marshal(pushResponse)
+			var pushResult []byte
+			var err error
+			// push対象のAPIで script が設定されている場合は、その結果をそのまま使用
+			if pushConfig.Script != "" {
+				scriptResult, err := runScript([]string{pushConfig.Script}, params)
 				if err != nil {
-					log.Printf("Push response JSON marshal error: %v", err)
+					log.Printf("Push API script error: %v", err)
 				} else {
-					log.Printf("Broadcasting push result to channel [%s]: %s", apiConfig.Push, pushData)
-					hub.Broadcast(apiConfig.Push, pushData)
+					pushResult = []byte(scriptResult)
 				}
+			} else {
+				// それ以外の場合は、SQL実行結果をラップする
+				pushResult, err = executeAPIConfig(pushConfig)
+				if err != nil {
+					log.Printf("Push API execution error: %v", err)
+				} else {
+					// SQLの場合は、固定のラッパーで出力する
+					type SQLResponse struct {
+						Success bool            `json:"success"`
+						Status  int             `json:"status"`
+						Result  json.RawMessage `json:"result"`
+					}
+					response := SQLResponse{
+						Success: true,
+						Status:  200,
+						Result:  pushResult,
+					}
+					pushResult, err = json.Marshal(response)
+					if err != nil {
+						log.Printf("Push response JSON marshal error: %v", err)
+					}
+				}
+			}
+			if pushResult != nil {
+				log.Printf("Broadcasting push result to channel [%s]: %s", apiConfig.Push, pushResult)
+				hub.Broadcast(apiConfig.Push, pushResult)
 			}
 		} else {
 			log.Printf("Push API設定 [%s] が見つかりません", apiConfig.Push)
