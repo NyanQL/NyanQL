@@ -1005,28 +1005,40 @@ func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 		params = make(map[string]interface{})
 	}
 
-	// SQLファイルを読み込む
+	// SQLファイルの読み込み
 	sqlContent, err := ioutil.ReadFile(sqlFilePath)
-	// エラーチェックは省略
 	if err != nil {
 		panic(vm.ToValue(fmt.Sprintf("failed to read SQL file %s: %v", sqlFilePath, err)))
 	}
 	normalizedSQL := normalizeSQL(string(sqlContent))
 	log.Print(normalizedSQL)
 
-	// まず、外側ブロック（-- BEGIN -- ～ -- END --）を処理する
-	processedSQL := processWhereBlock(string(normalizedSQL), params)
-	// 次に、従来形式のIFブロック（/*IF ...*/ ... /*END*/）も処理する
+	// 外側ブロックと IF ブロックの処理
+	processedSQL := processWhereBlock(normalizedSQL, params)
 	processedSQL = processConditionals(processedSQL, params)
 	log.Print("Processed SQL: ", processedSQL)
 
-	// SQL内のパラメータ置換を実施
+	// パラメータ置換
 	queryStr, args := prepareQueryWithParams(processedSQL, params)
 	log.Print("Final Query: ", queryStr)
 
-	// SELECTクエリなら結果をJSONに変換して返す
+	// トランザクションが存在するか確認
+	var execer interface {
+		Query(query string, args ...interface{}) (*sql.Rows, error)
+		Exec(query string, args ...interface{}) (sql.Result, error)
+	}
+	if txVal := vm.Get("nyanTx"); txVal != nil && txVal.Export() != nil {
+		if tx, ok := txVal.Export().(*sql.Tx); ok {
+			execer = tx
+		}
+	}
+	if execer == nil {
+		execer = db
+	}
+
+	// SQL の実行
 	if isSelectQuery(queryStr) {
-		rows, err := db.Query(queryStr, args...)
+		rows, err := execer.Query(queryStr, args...)
 		if err != nil {
 			panic(vm.ToValue(fmt.Sprintf("error executing SQL query: %v", err)))
 		}
@@ -1037,8 +1049,7 @@ func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 		}
 		return vm.ToValue(string(jsonBytes))
 	} else {
-		// SELECT以外の場合は、影響を受けた行数を返す
-		result, err := db.Exec(queryStr, args...)
+		result, err := execer.Exec(queryStr, args...)
 		if err != nil {
 			panic(vm.ToValue(fmt.Sprintf("error executing SQL query: %v", err)))
 		}
@@ -1209,8 +1220,25 @@ func getAcceptedParamsKeys(sqlPaths []string) ([]string, error) {
 	return keys, nil
 }
 
-// api.jsonで指定されたscriptのファイルを実行する処理
+// runScript は、指定された JavaScript ファイル群を結合して実行します。
+// この関数の先頭で DB トランザクションを開始し、グローバル変数 "nyanTx" として VM に渡します。
+// スクリプト内で複数の nyanRunSQLHandler 呼び出しがあった場合、すべて同一トランザクション下で実行されます。
+// スクリプトの実行が成功すればコミット、エラーがあればロールバックします。
 func runScript(scriptPaths []string, params map[string]interface{}) (string, error) {
+	// トランザクション開始
+	tx, err := db.Begin()
+	if err != nil {
+		return "", fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	// コミット済みかどうかのフラグ（defer で rollback するため）
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+
+	// javascript_include に指定されたファイルと scriptPaths の内容を結合
 	var combinedScript strings.Builder
 	for _, includePath := range config.JavascriptInclude {
 		content, err := ioutil.ReadFile(includePath)
@@ -1228,8 +1256,14 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 		combinedScript.Write(content)
 		combinedScript.WriteString("\n")
 	}
+
+	// JavaScript VM の生成
 	vm := goja.New()
+	// VM にパラメータとトランザクションオブジェクトをセット
 	vm.Set("nyanAllParams", params)
+	vm.Set("nyanTx", tx)
+
+	// console.log の定義
 	vm.Set("console", map[string]interface{}{
 		"log": func(call goja.FunctionCall) goja.Value {
 			var args []string
@@ -1257,6 +1291,8 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 			return goja.Undefined()
 		},
 	})
+
+	// VM にその他のヘルパー関数をセット（例: nyanGetAPI, nyanJsonAPI, nyanRunSQL）
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
 		var url, username, password string
 		if len(call.Arguments) >= 1 {
@@ -1297,10 +1333,19 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 	vm.Set("nyanRunSQL", func(call goja.FunctionCall) goja.Value {
 		return nyanRunSQLHandler(vm, call)
 	})
+
+	// スクリプト実行
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
 		return "", fmt.Errorf("script execution error: %v", err)
 	}
+
+	// トランザクションコミット
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("failed to commit transaction: %v", err)
+	}
+	committed = true
+
 	return value.String(), nil
 }
 
