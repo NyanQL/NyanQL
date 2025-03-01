@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/dop251/goja"
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/gorilla/websocket"
 	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/natefinch/lumberjack"
@@ -21,6 +22,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type Config struct {
@@ -63,7 +65,27 @@ type APIConfig struct {
 	SQL         []string `json:"sql,omitempty"`
 	Script      string   `json:"script,omitempty"`
 	Check       string   `json:"check,omitempty"`
+	Push        string   `json:"push,omitempty"`
 	Description string   `json:"description"`
+}
+
+type Hub struct {
+	mu      sync.Mutex
+	clients map[string]map[*websocket.Conn]bool // チャネル名ごとのクライアント一覧
+}
+
+type SQLResponse struct {
+	Success bool            `json:"success"`
+	Status  int             `json:"status"`
+	Result  json.RawMessage `json:"result"`
+}
+
+type JSONErrorResponse struct {
+	Success bool `json:"success"`
+	Status  int  `json:"status"`
+	Error   struct {
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 var config Config
@@ -74,12 +96,15 @@ var dbType string
 // reParams は、/*id*/ のようなプレースホルダーを抽出する正規表現
 var reParams = regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
 
-type DetailResponse struct {
-	API                string                 `json:"api"`
-	Description        string                 `json:"description"`
-	NyanAcceptedParams map[string]interface{} `json:"nyanAcceptedParams"`
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // 必要に応じてオリジンチェックを追加
+	},
 }
 
+var hub *Hub
+
+// main
 func main() {
 	execDir, err := os.Executable()
 	if err != nil {
@@ -112,12 +137,13 @@ func main() {
 		AllowedHeaders: []string{"Content-Type", "Authorization"},
 	})
 
+	hub = NewHub()
+
 	http.Handle("/nyan/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		basicAuth(handleNyanOrDetail, config)(w, r)
 	})))
-	http.Handle("/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		basicAuth(handleRequest, config)(w, r)
-	})))
+
+	http.Handle("/", corsHandler.Handler(http.HandlerFunc(unifiedHandler)))
 
 	if config.CertPath != "" && config.KeyPath != "" {
 		log.Printf("Server starting on HTTPS port %d\n", config.Port)
@@ -125,6 +151,81 @@ func main() {
 	} else {
 		log.Printf("Server starting on HTTP port %d\n", config.Port)
 		log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", config.Port), nil))
+	}
+}
+
+func (h *Hub) AddClient(channel string, conn *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.clients == nil {
+		h.clients = make(map[string]map[*websocket.Conn]bool)
+	}
+	if _, ok := h.clients[channel]; !ok {
+		h.clients[channel] = make(map[*websocket.Conn]bool)
+	}
+	h.clients[channel][conn] = true
+}
+
+func (h *Hub) RemoveClient(channel string, conn *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if clients, ok := h.clients[channel]; ok {
+		delete(clients, conn)
+		if len(clients) == 0 {
+			delete(h.clients, channel)
+		}
+	}
+}
+func NewHub() *Hub {
+	return &Hub{
+		clients: make(map[string]map[*websocket.Conn]bool),
+	}
+}
+
+func unifiedHandler(w http.ResponseWriter, r *http.Request) {
+	// WebSocketアップグレード要求なら認証後、handleWebSocketに処理を委譲
+	if isWebSocketRequest(r) {
+		// ここで必要ならBasicAuthの認証を実施
+		// もしくはWebSocket用に別の認証方式を採用する
+		handleWebSocket(w, r)
+		return
+	}
+	// 通常のHTTPリクエストならBasicAuthを適用して処理
+	basicAuth(handleRequest, config)(w, r)
+}
+
+// WebSocketリクエストかどうかを判定する関数例
+func isWebSocketRequest(r *http.Request) bool {
+	upgrade := r.Header.Get("Upgrade")
+	return strings.ToLower(upgrade) == "websocket"
+}
+
+// WebSocketアップグレードと接続管理を行う関数
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// ここでは、例えばURLパスの末尾をチャネル名として利用する例
+	parts := strings.Split(r.URL.Path, "/")
+	channel := "default" // デフォルトチャネル
+	if len(parts) > 1 && parts[len(parts)-1] != "" {
+		channel = parts[len(parts)-1]
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocketアップグレードエラー: %v", err)
+		return
+	}
+	hub.AddClient(channel, conn)
+	defer hub.RemoveClient(channel, conn)
+
+	// シンプルな読み込みループ（ここで受信したメッセージを必要に応じて処理可能）
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			log.Printf("WebSocket read error: %v", err)
+			break
+		}
+		// 受信メッセージのログ出力例
+		log.Printf("Received on channel [%s]: %s", channel, msg)
 	}
 }
 
@@ -405,8 +506,53 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		lastJSON = []byte("[]")
 	}
 
+	// push 処理
+	if apiConfig.Push != "" {
+		pushConfig, exists := sqlFiles[apiConfig.Push]
+		if exists {
+			resultJSON, err := executeAPIConfig(pushConfig)
+			if err != nil {
+				log.Printf("Push API 実行エラー: %v", err)
+			} else {
+				// pushされるJSONも success, status, result の構造にする
+				type SQLResponse struct {
+					Success bool            `json:"success"`
+					Status  int             `json:"status"`
+					Result  json.RawMessage `json:"result"`
+				}
+				pushResponse := SQLResponse{
+					Success: true,
+					Status:  200,
+					Result:  resultJSON,
+				}
+				pushData, err := json.Marshal(pushResponse)
+				if err != nil {
+					log.Printf("Push response JSON marshal error: %v", err)
+				} else {
+					log.Printf("Broadcasting push result to channel [%s]: %s", apiConfig.Push, pushData)
+					hub.Broadcast(apiConfig.Push, pushData)
+				}
+			}
+		} else {
+			log.Printf("Push API設定 [%s] が見つかりません", apiConfig.Push)
+		}
+	}
+
+	// SQL実行結果を固定順序の構造体で返す
+	type SQLResponse struct {
+		Success bool            `json:"success"`
+		Status  int             `json:"status"`
+		Result  json.RawMessage `json:"result"`
+	}
+	response := SQLResponse{
+		Success: true,
+		Status:  200,
+		Result:  lastJSON,
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(lastJSON)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Failed to encode JSON: %v", err)
+	}
 }
 
 func isSelectQuery(query string) bool {
@@ -710,10 +856,33 @@ func splitTopLevelColumns(selectPart string) []string {
 	return result
 }
 
-func sendJSONError(w http.ResponseWriter, errPayload interface{}, statusCode int) {
+func sendJSONError(w http.ResponseWriter, message interface{}, statusCode int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	json.NewEncoder(w).Encode(ErrorResponse{Error: errPayload})
+
+	response := JSONErrorResponse{
+		Success: false,
+		Status:  statusCode,
+	}
+
+	switch msg := message.(type) {
+	case string:
+		response.Error.Message = msg
+	case error:
+		response.Error.Message = msg.Error()
+	default:
+		// その他の場合はJSONに変換して文字列化
+		b, err := json.Marshal(msg)
+		if err != nil {
+			response.Error.Message = "An unknown error occurred"
+		} else {
+			response.Error.Message = string(b)
+		}
+	}
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Failed to encode JSON error response: %v", err)
+	}
 }
 
 // 従来形式の IF ブロック処理（/*IF ...*/ ... /*END*/）
@@ -1234,4 +1403,49 @@ func processCommentConditionals(block string, params map[string]interface{}) str
 func normalizeSQL(sqlText string) string {
 	// \s+ は空白文字（スペース、タブ、改行など）の連続にマッチする
 	return regexp.MustCompile(`\s+`).ReplaceAllString(sqlText, " ")
+}
+
+func executeAPIConfig(apiConfig APIConfig) ([]byte, error) {
+	// ここでは、SQLが設定されている場合、最初のSQLファイルを実行する例です
+	if len(apiConfig.SQL) > 0 {
+		query, err := ioutil.ReadFile(apiConfig.SQL[0])
+		if err != nil {
+			return nil, fmt.Errorf("failed to read SQL file: %v", err)
+		}
+		// パラメータが必要な場合は適宜設定してください
+		rows, err := db.Query(string(query))
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute query: %v", err)
+		}
+		defer rows.Close()
+		return RowsToJSON(rows)
+	}
+	// Scriptが設定されている場合は runScript を使う例
+	if apiConfig.Script != "" {
+		result, err := runScript([]string{apiConfig.Script}, make(map[string]interface{}))
+		if err != nil {
+			return nil, err
+		}
+		return []byte(result), nil
+	}
+	return nil, fmt.Errorf("no executable configuration found")
+}
+
+func (h *Hub) Broadcast(channel string, message []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	clients, ok := h.clients[channel]
+	if !ok {
+		log.Printf("Channel [%s] に接続しているクライアントがありません", channel)
+		return
+	}
+	for conn := range clients {
+		if conn == nil {
+			// nil の接続があればスキップ
+			continue
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			log.Printf("チャネル [%s] への送信エラー: %v", channel, err)
+		}
+	}
 }

@@ -5,7 +5,8 @@
   },
   "check": {
     "sql": ["./sql/sqlite/checkToday.sql"],
-    "description": "本日の登録があるか確認します。"
+    "description": "本日の登録があるか確認します。",
+    "push": "list"
   },
   "stamp":{
     "sql": ["./sql/sqlite/insert_stamp.sql"],
