@@ -1025,6 +1025,7 @@ func getAcceptedParamsKeys(sqlPaths []string) ([]string, error) {
 	return keys, nil
 }
 
+// api.jsonで指定されたscriptのファイルを実行する処理
 func runScript(scriptPaths []string, params map[string]interface{}) (string, error) {
 	var combinedScript strings.Builder
 	for _, includePath := range config.JavascriptInclude {
@@ -1143,7 +1144,6 @@ func evaluateCondition(cond string, params map[string]interface{}) bool {
 }
 
 // checkOneCondition は、単一の条件（例："id != null" または "id == null"）を評価します。
-// 条件が "BEGIN" なら常に真とします。
 func checkOneCondition(cond string, params map[string]interface{}) bool {
 	cond = strings.TrimSpace(cond)
 	if strings.ToUpper(cond) == "BEGIN" {
@@ -1211,8 +1211,6 @@ func processWhereBlock(sqlText string, params map[string]interface{}) string {
 }
 
 // processCommentConditionals は、IFブロック（/*IF ...*/ ... /*END*/）を処理します。
-// マーカー間の文字列を抽出し、条件が "BEGIN" なら無条件で内容を返し、
-// それ以外は evaluateCondition によって判定します。
 func processCommentConditionals(block string, params map[string]interface{}) string {
 	// 正規表現で非貪欲にIFブロックをマッチさせる
 	re := regexp.MustCompile(`(?s)/\*IF\s+(.*?)\*/(.*?)\s*/\*END\*/`)
