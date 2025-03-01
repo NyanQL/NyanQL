@@ -12,11 +12,11 @@ function main(){
     console.log(JSON.stringify(data));
     data.ids = [2];
     console.log(data);
-    let result = JSON.parse(nyanRunSQL("./sql/sqlite/get_by_ids.sql" , data));
+    let result = JSON.parse(nyanRunSQL("./sql/sqlite/checkToday.sql" , {}));
 
     console.log(JSON.stringify(result));
 
-    return JSON.stringify({success: true, status: 200, data: { result: result} });
+    return JSON.stringify({success: true, status: 200, result: result , api: nyanAllParams.api });
 }
 
 main();
