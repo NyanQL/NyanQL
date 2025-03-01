@@ -716,70 +716,6 @@ func sendJSONError(w http.ResponseWriter, errPayload interface{}, statusCode int
 	json.NewEncoder(w).Encode(ErrorResponse{Error: errPayload})
 }
 
-// processWhereBlock は、-- BEGIN -- ～ -- END -- のブロックを行単位で処理します。
-// ブロック内の行（通常はWHERE句および複数のIF行）が処理され、少なくとも1つIFが成立すればブロック全体が出力されます。
-func processWhereBlock(sqlText string, params map[string]interface{}) string {
-	lines := strings.Split(sqlText, "\n")
-	var outputLines []string
-	inBlock := false
-	var blockLines []string
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "-- BEGIN") {
-			inBlock = true
-			blockLines = []string{}
-			continue
-		}
-		if strings.HasPrefix(trimmed, "-- END") && inBlock {
-			inBlock = false
-			processedBlock := processCommentConditionals(strings.Join(blockLines, "\n"), params)
-			if strings.TrimSpace(processedBlock) != "" {
-				outputLines = append(outputLines, processedBlock)
-			}
-			continue
-		}
-		if inBlock {
-			blockLines = append(blockLines, line)
-		} else {
-			outputLines = append(outputLines, line)
-		}
-	}
-	return strings.Join(outputLines, "\n")
-}
-
-// processCommentConditionals は、-- IF ... -- END -- の形式の行を処理します。
-// 形式は "– IF <条件>-- <内容> -- END --" で、条件部分は evaluateCondition で評価します。
-// IF行以外はそのまま残します。
-func processCommentConditionals(block string, params map[string]interface{}) string {
-	lines := strings.Split(block, "\n")
-	var resultLines []string
-	anyConditionSatisfied := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "-- IF") && strings.HasSuffix(trimmed, "-- END --") {
-			inner := strings.TrimPrefix(trimmed, "-- IF")
-			inner = strings.TrimSuffix(inner, "-- END --")
-			inner = strings.TrimSpace(inner)
-			// ここでは "--" を区切り文字として、最初の部分を条件、2番目を出力内容とみなす
-			parts := strings.SplitN(inner, "--", 2)
-			if len(parts) == 2 {
-				cond := strings.TrimSpace(parts[0])
-				content := strings.TrimSpace(parts[1])
-				if evaluateCondition(cond, params) {
-					resultLines = append(resultLines, content)
-					anyConditionSatisfied = true
-				}
-			}
-		} else {
-			resultLines = append(resultLines, line)
-		}
-	}
-	if anyConditionSatisfied {
-		return strings.Join(resultLines, "\n")
-	}
-	return ""
-}
-
 // 従来形式の IF ブロック処理（/*IF ...*/ ... /*END*/）
 func processConditionalsOnce(query string, params map[string]interface{}) string {
 	reIf := regexp.MustCompile(`(?s)/\*IF\s+(.*?)\*/(.*?)/\*END\*/`)
@@ -839,21 +775,6 @@ func processConditionals(query string, params map[string]interface{}) string {
 	return query
 }
 
-func isEmpty(val interface{}) bool {
-	if val == nil {
-		return true
-	}
-	switch v := val.(type) {
-	case string:
-		return strings.TrimSpace(v) == ""
-	case []interface{}:
-		return len(v) == 0
-	case []string:
-		return len(v) == 0
-	}
-	return false
-}
-
 // --- 従来の parseScriptConstants もそのまま ---
 func parseScriptConstants(scriptPath string) (map[string]interface{}, []string, error) {
 	data, err := ioutil.ReadFile(scriptPath)
@@ -902,12 +823,15 @@ func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 
 	// SQLファイルを読み込む
 	sqlContent, err := ioutil.ReadFile(sqlFilePath)
+	// エラーチェックは省略
 	if err != nil {
 		panic(vm.ToValue(fmt.Sprintf("failed to read SQL file %s: %v", sqlFilePath, err)))
 	}
+	normalizedSQL := normalizeSQL(string(sqlContent))
+	log.Print(normalizedSQL)
 
 	// まず、外側ブロック（-- BEGIN -- ～ -- END --）を処理する
-	processedSQL := processWhereBlock(string(sqlContent), params)
+	processedSQL := processWhereBlock(string(normalizedSQL), params)
 	// 次に、従来形式のIFブロック（/*IF ...*/ ... /*END*/）も処理する
 	processedSQL = processConditionals(processedSQL, params)
 	log.Print("Processed SQL: ", processedSQL)
@@ -1195,16 +1119,13 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 	return value.String(), nil
 }
 
-// evaluateCondition は、条件文字列（例："id != null OR date != null" や "id != null AND date != null"）を
-// 解析し、パラメータに基づいて成立するかどうかを判定します。
-// まず "OR" で分割し、各部分についてさらに "AND" で分割してすべてが真なら、その部分は真と判断します。
-// 複数のOR部分のいずれかが真なら全体として真になります。
+// evaluateCondition は、条件文字列（例："id != null OR date != null" や "id != null AND date != null"）を解析して評価します。
+// まず "OR" で分割し、各部分についてさらに "AND" で分割、すべてが成立すればそのOR部分は成立とみなし、
+// いずれかが成立すれば全体でtrueを返します。
 func evaluateCondition(cond string, params map[string]interface{}) bool {
-	// "OR" で分割
 	orParts := strings.Split(cond, "OR")
 	for _, orPart := range orParts {
 		orPart = strings.TrimSpace(orPart)
-		// "AND" でさらに分割
 		andParts := strings.Split(orPart, "AND")
 		allTrue := true
 		for _, andPart := range andParts {
@@ -1221,9 +1142,13 @@ func evaluateCondition(cond string, params map[string]interface{}) bool {
 	return false
 }
 
-// checkOneCondition は、1つの単一条件（例："id != null" または "id == null"）を評価します。
+// checkOneCondition は、単一の条件（例："id != null" または "id == null"）を評価します。
+// 条件が "BEGIN" なら常に真とします。
 func checkOneCondition(cond string, params map[string]interface{}) bool {
 	cond = strings.TrimSpace(cond)
+	if strings.ToUpper(cond) == "BEGIN" {
+		return true
+	}
 	if strings.Contains(cond, "!=") {
 		parts := strings.SplitN(cond, "!=", 2)
 		if len(parts) != 2 {
@@ -1231,8 +1156,6 @@ func checkOneCondition(cond string, params map[string]interface{}) bool {
 		}
 		paramName := strings.TrimSpace(parts[0])
 		expected := strings.TrimSpace(parts[1])
-		// expected が "null"（大文字・小文字を区別しない）なら、
-		// params に値が存在し、かつ空でなければ真
 		if strings.ToLower(expected) == "null" {
 			if val, exists := params[paramName]; exists && !isEmpty(val) {
 				return true
@@ -1245,7 +1168,6 @@ func checkOneCondition(cond string, params map[string]interface{}) bool {
 		}
 		paramName := strings.TrimSpace(parts[0])
 		expected := strings.TrimSpace(parts[1])
-		// expected が "null"なら、params に値が存在しないか空なら真
 		if strings.ToLower(expected) == "null" {
 			if val, exists := params[paramName]; !exists || isEmpty(val) {
 				return true
@@ -1253,4 +1175,65 @@ func checkOneCondition(cond string, params map[string]interface{}) bool {
 		}
 	}
 	return false
+}
+
+// isEmpty は、値が nil、空文字、または空のスライスの場合に true を返します。
+func isEmpty(val interface{}) bool {
+	if val == nil {
+		return true
+	}
+	switch v := val.(type) {
+	case string:
+		return strings.TrimSpace(v) == ""
+	case []interface{}:
+		return len(v) == 0
+	case []string:
+		return len(v) == 0
+	}
+	return false
+}
+
+// processWhereBlock は、SQL全文から外側ブロック (/*BEGIN*/ ～ /*END*/) を抽出し、
+// ブロック内のIFブロック（/*IF ...*/ ... /*END*/）を処理して、外側ブロックを置き換えます。
+func processWhereBlock(sqlText string, params map[string]interface{}) string {
+	beginIdx := strings.Index(sqlText, "/*BEGIN*/")
+	endIdx := strings.LastIndex(sqlText, "/*END*/")
+	if beginIdx == -1 || endIdx == -1 || beginIdx >= endIdx {
+		return sqlText
+	}
+	// 外側ブロック内の内容を抽出
+	blockContent := sqlText[beginIdx+len("/*BEGIN*/") : endIdx]
+	// ブロック内のIFブロックを処理する（normalize も必要に応じて行う）
+	processedBlock := processCommentConditionals(blockContent, params)
+	// 外側ブロック全体を置き換える
+	result := sqlText[:beginIdx] + processedBlock + sqlText[endIdx+len("/*END*/"):]
+	return result
+}
+
+// processCommentConditionals は、IFブロック（/*IF ...*/ ... /*END*/）を処理します。
+// マーカー間の文字列を抽出し、条件が "BEGIN" なら無条件で内容を返し、
+// それ以外は evaluateCondition によって判定します。
+func processCommentConditionals(block string, params map[string]interface{}) string {
+	// 正規表現で非貪欲にIFブロックをマッチさせる
+	re := regexp.MustCompile(`(?s)/\*IF\s+(.*?)\*/(.*?)\s*/\*END\*/`)
+	processed := re.ReplaceAllStringFunc(block, func(match string) string {
+		submatches := re.FindStringSubmatch(match)
+		if len(submatches) < 3 {
+			return ""
+		}
+		cond := strings.TrimSpace(submatches[1])
+		content := strings.TrimSpace(submatches[2])
+		// 特別条件 "BEGIN" なら無条件に出力
+		if strings.ToUpper(cond) == "BEGIN" || evaluateCondition(cond, params) {
+			return content
+		}
+		return ""
+	})
+	return processed
+}
+
+// 余分な空白文字（改行、タブ、連続するスペース）を1つのスペースに正規化する関数
+func normalizeSQL(sqlText string) string {
+	// \s+ は空白文字（スペース、タブ、改行など）の連続にマッチする
+	return regexp.MustCompile(`\s+`).ReplaceAllString(sqlText, " ")
 }
