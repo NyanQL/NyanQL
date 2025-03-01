@@ -38,16 +38,14 @@ type Config struct {
 	DBPort            string          `json:"DBPort"`
 	BasicAuth         BasicAuthConfig `json:"BasicAuth"`
 	Log               LogConfig       `json:"log"`
-	JavascriptInclude []string        `json:"javascript_include,omitempty"` // 新規フィールド
+	JavascriptInclude []string        `json:"javascript_include,omitempty"`
 }
 
-// BasicAuthConfig represents basic authentication configuration
 type BasicAuthConfig struct {
 	Username string `json:"Username"`
 	Password string `json:"Password"`
 }
 
-// LogConfig represents logging configuration
 type LogConfig struct {
 	Filename      string `json:"Filename"`
 	MaxSize       int    `json:"MaxSize"`
@@ -57,23 +55,24 @@ type LogConfig struct {
 	EnableLogging bool   `json:"EnableLogging"`
 }
 
-// ErrorResponse represents a JSON error response
 type ErrorResponse struct {
 	Error interface{} `json:"error"`
 }
 
 type APIConfig struct {
-	SQL         []string `json:"sql,omitempty"`    // SQL ファイルのパス。存在しなければ nil または空スライス
-	Script      string   `json:"script,omitempty"` // 任意の JavaScript ファイルを配列で指定可能
-	Check       string   `json:"check,omitempty"`  // 単一のチェック用 JavaScript ファイル。必要に応じて省略可能
-	Description string   `json:"description"`      // 説明文。ここは必須とするか、必要ならomitemptyを付けてもよい
+	SQL         []string `json:"sql,omitempty"`
+	Script      string   `json:"script,omitempty"`
+	Check       string   `json:"check,omitempty"`
+	Description string   `json:"description"`
 }
 
 var config Config
 var db *sql.DB
 var sqlFiles map[string]APIConfig
 var dbType string
-var reParams = regexp.MustCompile(`(?s)\/\*\s*([^*\/]+)\s*\*\/\s*(?:'([^']*)'|([^\s,;]+))`)
+
+// reParams は、/*id*/ のようなプレースホルダーを抽出する正規表現
+var reParams = regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
 
 type DetailResponse struct {
 	API                string                 `json:"api"`
@@ -82,55 +81,40 @@ type DetailResponse struct {
 }
 
 func main() {
-	// 現在の作業ディレクトリを取得
 	execDir, err := os.Executable()
 	if err != nil {
 		log.Fatalf("Failed to get executable path: %v", err)
 	}
-	execDir = filepath.Dir(execDir) // 実行ファイルのディレクトリを取得
+	execDir = filepath.Dir(execDir)
 
 	configFilePath := filepath.Join(execDir, "config.json")
-	configFile, err := os.Open(configFilePath) // 既に err が宣言されているので "=" を使用
+	configFile, err := os.Open(configFilePath)
 	if err != nil {
 		log.Fatalf("Failed to open config file: %v", err)
 	}
 	defer configFile.Close()
-
-	err = json.NewDecoder(configFile).Decode(&config)
-	if err != nil {
+	if err = json.NewDecoder(configFile).Decode(&config); err != nil {
 		log.Fatalf("Failed to decode config JSON: %v", err)
 	}
-
-	// Adjust relative paths in the configuration
 	adjustPaths(execDir, &config)
-
-	// Display version
 	log.Printf("Starting application version: %s", config.Version)
-
-	// Configure logger
 	setupLogger(execDir)
 
-	// Connect to the database
 	db, err = connectDB(config)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	loadSQLFiles(execDir)
 
-	// Set up CORS
 	corsHandler := cors.New(cors.Options{
 		AllowedOrigins: []string{"*"},
 		AllowedMethods: []string{"GET", "POST", "OPTIONS", "PUT", "DELETE"},
 		AllowedHeaders: []string{"Content-Type", "Authorization"},
 	})
 
-	// /nyan エンドポイントの登録（Basic Auth も適用）
 	http.Handle("/nyan/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Basic Auth を適用
 		basicAuth(handleNyanOrDetail, config)(w, r)
 	})))
-
-	// その他のリクエストに対しても Basic Auth を適用
 	http.Handle("/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		basicAuth(handleRequest, config)(w, r)
 	})))
@@ -156,7 +140,6 @@ func adjustPaths(execDir string, config *Config) {
 	}
 }
 
-// SQLファイルの読み込み
 func loadSQLFiles(execDir string) {
 	apiFilePath := filepath.Join(execDir, "api.json")
 	data, err := ioutil.ReadFile(apiFilePath)
@@ -166,19 +149,11 @@ func loadSQLFiles(execDir string) {
 	if err := json.Unmarshal(data, &sqlFiles); err != nil {
 		log.Fatalf("Failed to decode SQL files JSON: %v", err)
 	}
-
-	// ここで "script" と "sql" の両方が設定されている場合にエラーとして起動を停止
 	for apiKey, apiConfig := range sqlFiles {
-		// script があり、かつ sql のエントリ数が > 0 ならエラー
 		if len(apiConfig.Script) > 0 && len(apiConfig.SQL) > 0 {
-			log.Fatalf(
-				"Configuration error in api.json for API '%s': If 'script' is set, 'sql' cannot be specified. Please remove one of them.",
-				apiKey,
-			)
+			log.Fatalf("Configuration error in api.json for API '%s': If 'script' is set, 'sql' cannot be specified.", apiKey)
 		}
 	}
-
-	// Update SQL file paths to be absolute if they are relative
 	for apiKey, apiConfig := range sqlFiles {
 		for i, sqlPath := range apiConfig.SQL {
 			if !filepath.IsAbs(sqlPath) {
@@ -188,7 +163,6 @@ func loadSQLFiles(execDir string) {
 	}
 }
 
-// ロガーの設定
 func setupLogger(execDir string) {
 	logFilePath := filepath.Join(execDir, config.Log.Filename)
 	if config.Log.EnableLogging {
@@ -223,15 +197,11 @@ func connectDB(config Config) (*sql.DB, error) {
 	return sql.Open(driverName, dsn)
 }
 
-// リクエストの処理
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	// favicon.ico は無視
 	if r.URL.Path == "/favicon.ico" {
 		http.NotFound(w, r)
 		return
 	}
-
-	// リクエストパラメータを取得（JSON or フォーム）
 	contentType := r.Header.Get("Content-Type")
 	var params map[string]interface{}
 	if contentType == "application/json" {
@@ -252,18 +222,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			sendJSONError(w, "Error parsing form data", http.StatusBadRequest)
 			return
 		}
-		if err := r.ParseForm(); err != nil {
-			sendJSONError(w, "Error parsing form data", http.StatusBadRequest)
-			return
-		}
 		params = make(map[string]interface{})
 		for key, values := range r.Form {
-			// 複数の値があればそのままスライスとして設定
 			if len(values) > 1 {
 				params[key] = values
 			} else {
 				val := values[0]
-				// 値がJSON配列の形式かチェック
 				if strings.HasPrefix(val, "[") && strings.HasSuffix(val, "]") {
 					var arr []interface{}
 					if err := json.Unmarshal([]byte(val), &arr); err == nil {
@@ -271,7 +235,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 				}
-				// カンマ区切りの文字列なら分割
 				if strings.Contains(val, ",") {
 					splitVals := strings.Split(val, ",")
 					for i := range splitVals {
@@ -284,8 +247,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-
-	// URLパスが "/" 以外の場合、api パラメータとして扱う
 	if r.URL.Path != "/" {
 		apiName := strings.TrimPrefix(r.URL.Path, "/")
 		if apiName != "" {
@@ -294,38 +255,26 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-
-	// APIキー（名前）を取得
 	apiKey, ok := params["api"].(string)
 	if !ok || apiKey == "" {
 		sendJSONError(w, "API key is required and must be a string", http.StatusBadRequest)
 		return
 	}
-
-	// api.json から API 設定を取得
 	apiConfig, exists := sqlFiles[apiKey]
 	if !exists {
 		sendJSONError(w, "SQL files not found", http.StatusNotFound)
 		return
 	}
-
-	// 置換対象パラメータキーの配列を取得
 	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
 	if err != nil {
 		log.Printf("Failed to get accepted params keys: %v", err)
 		acceptedKeys = []string{}
 	}
-
-	// リクエストパラメータから nyan_mode を取得（snake_case）
 	nyanMode, _ := params["nyan_mode"].(string)
-
-	// nyan_mode が "checkOnly" かつチェック用スクリプトが未設定の場合は 404 エラー
 	if nyanMode == "checkOnly" && apiConfig.Check == "" {
 		sendJSONError(w, "No check script for this API", http.StatusNotFound)
 		return
 	}
-
-	// チェック用 JavaScript の実行（チェック用スクリプトが指定されている場合）
 	if apiConfig.Check != "" {
 		success, statusCode, errorObj, jsonStr, err := runCheckScript(apiConfig.Check, params, acceptedKeys)
 		if err != nil {
@@ -347,14 +296,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(response)
 			return
 		}
-		// nyan_mode が "checkOnly" の場合はチェック結果のみを返す
 		if nyanMode == "checkOnly" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
 			w.Write([]byte(jsonStr))
 			return
 		}
-		// もし script の設定がある場合は、チェック成功なら script を実行してその結果を返す
 		if apiConfig.Script != "" {
 			scriptResult, err := runScript([]string{apiConfig.Script}, params)
 			if err != nil {
@@ -367,8 +314,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(scriptResult))
 			return
 		}
-
-		// チェックが成功し、なおかつ SQL も script も未設定の場合はチェック結果を返す
 		if len(apiConfig.SQL) == 0 && apiConfig.Script == "" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
@@ -377,7 +322,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// SQL 実行へ進む場合
 	var tx *sql.Tx
 	if len(apiConfig.SQL) > 1 {
 		tx, err = db.Begin()
@@ -399,7 +343,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Print(string(query))
-		queryStr, args := prepareQueryWithParams(string(query), params)
+		// まず、外側ブロック（-- BEGIN -- ～ -- END --）を処理
+		processed := processWhereBlock(string(query), params)
+		// 次に、従来のIFブロック（/*IF ...*/ ... /*END*/）も処理
+		processed = processConditionals(processed, params)
+		log.Print("Processed SQL: ", processed)
+		queryStr, args := prepareQueryWithParams(processed, params)
+		log.Print("Final Query: ", queryStr)
 		if isSelectQuery(queryStr) {
 			var rows *sql.Rows
 			if tx != nil {
@@ -463,39 +413,25 @@ func isSelectQuery(query string) bool {
 	return strings.HasPrefix(strings.TrimSpace(strings.ToUpper(query)), "SELECT")
 }
 
-// SQLのパラメータ適用
 func prepareQueryWithParams(query string, params map[string]interface{}) (string, []interface{}) {
-	// パラメータ置換用の正規表現
-	re := regexp.MustCompile(`\/\*([^*]+)\*\/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
-
-	// 同じパラメータ名ごとに一度だけ引数に登録するためのマッピング
+	re := regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
 	mapping := make(map[string]string)
 	args := []interface{}{}
 	placeholderCounter := 1
-
-	// 正規表現でマッチした部分を置換
 	replacedQuery := re.ReplaceAllStringFunc(query, func(match string) string {
-		// マッチしたグループの取得
 		groups := re.FindStringSubmatch(match)
 		paramName := strings.TrimSpace(groups[1])
-
-		// すでに置換済みならそのプレースホルダーを返す
 		if placeholder, exists := mapping[paramName]; exists {
 			return placeholder
 		}
-
-		// パラメータ値の取得
 		value, ok := params[paramName]
 		if !ok {
 			log.Printf("Parameter %s not found in provided parameters", paramName)
 			value = nil
 		}
-
-		// reflect を用いてスライスかどうかを判定
 		rv := reflect.ValueOf(value)
 		if rv.IsValid() && rv.Kind() == reflect.Slice {
-			// スライスの場合、要素ごとにプレースホルダーを生成
-			placeholders := []string{}
+			var placeholders []string
 			for i := 0; i < rv.Len(); i++ {
 				args = append(args, rv.Index(i).Interface())
 				if dbType == "postgres" {
@@ -509,7 +445,6 @@ func prepareQueryWithParams(query string, params map[string]interface{}) (string
 			mapping[paramName] = placeholder
 			return placeholder
 		} else {
-			// スライスでない場合は従来通り単一のプレースホルダーを生成
 			args = append(args, value)
 			var placeholder string
 			if dbType == "postgres" {
@@ -522,7 +457,6 @@ func prepareQueryWithParams(query string, params map[string]interface{}) (string
 			return placeholder
 		}
 	})
-
 	log.Print("Replaced Query: ", replacedQuery)
 	return replacedQuery, args
 }
@@ -532,26 +466,21 @@ func RowsToJSON(rows *sql.Rows) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	var results []map[string]interface{}
 	values := make([]interface{}, len(columns))
 	valuePtrs := make([]interface{}, len(columns))
-
 	for rows.Next() {
 		for i := range columns {
 			valuePtrs[i] = &values[i]
 		}
-
 		if err := rows.Scan(valuePtrs...); err != nil {
 			return nil, err
 		}
-
 		entry := make(map[string]interface{})
 		for i, col := range columns {
 			var v interface{}
 			val := values[i]
-			b, ok := val.([]byte)
-			if ok {
+			if b, ok := val.([]byte); ok {
 				v = string(b)
 			} else {
 				v = val
@@ -579,8 +508,6 @@ func checkPassword(user, pass string, config Config) bool {
 	return user == config.BasicAuth.Username && pass == config.BasicAuth.Password
 }
 
-// /nyan 用のハンドラー
-// NyanResponse は JSON レスポンスの順序を保証するための構造体です。
 type NyanResponse struct {
 	Name    string               `json:"name"`
 	Profile string               `json:"profile"`
@@ -589,15 +516,12 @@ type NyanResponse struct {
 }
 
 func handleNyan(w http.ResponseWriter, r *http.Request) {
-	// config.jsonから必要な情報を抽出
 	response := NyanResponse{
 		Name:    config.Name,
 		Profile: config.Profile,
 		Version: config.Version,
-		Apis:    sqlFiles, // sqlFiles は api.json の内容が格納されている変数
+		Apis:    sqlFiles,
 	}
-
-	// JSON として出力（構造体を利用することで、フィールドの順序が保証される）
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Failed to encode JSON: %v", err)
@@ -605,23 +529,15 @@ func handleNyan(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// nyanとdetailの切り分け
 func handleNyanOrDetail(w http.ResponseWriter, r *http.Request) {
-	// 先頭の "/nyan" を除去し、残りのサブパスを判定する
 	subPath := strings.TrimPrefix(r.URL.Path, "/nyan")
-
-	// /nyan のみ (実際には /nyan にアクセスすると net/http が /nyan/ にリダイレクトする場合が多い)
-	// /nyan/ でアクセスされた場合、subPath は "/" になる
 	if subPath == "" || subPath == "/" {
-		// => /nyan/ の場合は既存の機能 (handleNyan)
 		handleNyan(w, r)
 	} else {
-		// => /nyan/以降に何か続いている場合 (/nyan/apiName)
 		handleNyanDetail(w, r)
 	}
 }
 
-// /nyan/{API名} の詳細を返すハンドラー
 func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
 	type detailResponse struct {
 		API                string                 `json:"api"`
@@ -629,51 +545,40 @@ func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
 		NyanAcceptedParams map[string]interface{} `json:"nyanAcceptedParams"`
 		NyanOutputColumns  []string               `json:"nyanOutputColumns,omitempty"`
 	}
-
 	apiName := strings.TrimPrefix(r.URL.Path, "/nyan/")
 	if apiName == "" {
 		sendJSONError(w, "API name is required", http.StatusBadRequest)
 		return
 	}
-
 	apiConfig, exists := sqlFiles[apiName]
 	if !exists {
 		sendJSONError(w, "API not found", http.StatusNotFound)
 		return
 	}
-
-	// SQLファイルからパラメータ解析
 	paramsMap, err := parseSQLParams(apiConfig.SQL)
 	if err != nil {
 		log.Printf("Failed to parse SQL comments: %v", err)
 		sendJSONError(w, "Failed to parse SQL comments", http.StatusInternalServerError)
 		return
 	}
-
 	var acceptedParamsFromScript map[string]interface{}
 	var outputColumns []string
-
-	// script が指定されている場合は、スクリプトから定数を抽出
 	if apiConfig.Script != "" {
 		acceptedParamsFromScript, outputColumns, err = parseScriptConstants(apiConfig.Script)
 		if err != nil {
 			log.Printf("Failed to parse script constants: %v", err)
-			// 必須でなければログ出力のみ、もしくはエラー応答とするか検討してください
 		} else {
-			// スクリプトから得た acceptedParams を SQL で解析した内容とマージ（スクリプト側優先）
 			for k, v := range acceptedParamsFromScript {
 				paramsMap[k] = v
 			}
 		}
 	}
-
 	resp := detailResponse{
 		API:                apiName,
 		Description:        apiConfig.Description,
 		NyanAcceptedParams: paramsMap,
 		NyanOutputColumns:  outputColumns,
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("Failed to encode JSON: %v", err)
@@ -681,7 +586,6 @@ func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// SQLのパース
 func parseSQLParams(filePaths []string) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
 	for _, filePath := range filePaths {
@@ -690,33 +594,21 @@ func parseSQLParams(filePaths []string) (map[string]interface{}, error) {
 			return nil, fmt.Errorf("failed to read file %s: %v", filePath, err)
 		}
 		content := string(data)
-
-		// コメント + デフォルト値を全て取得
 		matches := reParams.FindAllStringSubmatch(content, -1)
 		for _, m := range matches {
-			// m[1] = paramName
-			// m[2] = '...' (シングルクオート文字列) の中身
-			// m[3] = クオートなし
 			paramName := strings.TrimSpace(m[1])
-
 			var rawValue string
 			if m[2] != "" {
-				// シングルクオートの中身を使用する
 				rawValue = m[2]
 			} else {
-				// クオートなしの値
 				rawValue = m[3]
 			}
-
-			// 既に同じparamNameがあった場合は上書き or スキップ 等、要件に合わせて調整
 			result[paramName] = convertToNumberIfPossible(rawValue)
 		}
 	}
 	return result, nil
 }
 
-// convertToNumberIfPossible は、文字列が数値なら int/float64 に、
-// それ以外は string として返します。
 func convertToNumberIfPossible(s string) interface{} {
 	if isInteger(s) {
 		if i, err := strconv.Atoi(s); err == nil {
@@ -728,68 +620,48 @@ func convertToNumberIfPossible(s string) interface{} {
 			return f
 		}
 	}
-	return s // 数字でなければ文字列として扱う
+	return s
 }
 
 func isInteger(s string) bool {
-	// 先頭に + - がついた整数をざっくり判定
 	return regexp.MustCompile(`^[+-]?\d+$`).MatchString(s)
 }
 
 func isFloat(s string) bool {
-	// 小数点を含む数値をざっくり判定 (指数部や厳密な形式は非考慮)
 	return regexp.MustCompile(`^[+-]?\d+(\.\d+)?$`).MatchString(s)
 }
 
-// parseSelectColumns は、指定したファイルを読み込み
-// 例: "SELECT count(id) AS today_count, name FROM stamps" のような文から
-// ["today_count", "name"] を取り出す簡易実装です。
-// parseSelectColumns は、SELECT～FROM の間を取り出し、トップレベルの列区切りカンマで分割し、
-// "AS エイリアス" があればエイリアスを抽出して返す簡易実装です。
 func parseSelectColumns(sqlFilePath string) ([]string, error) {
 	data, err := ioutil.ReadFile(sqlFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file %s: %v", sqlFilePath, err)
 	}
 	content := string(data)
-
-	// 大文字小文字を無視して「SELECT」「FROM」の位置を探す
 	upper := strings.ToUpper(content)
 	selectIdx := strings.Index(upper, "SELECT")
 	if selectIdx == -1 {
-		return nil, nil // SELECT がなければ空
+		return nil, nil
 	}
 	fromIdx := strings.Index(upper, "FROM")
 	if fromIdx == -1 || fromIdx < selectIdx {
-		// FROM がない、または SELECT より前にある場合は対象外
 		return nil, nil
 	}
-
-	// SELECT と FROM の間を取り出し、前後の空白を削除
 	selectPart := strings.TrimSpace(content[selectIdx+len("SELECT") : fromIdx])
 	if selectPart == "" {
 		return nil, nil
 	}
-
-	// "SELECT * FROM" のように一発で終わる場合
 	if selectPart == "*" {
 		return []string{"*"}, nil
 	}
-
-	// トップレベルの列区切りとなるカンマを見つけて分割
 	colExprs := splitTopLevelColumns(selectPart)
-
 	var aliases []string
 	for _, expr := range colExprs {
-		// 大文字小文字無視で " AS " を探して、あればエイリアス部分を抽出
 		upperExpr := strings.ToUpper(expr)
 		asIdx := strings.Index(upperExpr, " AS ")
 		if asIdx >= 0 {
 			aliasPart := strings.TrimSpace(expr[asIdx+4:])
 			aliases = append(aliases, aliasPart)
 		} else {
-			// AS がなければ式全体を格納してもいいが、ここでは式全体をとりあえず返す
-			// 例: "COUNT(stamps.date)" -> "COUNT(stamps.date)"
 			trimmed := strings.TrimSpace(expr)
 			aliases = append(aliases, trimmed)
 		}
@@ -797,22 +669,16 @@ func parseSelectColumns(sqlFilePath string) ([]string, error) {
 	return aliases, nil
 }
 
-// splitTopLevelColumns は、SELECT ... FROM の間の文字列を受け取り、
-// トップレベルのカンマ(関数呼び出しやCASE式などの中ではない)で分割したスライスを返す。
 func splitTopLevelColumns(selectPart string) []string {
 	var result []string
 	var sb strings.Builder
-
-	depth := 0 // ( ) の深さ
+	depth := 0
 	inSingleQuote := false
-
 	runes := []rune(selectPart)
-
 	for i := 0; i < len(runes); i++ {
 		ch := runes[i]
 		switch ch {
 		case '\'':
-			// シングルクオートの開始 or 終了
 			inSingleQuote = !inSingleQuote
 			sb.WriteRune(ch)
 		case '(':
@@ -826,9 +692,7 @@ func splitTopLevelColumns(selectPart string) []string {
 			}
 			sb.WriteRune(ch)
 		case ',':
-			// depth=0 かつ inSingleQuote=false のときだけ、トップレベルの列区切り
 			if depth == 0 && !inSingleQuote {
-				// 列1つ分を確定
 				col := strings.TrimSpace(sb.String())
 				result = append(result, col)
 				sb.Reset()
@@ -839,7 +703,6 @@ func splitTopLevelColumns(selectPart string) []string {
 			sb.WriteRune(ch)
 		}
 	}
-	// 最後に残っている要素を追加
 	rest := strings.TrimSpace(sb.String())
 	if rest != "" {
 		result = append(result, rest)
@@ -847,18 +710,244 @@ func splitTopLevelColumns(selectPart string) []string {
 	return result
 }
 
-// sendJSONErrorをinterface{}を受け取るように定義（1箇所だけ定義する）
 func sendJSONError(w http.ResponseWriter, errPayload interface{}, statusCode int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(ErrorResponse{Error: errPayload})
 }
 
-// runCheckScript のシグネチャを変更し、元の JSON 文字列も返すようにする
+// processWhereBlock は、-- BEGIN -- ～ -- END -- のブロックを行単位で処理します。
+// ブロック内の行（通常はWHERE句および複数のIF行）が処理され、少なくとも1つIFが成立すればブロック全体が出力されます。
+func processWhereBlock(sqlText string, params map[string]interface{}) string {
+	lines := strings.Split(sqlText, "\n")
+	var outputLines []string
+	inBlock := false
+	var blockLines []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "-- BEGIN") {
+			inBlock = true
+			blockLines = []string{}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "-- END") && inBlock {
+			inBlock = false
+			processedBlock := processCommentConditionals(strings.Join(blockLines, "\n"), params)
+			if strings.TrimSpace(processedBlock) != "" {
+				outputLines = append(outputLines, processedBlock)
+			}
+			continue
+		}
+		if inBlock {
+			blockLines = append(blockLines, line)
+		} else {
+			outputLines = append(outputLines, line)
+		}
+	}
+	return strings.Join(outputLines, "\n")
+}
+
+// processCommentConditionals は、-- IF ... -- END -- の形式の行を処理します。
+// 形式は "– IF <条件>-- <内容> -- END --" で、条件部分は evaluateCondition で評価します。
+// IF行以外はそのまま残します。
+func processCommentConditionals(block string, params map[string]interface{}) string {
+	lines := strings.Split(block, "\n")
+	var resultLines []string
+	anyConditionSatisfied := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "-- IF") && strings.HasSuffix(trimmed, "-- END --") {
+			inner := strings.TrimPrefix(trimmed, "-- IF")
+			inner = strings.TrimSuffix(inner, "-- END --")
+			inner = strings.TrimSpace(inner)
+			// ここでは "--" を区切り文字として、最初の部分を条件、2番目を出力内容とみなす
+			parts := strings.SplitN(inner, "--", 2)
+			if len(parts) == 2 {
+				cond := strings.TrimSpace(parts[0])
+				content := strings.TrimSpace(parts[1])
+				if evaluateCondition(cond, params) {
+					resultLines = append(resultLines, content)
+					anyConditionSatisfied = true
+				}
+			}
+		} else {
+			resultLines = append(resultLines, line)
+		}
+	}
+	if anyConditionSatisfied {
+		return strings.Join(resultLines, "\n")
+	}
+	return ""
+}
+
+// 従来形式の IF ブロック処理（/*IF ...*/ ... /*END*/）
+func processConditionalsOnce(query string, params map[string]interface{}) string {
+	reIf := regexp.MustCompile(`(?s)/\*IF\s+(.*?)\*/(.*?)/\*END\*/`)
+	query = reIf.ReplaceAllStringFunc(query, func(block string) string {
+		parts := reIf.FindStringSubmatch(block)
+		if len(parts) < 3 {
+			return ""
+		}
+		condition := strings.TrimSpace(parts[1])
+		content := parts[2]
+		if strings.Contains(condition, "!=") {
+			condParts := strings.Split(condition, "!=")
+			if len(condParts) == 2 {
+				paramName := strings.TrimSpace(condParts[0])
+				expected := strings.TrimSpace(condParts[1])
+				if expected == "null" {
+					if val, exists := params[paramName]; exists && !isEmpty(val) {
+						return content
+					}
+				}
+			}
+		} else if strings.Contains(condition, "==") {
+			condParts := strings.Split(condition, "==")
+			if len(condParts) == 2 {
+				paramName := strings.TrimSpace(condParts[0])
+				expected := strings.TrimSpace(condParts[1])
+				if expected == "null" {
+					if val, exists := params[paramName]; !exists || isEmpty(val) {
+						return content
+					}
+				}
+			}
+		}
+		return ""
+	})
+	reBegin := regexp.MustCompile(`(?s)/\*BEGIN\*/(.*?)/\*END\*/`)
+	query = reBegin.ReplaceAllStringFunc(query, func(block string) string {
+		parts := reBegin.FindStringSubmatch(block)
+		if len(parts) < 2 {
+			return ""
+		}
+		content := parts[1]
+		if strings.TrimSpace(content) != "" {
+			return content
+		}
+		return ""
+	})
+	return query
+}
+
+func processConditionals(query string, params map[string]interface{}) string {
+	prev := ""
+	for query != prev {
+		prev = query
+		query = processConditionalsOnce(query, params)
+	}
+	return query
+}
+
+func isEmpty(val interface{}) bool {
+	if val == nil {
+		return true
+	}
+	switch v := val.(type) {
+	case string:
+		return strings.TrimSpace(v) == ""
+	case []interface{}:
+		return len(v) == 0
+	case []string:
+		return len(v) == 0
+	}
+	return false
+}
+
+// --- 従来の parseScriptConstants もそのまま ---
+func parseScriptConstants(scriptPath string) (map[string]interface{}, []string, error) {
+	data, err := ioutil.ReadFile(scriptPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read script file %s: %v", scriptPath, err)
+	}
+	content := string(data)
+	var acceptedParams map[string]interface{}
+	var outputColumns []string
+	reAcceptedParams := regexp.MustCompile(`(?s)const\s+nyanAcceptedParams\s*=\s*({[\s\S]*?})\s*;`)
+	if match := reAcceptedParams.FindStringSubmatch(content); match != nil && len(match) > 1 {
+		jsonStr := match[1]
+		if err := json.Unmarshal([]byte(jsonStr), &acceptedParams); err != nil {
+			return nil, nil, fmt.Errorf("failed to parse nyanAcceptedParams: %v", err)
+		}
+	}
+	reOutputColumns := regexp.MustCompile(`(?s)const\s+nyanOutputColumns\s*=\s*(\[[\s\S]*?\])\s*;`)
+	if match := reOutputColumns.FindStringSubmatch(content); match != nil && len(match) > 1 {
+		jsonStr := match[1]
+		if err := json.Unmarshal([]byte(jsonStr), &outputColumns); err != nil {
+			return nil, nil, fmt.Errorf("failed to parse nyanOutputColumns: %v", err)
+		}
+	}
+	log.Print(outputColumns)
+	return acceptedParams, outputColumns, nil
+}
+
+func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
+	// 第一引数: SQLファイルのパス
+	if len(call.Arguments) < 1 {
+		panic(vm.ToValue("nyanRunSQL requires at least the SQL file path as argument"))
+	}
+	sqlFilePath := call.Argument(0).String()
+
+	// 第二引数: パラメータオブジェクト（存在しなければ空のマップ）
+	var params map[string]interface{}
+	if len(call.Arguments) >= 2 {
+		if obj, ok := call.Argument(1).Export().(map[string]interface{}); ok {
+			params = obj
+		} else {
+			params = make(map[string]interface{})
+		}
+	} else {
+		params = make(map[string]interface{})
+	}
+
+	// SQLファイルを読み込む
+	sqlContent, err := ioutil.ReadFile(sqlFilePath)
+	if err != nil {
+		panic(vm.ToValue(fmt.Sprintf("failed to read SQL file %s: %v", sqlFilePath, err)))
+	}
+
+	// まず、外側ブロック（-- BEGIN -- ～ -- END --）を処理する
+	processedSQL := processWhereBlock(string(sqlContent), params)
+	// 次に、従来形式のIFブロック（/*IF ...*/ ... /*END*/）も処理する
+	processedSQL = processConditionals(processedSQL, params)
+	log.Print("Processed SQL: ", processedSQL)
+
+	// SQL内のパラメータ置換を実施
+	queryStr, args := prepareQueryWithParams(processedSQL, params)
+	log.Print("Final Query: ", queryStr)
+
+	// SELECTクエリなら結果をJSONに変換して返す
+	if isSelectQuery(queryStr) {
+		rows, err := db.Query(queryStr, args...)
+		if err != nil {
+			panic(vm.ToValue(fmt.Sprintf("error executing SQL query: %v", err)))
+		}
+		defer rows.Close()
+		jsonBytes, err := RowsToJSON(rows)
+		if err != nil {
+			panic(vm.ToValue(fmt.Sprintf("error converting rows to JSON: %v", err)))
+		}
+		return vm.ToValue(string(jsonBytes))
+	} else {
+		// SELECT以外の場合は、影響を受けた行数を返す
+		result, err := db.Exec(queryStr, args...)
+		if err != nil {
+			panic(vm.ToValue(fmt.Sprintf("error executing SQL query: %v", err)))
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			panic(vm.ToValue(fmt.Sprintf("error retrieving rows affected: %v", err)))
+		}
+		response := map[string]interface{}{
+			"rowsAffected": affected,
+		}
+		jsonResp, _ := json.Marshal(response)
+		return vm.ToValue(string(jsonResp))
+	}
+}
+
 func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, string, error) {
 	var combinedScript strings.Builder
-
-	// config.json の javascript_include に指定されたすべてのファイルを読み込む
 	for _, includePath := range config.JavascriptInclude {
 		content, err := ioutil.ReadFile(includePath)
 		if err != nil {
@@ -867,28 +956,19 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 		combinedScript.Write(content)
 		combinedScript.WriteString("\n")
 	}
-
-	// api.json で指定されたチェック用 JavaScript ファイルをそのまま読み込む
 	checkContent, err := ioutil.ReadFile(apiCheckScriptPath)
 	if err != nil {
 		return false, 500, nil, "", fmt.Errorf("failed to read check script %s: %v", apiCheckScriptPath, err)
 	}
 	combinedScript.Write(checkContent)
 	combinedScript.WriteString("\n")
-
 	log.Printf("Combined check script:\n%s", combinedScript.String())
-
 	vm := goja.New()
-	// パラメータと、置換対象パラメータのキー配列をセット
 	vm.Set("nyanAllParams", params)
 	vm.Set("nyanAcceptedParamsKeys", acceptedParamsKeys)
-
-	// 必要な console, nyanGetAPI, nyanJsonAPI などの登録（省略可。前述の例を参照）
-	// console.log を登録
 	vm.Set("console", map[string]interface{}{
 		"log": func(call goja.FunctionCall) goja.Value {
-			args := []string{}
-			// JSON.stringify を取得して、オブジェクトの場合に文字列化する
+			var args []string
 			jsonStringifyVal := vm.Get("JSON").ToObject(vm).Get("stringify")
 			jsonStringify, ok := goja.AssertFunction(jsonStringifyVal)
 			if !ok {
@@ -913,8 +993,6 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 			return goja.Undefined()
 		},
 	})
-
-	// nyanGetAPI の登録（引数はオプション対応）
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
 		var url, username, password string
 		if len(call.Arguments) >= 1 {
@@ -932,8 +1010,6 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 		}
 		return vm.ToValue(result)
 	})
-
-	// nyanJsonAPI の登録（引数はオプション対応）
 	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
 		var url, jsonData, username, password string
 		if len(call.Arguments) >= 1 {
@@ -954,12 +1030,10 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 		}
 		return vm.ToValue(result)
 	})
-
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
 		return false, 500, nil, "", fmt.Errorf("check script error: %v", err)
 	}
-
 	jsonStr := value.String()
 	var result struct {
 		Success bool        `json:"success"`
@@ -969,33 +1043,23 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
 		return false, 500, nil, jsonStr, fmt.Errorf("failed to unmarshal check result: %v", err)
 	}
-
 	return result.Success, result.Status, result.Error, jsonStr, nil
 }
 
 func getAPI(url, username, password string) (string, error) {
-	// HTTPクライアントの生成
 	client := &http.Client{}
-
-	// リクエストの生成
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", fmt.Errorf("error creating request: %v", err)
 	}
-
-	// BASIC認証ヘッダーの設定
 	if username != "" {
 		req.SetBasicAuth(username, password)
 	}
-
-	// リクエストの送信
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("error sending request: %v", err)
 	}
 	defer resp.Body.Close()
-
-	// レスポンスの読み取り
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("error reading response: %v", err)
@@ -1003,26 +1067,21 @@ func getAPI(url, username, password string) (string, error) {
 	return string(body), nil
 }
 
-// POSTリクエストを行うGo関数
 func jsonAPI(url string, jsonData []byte, username, password string) (string, error) {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", err
 	}
-
-	// Basic認証のセットアップ
 	basicAuth := username + ":" + password
 	basicAuthEncoded := base64.StdEncoding.EncodeToString([]byte(basicAuth))
 	req.Header.Set("Authorization", "Basic "+basicAuthEncoded)
 	req.Header.Set("Content-Type", "application/json")
-
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
@@ -1030,25 +1089,20 @@ func jsonAPI(url string, jsonData []byte, username, password string) (string, er
 	return string(body), nil
 }
 
-// パラメータの取得
 func getAcceptedParamsKeys(sqlPaths []string) ([]string, error) {
 	paramsMap, err := parseSQLParams(sqlPaths)
 	if err != nil {
 		return nil, err
 	}
-	keys := []string{}
+	var keys []string
 	for k := range paramsMap {
 		keys = append(keys, k)
 	}
 	return keys, nil
 }
 
-// runScript は、config.JavascriptInclude で指定されたファイルと、
-// apiConfig.Script に指定されたスクリプト群を連結して実行し、結果の文字列を返します。
 func runScript(scriptPaths []string, params map[string]interface{}) (string, error) {
 	var combinedScript strings.Builder
-
-	// config.JavascriptInclude に指定されたファイルを全て読み込む
 	for _, includePath := range config.JavascriptInclude {
 		content, err := ioutil.ReadFile(includePath)
 		if err != nil {
@@ -1057,8 +1111,6 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 		combinedScript.Write(content)
 		combinedScript.WriteString("\n")
 	}
-
-	// apiConfig.Script に指定された各スクリプトファイルを読み込む
 	for _, scriptPath := range scriptPaths {
 		content, err := ioutil.ReadFile(scriptPath)
 		if err != nil {
@@ -1067,16 +1119,11 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 		combinedScript.Write(content)
 		combinedScript.WriteString("\n")
 	}
-
-	// Goja の VM を作成し、パラメータをセット
 	vm := goja.New()
 	vm.Set("nyanAllParams", params)
-
-	//console
 	vm.Set("console", map[string]interface{}{
 		"log": func(call goja.FunctionCall) goja.Value {
-			args := []string{}
-			// JSON.stringify を取得して、オブジェクトの場合に文字列化する
+			var args []string
 			jsonStringifyVal := vm.Get("JSON").ToObject(vm).Get("stringify")
 			jsonStringify, ok := goja.AssertFunction(jsonStringifyVal)
 			if !ok {
@@ -1101,8 +1148,6 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 			return goja.Undefined()
 		},
 	})
-
-	// nyanGetAPI の登録（引数はオプション対応）
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
 		var url, username, password string
 		if len(call.Arguments) >= 1 {
@@ -1120,8 +1165,6 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 		}
 		return vm.ToValue(result)
 	})
-
-	// nyanJsonAPI の登録（引数はオプション対応）
 	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
 		var url, jsonData, username, password string
 		if len(call.Arguments) >= 1 {
@@ -1142,12 +1185,9 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 		}
 		return vm.ToValue(result)
 	})
-
 	vm.Set("nyanRunSQL", func(call goja.FunctionCall) goja.Value {
 		return nyanRunSQLHandler(vm, call)
 	})
-
-	// 連結したスクリプトを実行
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
 		return "", fmt.Errorf("script execution error: %v", err)
@@ -1155,96 +1195,62 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 	return value.String(), nil
 }
 
-// parseScriptConstants は、指定されたスクリプトファイルから
-// const nyanAcceptedParams と const nyanOutputColumns の値を抽出して返します。
-func parseScriptConstants(scriptPath string) (map[string]interface{}, []string, error) {
-	data, err := ioutil.ReadFile(scriptPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read script file %s: %v", scriptPath, err)
-	}
-	content := string(data)
-
-	var acceptedParams map[string]interface{}
-	var outputColumns []string
-
-	// 改善した正規表現：末尾のセミコロンは含めず、括弧の中身のみをキャプチャ
-	reAcceptedParams := regexp.MustCompile(`(?s)const\s+nyanAcceptedParams\s*=\s*({[\s\S]*?})\s*;`)
-	if match := reAcceptedParams.FindStringSubmatch(content); match != nil && len(match) > 1 {
-		jsonStr := match[1]
-		if err := json.Unmarshal([]byte(jsonStr), &acceptedParams); err != nil {
-			return nil, nil, fmt.Errorf("failed to parse nyanAcceptedParams: %v", err)
+// evaluateCondition は、条件文字列（例："id != null OR date != null" や "id != null AND date != null"）を
+// 解析し、パラメータに基づいて成立するかどうかを判定します。
+// まず "OR" で分割し、各部分についてさらに "AND" で分割してすべてが真なら、その部分は真と判断します。
+// 複数のOR部分のいずれかが真なら全体として真になります。
+func evaluateCondition(cond string, params map[string]interface{}) bool {
+	// "OR" で分割
+	orParts := strings.Split(cond, "OR")
+	for _, orPart := range orParts {
+		orPart = strings.TrimSpace(orPart)
+		// "AND" でさらに分割
+		andParts := strings.Split(orPart, "AND")
+		allTrue := true
+		for _, andPart := range andParts {
+			andPart = strings.TrimSpace(andPart)
+			if !checkOneCondition(andPart, params) {
+				allTrue = false
+				break
+			}
+		}
+		if allTrue {
+			return true
 		}
 	}
-
-	// 改善した正規表現：[] の中身を正しくキャプチャ（改行や空白も含む）
-	reOutputColumns := regexp.MustCompile(`(?s)const\s+nyanOutputColumns\s*=\s*(\[[\s\S]*?\])\s*;`)
-	if match := reOutputColumns.FindStringSubmatch(content); match != nil && len(match) > 1 {
-		jsonStr := match[1]
-		if err := json.Unmarshal([]byte(jsonStr), &outputColumns); err != nil {
-			return nil, nil, fmt.Errorf("failed to parse nyanOutputColumns: %v", err)
-		}
-	}
-
-	log.Print(outputColumns)
-
-	return acceptedParams, outputColumns, nil
+	return false
 }
 
-// nyanRunSQLHandler は、JavaScript から呼ばれた nyanRunSQL の処理を実装します。
-func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
-	// 第一引数: SQL ファイルのパス
-	if len(call.Arguments) < 1 {
-		panic(vm.ToValue("nyanRunSQL requires at least the SQL file path as argument"))
+// checkOneCondition は、1つの単一条件（例："id != null" または "id == null"）を評価します。
+func checkOneCondition(cond string, params map[string]interface{}) bool {
+	cond = strings.TrimSpace(cond)
+	if strings.Contains(cond, "!=") {
+		parts := strings.SplitN(cond, "!=", 2)
+		if len(parts) != 2 {
+			return false
+		}
+		paramName := strings.TrimSpace(parts[0])
+		expected := strings.TrimSpace(parts[1])
+		// expected が "null"（大文字・小文字を区別しない）なら、
+		// params に値が存在し、かつ空でなければ真
+		if strings.ToLower(expected) == "null" {
+			if val, exists := params[paramName]; exists && !isEmpty(val) {
+				return true
+			}
+		}
+	} else if strings.Contains(cond, "==") {
+		parts := strings.SplitN(cond, "==", 2)
+		if len(parts) != 2 {
+			return false
+		}
+		paramName := strings.TrimSpace(parts[0])
+		expected := strings.TrimSpace(parts[1])
+		// expected が "null"なら、params に値が存在しないか空なら真
+		if strings.ToLower(expected) == "null" {
+			if val, exists := params[paramName]; !exists || isEmpty(val) {
+				return true
+			}
+		}
 	}
-	sqlFilePath := call.Argument(0).String()
-
-	// 第二引数: オプションのパラメータオブジェクト（存在しなければ空のマップ）
-	var params map[string]interface{}
-	if len(call.Arguments) >= 2 {
-		if obj, ok := call.Argument(1).Export().(map[string]interface{}); ok {
-			params = obj
-		} else {
-			params = make(map[string]interface{})
-		}
-	} else {
-		params = make(map[string]interface{})
-	}
-
-	// SQL ファイルを読み込む
-	sqlContent, err := ioutil.ReadFile(sqlFilePath)
-	if err != nil {
-		panic(vm.ToValue(fmt.Sprintf("failed to read SQL file %s: %v", sqlFilePath, err)))
-	}
-
-	// SQL 内のパラメータを置換
-	queryStr, args := prepareQueryWithParams(string(sqlContent), params)
-
-	// SELECT クエリなら結果を JSON に変換して返す
-	if isSelectQuery(queryStr) {
-		rows, err := db.Query(queryStr, args...)
-		if err != nil {
-			panic(vm.ToValue(fmt.Sprintf("error executing SQL query: %v", err)))
-		}
-		defer rows.Close()
-		jsonBytes, err := RowsToJSON(rows)
-		if err != nil {
-			panic(vm.ToValue(fmt.Sprintf("error converting rows to JSON: %v", err)))
-		}
-		return vm.ToValue(string(jsonBytes))
-	} else {
-		// SELECT 以外の場合は、影響を受けた行数を返す
-		res, err := db.Exec(queryStr, args...)
-		if err != nil {
-			panic(vm.ToValue(fmt.Sprintf("error executing SQL query: %v", err)))
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			panic(vm.ToValue(fmt.Sprintf("error retrieving rows affected: %v", err)))
-		}
-		response := map[string]interface{}{
-			"rowsAffected": affected,
-		}
-		jsonResp, _ := json.Marshal(response)
-		return vm.ToValue(string(jsonResp))
-	}
+	return false
 }
