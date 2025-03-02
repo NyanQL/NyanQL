@@ -28,10 +28,10 @@
   "test2": {
     "check": "./javascript/check_test1.js",
     "script": "./javascript/script.js",
-    "description": "scriptが動くのです。"
+    "description": "checkが実行されscriptが動くサンプルです。"
   },
   "ids": {
     "sql": ["./sql/sqlite/get_by_ids.sql"],
-    "description": "idsをテスト"
+    "description": "idsをテスト inの場合は、[1,2,3]と言った形でリクエストをしてください。"
   }
 }
