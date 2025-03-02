@@ -1,37 +1,47 @@
 # NyanQL
 
 NyanQL（にゃんくる）は、SQL を実行して JSON を返す API サービスです。
+
 内部に保存している SQL ファイルや JavaScript ファイルを API 設定により選択し、実行結果を JSON 形式で返します。
-
 また、push 機能を利用することで、ある API の実行結果を WebSocket 経由で別の API クライアントに自動配信することも可能です。
-
 NyanQL には、SQL 実行の他、JavaScript を実行して JSON を生成する機能（script）や、リクエストパラメータの検証用のチェック機能（check）もあります。
 
 NyanQLには、NyanQL(にゃんくる)以外にも、
 JavaScriptを実行してJSONを生成するNyan8（にゃんぱち）と、
 HTMLを生成するNyanPUI（にゃんぷい）があります。
 
-## 対応データベース
-
+# 対応データベース
 次のデータベースでの利用が可能です。
-
 * MySQL
 * PostgreSQL
 * SQLite
+
+# 対応OSと起動方法
+各環境用にビルド済みバイナリファイルを同梱しています。 クリックまたはターミナルから起動して実行できます。
+HostとなるOSに合わせたバイナリーを使って起動してください。
+* 
+* Linux用 NyanQL_Linux_amd64
+* Mac用　NyanQL_Mac
+* Windows用 NyanQL_Windows.exe
+
+# 設定ファイル
+APIサーバの設定としてのconfig.jsonとそれぞれのAPIに対する設定となるapi.jsonがあります。
+これらを設定し、起動してください。
+
 
 ## 設定ファイル: config.json
 
 `config.json` に NyanQL の設定を記述します。各項目の説明は下記の通りです。
 SSL 証明書を指定すると https でアクセス可能になります。
-
-### config.json について
+また、javascript_includeで指定したファイルは各APIのcheckもしくはscriptで指定されたjsファイルの前に読み込まれます。
+Port:では起動するサーバのport番号を指定してください。
 
 ```json
 {
   "name": "このAPIサーバの名前",
   "profile": "このAPIサーバの自己紹介",
   "version": "このAPIサーバのバージョン",
-  "Port": 8443,
+  "Port": "ポート番号を数値で記載",
   "CertPath": "SSL証明書のパス",
   "KeyPath": "SSL証明書のキーのパス",
   "DBType": "データベースのタイプ（mysql、postgres、sqliteが使用可能）",
@@ -59,9 +69,9 @@ SSL 証明書を指定すると https でアクセス可能になります。
 }
 ``` 
 
-### ログ設定
+### ログ設定について
 
-config.jsonで指定するログ設定の詳細は以下の通りです。
+config.jsonのlogの項目で下記の設定が指定可能です。
 
 * Filename: ログファイルの保存場所を指定します。例: "./logs/nyanql.log"
 * MaxSize: ログファイルの最大サイズ（MB単位）。このサイズを超えると新しいログファイルが作成されます。例: 5（5MB）
@@ -73,6 +83,7 @@ config.jsonで指定するログ設定の詳細は以下の通りです。
 ## API設定ファイル: api.json
 
 api.json は、各 API エンドポイントごとに実行する SQL ファイルや JavaScript ファイルを定義する設定ファイルです。
+エンドポイントは ?api=API名等 パラメータで渡すことも可能です。
 
 ### api.json について
 
@@ -117,9 +128,11 @@ api.json は、各 API エンドポイントごとに実行する SQL ファイ�
 例：stamp API の push に "list" を設定すると、stamp 実行後に list API の結果が push 配信されます。
 * description: API の説明。利用者に対して API の目的や使い方を示します。
 
-# SQL ファイル内の条件付きブロックの使い方
+#### SQLについて
+SQLはリクエストされたパラメータを置き換えて実行します。
+また条件付きブロックを使用することが可能です。
 
-## パラメータの置き換えについて
+##### パラメータの置き換えについて
 
 SQLファイルに書かれたSQLのコメントは、get, post, jsonで指定すると、その値が書き換わったものが実行され結果を得られます。
 下記例の場合は ?date=2024-02-15 とリクエストをすればその部分が描き変わります。
@@ -142,7 +155,7 @@ WHERE date = '2024-02-15';
 これら生成されたSQLはGOで用意された機能によって
 SQL インジェクション対策が施され、安全かつ柔軟に動的なクエリの生成が可能となります。
 
-## SQLファイル上のSQLでの条件分岐によるSQLの生成
+##### 条件分岐によるSQLの生成
 NyanQL では、SQL ファイル内に特定のコメント形式を用いることで、リクエストパラメータの有無に応じた動的な SQL クエリの生成が可能です。
 この仕組みを使うと、ある条件が満たされた場合のみ、特定の SQL 文をクエリに含めることができます。
 
@@ -191,7 +204,8 @@ SELECT id, date FROM stamps;
 
 のみとなります。
 
-## 複雑な使用例
+##### 複雑な使用例
+外側ブロック (`/*BEGIN*/` ... `/*END*/`)を使用することができます。
 
 ```sql
 SELECT id, date FROM stamps
@@ -203,8 +217,6 @@ SELECT id, date FROM stamps
 /*END*/
 ;
 ```
-
-### この SQL の動作
 外側ブロック (`/*BEGIN*/` ... `/*END*/`)
 外側ブロックで囲まれた部分は、オプションとして展開されます。
 この例では、WHERE 句全体が外側ブロックに含まれているため、内部の条件が一つも展開されなかった場合、WHERE 句自体も出力されません。
@@ -302,10 +314,13 @@ main();
 # アクセス方法
 SSL を利用する場合は、次のように https://localhost:{Port}/?api=API名 の形式でアクセスします。
 SSL を利用しない場合は、http://localhost:{Port}/?api=API名 の形式です。
+apiをパラメータで指定せず、エンドポイントとして使うこともできます。
+http://localhost:{Port}/API名 は http://localhost:{Port}/?api=API名 と同じ挙動をします。
 
 # WebSocket Push の利用方法
 stamp API の実行後、設定された push ("list" など) の結果が WebSocket 経由で送信されます。
 WebSocket クライアントは、たとえば ws://localhost:{Port}/list に接続することで、push で送信される最新の list API の結果を受信できます。
+WebSocketでの接続の場合GETクエリパラメータは利用できませんので /API名の形で接続してください。
 
 # 予約語について
 apiとnyanから始まるものは予約語となります。 
