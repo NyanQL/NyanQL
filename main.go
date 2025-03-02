@@ -88,6 +88,20 @@ type JSONErrorResponse struct {
 	} `json:"error"`
 }
 
+// APIDetails は、各 API の説明情報のみを保持する構造体です。
+type APIDetails struct {
+	Description string `json:"description"`
+}
+
+// NyanResponse は /nyan にアクセスしたときに返すサーバ情報です。
+// Apis には、API名をキーとして、各 API の説明のみが含まれます。
+type NyanResponse struct {
+	Name    string                `json:"name"`
+	Profile string                `json:"profile"`
+	Version string                `json:"version"`
+	Apis    map[string]APIDetails `json:"apis"`
+}
+
 var config Config
 var db *sql.DB
 var sqlFiles map[string]APIConfig
@@ -669,19 +683,21 @@ func checkPassword(user, pass string, config Config) bool {
 	return user == config.BasicAuth.Username && pass == config.BasicAuth.Password
 }
 
-type NyanResponse struct {
-	Name    string               `json:"name"`
-	Profile string               `json:"profile"`
-	Version string               `json:"version"`
-	Apis    map[string]APIConfig `json:"apis"`
-}
-
+// handleNyan は、サーバ情報と各 API のキーと説明のみを返します。
 func handleNyan(w http.ResponseWriter, r *http.Request) {
+	// sqlFiles は map[string]APIConfig になっているので、必要な情報のみ抽出します。
+	filteredApis := make(map[string]APIDetails)
+	for key, apiConf := range sqlFiles {
+		filteredApis[key] = APIDetails{
+			Description: apiConf.Description,
+		}
+	}
+
 	response := NyanResponse{
 		Name:    config.Name,
 		Profile: config.Profile,
 		Version: config.Version,
-		Apis:    sqlFiles,
+		Apis:    filteredApis,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {

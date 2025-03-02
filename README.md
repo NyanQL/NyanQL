@@ -303,14 +303,6 @@ main();
 SSL を利用する場合は、次のように https://localhost:{Port}/?api=API名 の形式でアクセスします。
 SSL を利用しない場合は、http://localhost:{Port}/?api=API名 の形式です。
 
-たとえば、以下の URL で各 API を実行できます。
-
-* 一覧表示 API: https://localhost:8443/?api=list
-* 登録確認 API: https://localhost:8443/?api=check
-* スタンプ記録 API（実行後 push で list の結果が WebSocket へ配信）: https://localhost:8443/?api=stamp
-* 指定月リスト API: https://localhost:8443/?api=target_month_list&year=2024&month=7
-
-
 # WebSocket Push の利用方法
 stamp API の実行後、設定された push ("list" など) の結果が WebSocket 経由で送信されます。
 WebSocket クライアントは、たとえば ws://localhost:{Port}/list に接続することで、push で送信される最新の list API の結果を受信できます。
