@@ -274,7 +274,6 @@ function main() {
     data.ids = [2];
     let result = JSON.parse(nyanRunSQL("./sql/sqlite/checkToday.sql", {}));
     console.log("SQL result:", result);
-    // この形式をそのまま返すことで、Go側でのラッピングと二重にならない
     return JSON.stringify({ success: true, status: 200, result: result, api: nyanAllParams.api });
 }
 
