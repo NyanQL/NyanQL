@@ -10,6 +10,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/websocket"
 	_ "github.com/lib/pq"
+	_ "github.com/marcboeker/go-duckdb"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/natefinch/lumberjack"
 	"github.com/rs/cors"
@@ -253,18 +254,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func adjustPaths(execDir string, config *Config) {
-	if config.CertPath != "" && !filepath.IsAbs(config.CertPath) {
-		config.CertPath = filepath.Join(execDir, config.CertPath)
-	}
-	if config.KeyPath != "" && !filepath.IsAbs(config.KeyPath) {
-		config.KeyPath = filepath.Join(execDir, config.KeyPath)
-	}
-	if config.DatabaseType == "sqlite" && config.DBName != "" && !filepath.IsAbs(config.DBName) {
-		config.DBName = filepath.Join(execDir, config.DBName)
-	}
-}
-
 func loadSQLFiles(execDir string) {
 	apiFilePath := filepath.Join(execDir, "api.json")
 	data, err := ioutil.ReadFile(apiFilePath)
@@ -314,6 +303,9 @@ func connectDB(config Config) (*sql.DB, error) {
 		dsn = fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable", config.DBHost, config.DBPort, config.DBUsername, config.DBPassword, config.DBName)
 	case "sqlite":
 		driverName = "sqlite3"
+		dsn = config.DBName
+	case "duckdb":
+		driverName = "duckdb"
 		dsn = config.DBName
 	default:
 		return nil, fmt.Errorf("unsupported database type: %s", config.DatabaseType)
@@ -1606,4 +1598,17 @@ func nyanHostExecWrapper(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 		panic(vm.ToValue(err.Error()))
 	}
 	return vm.ToValue(out)
+}
+
+func adjustPaths(execDir string, config *Config) {
+	if config.CertPath != "" && !filepath.IsAbs(config.CertPath) {
+		config.CertPath = filepath.Join(execDir, config.CertPath)
+	}
+	if config.KeyPath != "" && !filepath.IsAbs(config.KeyPath) {
+		config.KeyPath = filepath.Join(execDir, config.KeyPath)
+	}
+	// sqlite と duckdb の場合、DBName が相対パスなら絶対パスに変換
+	if (config.DatabaseType == "sqlite" || config.DatabaseType == "duckdb") && config.DBName != "" && !filepath.IsAbs(config.DBName) {
+		config.DBName = filepath.Join(execDir, config.DBName)
+	}
 }
