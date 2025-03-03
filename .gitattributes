@@ -1,0 +1,2 @@
+NyanQL_Mac filter=lfs diff=lfs merge=lfs -text
+NyanQL_* filter=lfs diff=lfs merge=lfs -text
