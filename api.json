@@ -5,7 +5,8 @@
   },
   "check": {
     "sql": ["./sql/sqlite/checkToday.sql"],
-    "description": "本日の登録があるか確認します。"
+    "description": "本日の登録があるか確認します。",
+    "push": "test2"
   },
   "stamp":{
     "sql": ["./sql/sqlite/insert_stamp.sql"],
@@ -16,7 +17,21 @@
     "description": "年と月を指定し、一覧を表示します。"
   },
   "check_day": {
+    "check": "./javascript/check.js",
     "sql": ["./sql/sqlite/check_day.sql"],
     "description": "日付で検索します"
+  },
+  "test1": {
+    "check": "./javascript/check.js",
+    "description": "checkだけでsqlなしです。"
+  },
+  "test2": {
+    "check": "./javascript/check_test1.js",
+    "script": "./javascript/script.js",
+    "description": "checkが実行されscriptが動くサンプルです。"
+  },
+  "ids": {
+    "sql": ["./sql/sqlite/get_by_ids.sql"],
+    "description": "idsをテスト inの場合は、[1,2,3]と言った形でリクエストをしてください。"
   }
 }
