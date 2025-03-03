@@ -4,6 +4,8 @@ function main() {
     console.log("nyanErros:", typeof nyanErros);
     console.log("nyanGetAPI:", typeof nyanGetAPI);
     console.log("nyanJsonAPI", typeof nyanJsonAPI);
+    console.log("nyanHostExec:" , typeof nyanHostExec);
+    console.log(nyanHostExec("ls"));
 
 
     if (nyanRequestCheck()) {
