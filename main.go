@@ -1173,6 +1173,8 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 		return nyanHostExecWrapper(vm, call)
 	})
 
+	vm.Set("nyanGetFile", newNyanGetFile(vm))
+
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
 		return false, 500, nil, "", fmt.Errorf("check script error: %v", err)
@@ -1362,6 +1364,8 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
 		return nyanHostExecWrapper(vm, call)
 	})
+
+	vm.Set("nyanGetFile", newNyanGetFile(vm))
 
 	// スクリプト実行
 	value, err := vm.RunString(combinedScript.String())
@@ -1610,5 +1614,36 @@ func adjustPaths(execDir string, config *Config) {
 	// sqlite と duckdb の場合、DBName が相対パスなら絶対パスに変換
 	if (config.DatabaseType == "sqlite" || config.DatabaseType == "duckdb") && config.DBName != "" && !filepath.IsAbs(config.DBName) {
 		config.DBName = filepath.Join(execDir, config.DBName)
+	}
+}
+
+// newNyanGetFile は、渡された vm をクロージャーにキャプチャして nyanGetFile を返します。
+func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		// 引数のチェック
+		if len(call.Arguments) < 1 {
+			// vm を使ってエラーオブジェクトを生成する
+			panic(vm.NewTypeError("nyanGetFileには1つの引数（ファイルパス）が必要です"))
+		}
+		relativePath := call.Arguments[0].String()
+
+		// 実行中のバイナリのパスを取得し、ディレクトリ部分を取得
+		exePath, err := os.Executable()
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		exeDir := filepath.Dir(exePath)
+
+		// バイナリディレクトリからの相対パスを結合してフルパスを作成
+		fullPath := filepath.Join(exeDir, relativePath)
+
+		// ファイルを読み込み
+		content, err := ioutil.ReadFile(fullPath)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+
+		// 読み込んだ内容を文字列として返す
+		return vm.ToValue(string(content))
 	}
 }
