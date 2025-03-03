@@ -17,9 +17,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -100,6 +102,14 @@ type NyanResponse struct {
 	Profile string                `json:"profile"`
 	Version string                `json:"version"`
 	Apis    map[string]APIDetails `json:"apis"`
+}
+
+// ExecResult はコマンド実行結果を表す構造体です。
+type ExecResult struct {
+	Success  bool   `json:"success"`
+	ExitCode int    `json:"exit_code"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
 }
 
 var config Config
@@ -1165,6 +1175,12 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 		}
 		return vm.ToValue(result)
 	})
+
+	// VM にホストコマンド実行関数 nyanHostExec を登録
+	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
+		return nyanHostExecWrapper(vm, call)
+	})
+
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
 		return false, 500, nil, "", fmt.Errorf("check script error: %v", err)
@@ -1350,6 +1366,11 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 		return nyanRunSQLHandler(vm, call)
 	})
 
+	// VM にホストコマンド実行関数 nyanHostExec を登録
+	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
+		return nyanHostExecWrapper(vm, call)
+	})
+
 	// スクリプト実行
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
@@ -1524,4 +1545,65 @@ func (h *Hub) Broadcast(channel string, message []byte) {
 			log.Printf("チャネル [%s] への送信エラー: %v", channel, err)
 		}
 	}
+}
+
+// execCommand は指定されたコマンドを実行し、その結果を返します。
+func execCommand(commandLine string) (*ExecResult, error) {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/C", commandLine)
+	} else {
+		cmd = exec.Command("sh", "-c", commandLine)
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	err := cmd.Run()
+
+	result := &ExecResult{
+		Success:  false,
+		ExitCode: 0,
+		Stdout:   stdoutBuf.String(),
+		Stderr:   stderrBuf.String(),
+	}
+
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			result.ExitCode = exitErr.ExitCode()
+		} else {
+			result.ExitCode = -1
+		}
+		return result, fmt.Errorf("failed to exec: %w", err)
+	}
+
+	result.Success = true
+	return result, nil
+}
+
+// nyanHostExecWrapper は、nyanHostExec の実装部分を切り出した関数です。
+// コマンドを実行し、JSON タグに沿ったマップとして結果を返します。
+func nyanHostExecWrapper(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
+	if len(call.Arguments) < 1 {
+		panic(vm.ToValue("exec: No command provided"))
+	}
+	// コマンドライン文字列を取得
+	commandLine := call.Argument(0).String()
+	// コマンドを実行する
+	result, err := execCommand(commandLine)
+	if err != nil {
+		panic(vm.ToValue(err.Error()))
+	}
+	// 構造体を JSON にシリアライズし、再度 Unmarshal してマップに変換することで、
+	// JSON タグに基づいたキーが反映される
+	jsonBytes, err := json.Marshal(result)
+	if err != nil {
+		panic(vm.ToValue(err.Error()))
+	}
+	var out interface{}
+	if err := json.Unmarshal(jsonBytes, &out); err != nil {
+		panic(vm.ToValue(err.Error()))
+	}
+	return vm.ToValue(out)
 }
