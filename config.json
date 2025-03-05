@@ -9,10 +9,10 @@
   },
   "certPath": "",
   "keyPath": "",
-  "DBType": "duckdb",
+  "DBType": "sqlite",
   "DBUser": "",
   "DBPassword": "",
-  "DBName": "test.duckdb",
+  "DBName": "stamps.db",
   "DBHost": "",
   "DBPort": "",
   "log": {
