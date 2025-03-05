@@ -5,7 +5,9 @@ function main() {
     console.log("nyanGetAPI:", typeof nyanGetAPI);
     console.log("nyanJsonAPI", typeof nyanJsonAPI);
     console.log("nyanHostExec:" , typeof nyanHostExec);
-    console.log(nyanHostExec("ls"));
+    //console.log(nyanHostExec("ls"));
+    //let r2 = nyanJsonAPI("http://localhost:8443/nyan", '{"key":"value"}', "neko", "nyan", headers);
+    //console.log(r2);
 
 
     if (nyanRequestCheck()) {

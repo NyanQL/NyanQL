@@ -1147,21 +1147,37 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 		}
 		return vm.ToValue(result)
 	})
+
 	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
-		var url, jsonData, username, password string
-		if len(call.Arguments) >= 1 {
-			url = call.Argument(0).String()
+		url := call.Argument(0).String()
+		jsonData := call.Argument(1).String()
+		username := call.Argument(2).String()
+		password := call.Argument(3).String()
+
+		// 第5引数：ヘッダー情報（オブジェクトまたはJSON文字列）
+		var headers map[string]string
+		if len(call.Arguments) >= 5 {
+			// まずは、GojaのExportを使って直接オブジェクトとして取り出す
+			if obj, ok := call.Argument(4).Export().(map[string]interface{}); ok {
+				headers = make(map[string]string)
+				for key, value := range obj {
+					if s, ok := value.(string); ok {
+						headers[key] = s
+					} else {
+						// 文字列以外なら fmt.Sprintで文字列化
+						headers[key] = fmt.Sprint(value)
+					}
+				}
+			} else {
+				// オブジェクトとして取得できなければ、JSON文字列として処理する
+				headerJSON := call.Argument(4).String()
+				if err := json.Unmarshal([]byte(headerJSON), &headers); err != nil {
+					panic(vm.ToValue("Invalid header JSON: " + err.Error()))
+				}
+			}
 		}
-		if len(call.Arguments) >= 2 {
-			jsonData = call.Argument(1).String()
-		}
-		if len(call.Arguments) >= 3 {
-			username = call.Argument(2).String()
-		}
-		if len(call.Arguments) >= 4 {
-			password = call.Argument(3).String()
-		}
-		result, err := jsonAPI(url, []byte(jsonData), username, password)
+
+		result, err := jsonAPI(url, []byte(jsonData), username, password, headers)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
@@ -1212,21 +1228,36 @@ func getAPI(url, username, password string) (string, error) {
 	return string(body), nil
 }
 
-func jsonAPI(url string, jsonData []byte, username, password string) (string, error) {
+// POSTリクエストを行うGo関数
+func jsonAPI(url string, jsonData []byte, username, password string, headers map[string]string) (string, error) {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", err
 	}
-	basicAuth := username + ":" + password
-	basicAuthEncoded := base64.StdEncoding.EncodeToString([]byte(basicAuth))
-	req.Header.Set("Authorization", "Basic "+basicAuthEncoded)
+
+	// BASIC認証のセットアップ（usernameが空でなければ）
+	if username != "" {
+		basicAuth := username + ":" + password
+		basicAuthEncoded := base64.StdEncoding.EncodeToString([]byte(basicAuth))
+		req.Header.Set("Authorization", "Basic "+basicAuthEncoded)
+	}
+
 	req.Header.Set("Content-Type", "application/json")
+
+	// 追加のヘッダーが指定されていれば設定（複数指定可能）
+	if headers != nil {
+		for key, value := range headers {
+			req.Header.Set(key, value)
+		}
+	}
+
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
@@ -1318,7 +1349,7 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 		},
 	})
 
-	// VM にその他のヘルパー関数をセット（例: nyanGetAPI, nyanJsonAPI, nyanRunSQL）
+	// VM ヘルパー関数をセット
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
 		var url, username, password string
 		if len(call.Arguments) >= 1 {
@@ -1336,26 +1367,43 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 		}
 		return vm.ToValue(result)
 	})
+
 	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
-		var url, jsonData, username, password string
-		if len(call.Arguments) >= 1 {
-			url = call.Argument(0).String()
+		url := call.Argument(0).String()
+		jsonData := call.Argument(1).String()
+		username := call.Argument(2).String()
+		password := call.Argument(3).String()
+
+		// 第5引数：ヘッダー情報（オブジェクトまたはJSON文字列）
+		var headers map[string]string
+		if len(call.Arguments) >= 5 {
+			// まずは、GojaのExportを使って直接オブジェクトとして取り出す
+			if obj, ok := call.Argument(4).Export().(map[string]interface{}); ok {
+				headers = make(map[string]string)
+				for key, value := range obj {
+					if s, ok := value.(string); ok {
+						headers[key] = s
+					} else {
+						// 文字列以外なら fmt.Sprintで文字列化
+						headers[key] = fmt.Sprint(value)
+					}
+				}
+			} else {
+				// オブジェクトとして取得できなければ、JSON文字列として処理する
+				headerJSON := call.Argument(4).String()
+				if err := json.Unmarshal([]byte(headerJSON), &headers); err != nil {
+					panic(vm.ToValue("Invalid header JSON: " + err.Error()))
+				}
+			}
 		}
-		if len(call.Arguments) >= 2 {
-			jsonData = call.Argument(1).String()
-		}
-		if len(call.Arguments) >= 3 {
-			username = call.Argument(2).String()
-		}
-		if len(call.Arguments) >= 4 {
-			password = call.Argument(3).String()
-		}
-		result, err := jsonAPI(url, []byte(jsonData), username, password)
+
+		result, err := jsonAPI(url, []byte(jsonData), username, password, headers)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
 		return vm.ToValue(result)
 	})
+
 	vm.Set("nyanRunSQL", func(call goja.FunctionCall) goja.Value {
 		return nyanRunSQLHandler(vm, call)
 	})
