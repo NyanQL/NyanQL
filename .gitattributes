@@ -1,3 +1,4 @@
 NyanQL_Mac filter=lfs diff=lfs merge=lfs -text
 NyanQL_Windows.exe filter=lfs diff=lfs merge=lfs -text
+NyanQL_Win.exe filter=lfs diff=lfs merge=lfs -text
 NyanQL_Linux_amd64 filter=lfs diff=lfs merge=lfs -text
