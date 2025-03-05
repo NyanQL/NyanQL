@@ -16,13 +16,26 @@ HTMLを生成するNyanPUI（にゃんぷい）があります。
 * PostgreSQL
 * SQLite
 
-# 対応OSと起動方法
+# アプリケーションの実行方法
+config.jsonとapi.jsonを編集してください。
 各環境用にビルド済みバイナリファイルを同梱しています。 クリックまたはターミナルから起動して実行できます。
 HostとなるOSに合わせたバイナリーを使って起動してください。
-* 
-* Linux用 NyanQL_Linux_amd64
-* Mac用　NyanQL_Mac
-* Windows用 NyanQL_Windows.exe
+
+## Windowsの場合
+Nyan8_Win.exe をダブルクリックして起動します。
+
+## Macの場合
+Nyan8_Macをダブルクリックするか、ターミナルで以下のコマンドを実行して起動します。
+```
+./Nyan8_Mac
+```
+
+## Linuxの場合
+ターミナルで以下のコマンドを実行して起動します。
+```
+./Nyan8_Linux_x64
+```
+
 
 # 設定ファイル
 APIサーバの設定としてのconfig.jsonとそれぞれのAPIに対する設定となるapi.jsonがあります。
@@ -279,6 +292,90 @@ function main() {
 
 main();
 
+```
+
+# checkとscript共通のjavascript機能
+## postやgetやjsonなどで受信されたパラメータの取得
+nyanAllParamsに格納されています。
+
+```javascript
+console.log(nyanAllParams);
+```
+
+
+## Ajaxの操作
+Ajaxの操作が可能です。
+取得したデータはJSON.parseでパースしてください。
+
+getでの取得の場合
+
+```javascript
+//apiのURL  apiURL
+//basic認証のID  apiUser
+//basic認証のパスワード apiPass
+//javascript内でデータとして扱う場合、JSON.parse()で文字列から変換をする必要があります。
+console.log(nyanGetAPI(apiURL,apiUser,apiPass));
+```
+
+jsonでの取得の場合
+
+```javascript
+//apiのURL  apiURL
+//basic認証のID  apiUser
+//basic認証のパスワード apiPass
+//javascript内でデータとして扱う場合、JSON.parse()で文字列から変換をする必要があります。
+const data = {
+            api: "create_user",
+            username: nyanAllParams.username,
+            password: nyanAllParams.password,
+            email: nyanAllParams.email,
+            salt: saltKey
+        };
+const result = nyanJsonAPI(
+        apiURL,
+        JSON.stringify(data),
+        apiUser,
+        apiPass
+    );
+const resultData = JSON.parse(result);
+```
+
+ヘッダー情報をJSON文字列で渡す例
+
+```js
+// ヘッダー情報をJSON文字列で渡す例
+let headers = JSON.stringify({
+    "X-Custom-Header": "myValue",
+    "X-Another-Header": "anotherValue"
+});
+let result = nyanJsonAPI("https://example.com/api", JSON.stringify(data), "user", "pass", headers);
+```
+
+## hostでのコマンド実行と結果の取得
+hostでのコマンド実行が可能です。
+
+```javascript
+console.log(nyanHostExec("ls"));
+```
+
+実行結果は次のような構成になって取得できます。
+
+```json
+{"success":true,"exit_code":0,"stdout":"コマンドの実行結果","stderr":""}
+```
+
+* success : コマンドの実行が成功したかどうか
+* exit_code : コマンドの終了コード
+* stdout : 標準出力
+* stderr : 標準エラー出力
+
+## ファイルの読み込み
+
+ファイルの読み込みができます。
+
+```js
+let text = nyanGetFile("ファイルのパス");
+let data = JSON.parse(text);
 ```
 
 
