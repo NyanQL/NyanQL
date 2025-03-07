@@ -10,6 +10,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/websocket"
 	_ "github.com/lib/pq"
+	_ "github.com/marcboeker/go-duckdb"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/natefinch/lumberjack"
 	"github.com/rs/cors"
@@ -17,9 +18,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -100,6 +103,14 @@ type NyanResponse struct {
 	Profile string                `json:"profile"`
 	Version string                `json:"version"`
 	Apis    map[string]APIDetails `json:"apis"`
+}
+
+// ExecResult はコマンド実行結果を表す構造体です。
+type ExecResult struct {
+	Success  bool   `json:"success"`
+	ExitCode int    `json:"exit_code"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
 }
 
 var config Config
@@ -243,18 +254,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func adjustPaths(execDir string, config *Config) {
-	if config.CertPath != "" && !filepath.IsAbs(config.CertPath) {
-		config.CertPath = filepath.Join(execDir, config.CertPath)
-	}
-	if config.KeyPath != "" && !filepath.IsAbs(config.KeyPath) {
-		config.KeyPath = filepath.Join(execDir, config.KeyPath)
-	}
-	if config.DatabaseType == "sqlite" && config.DBName != "" && !filepath.IsAbs(config.DBName) {
-		config.DBName = filepath.Join(execDir, config.DBName)
-	}
-}
-
 func loadSQLFiles(execDir string) {
 	apiFilePath := filepath.Join(execDir, "api.json")
 	data, err := ioutil.ReadFile(apiFilePath)
@@ -304,6 +303,9 @@ func connectDB(config Config) (*sql.DB, error) {
 		dsn = fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable", config.DBHost, config.DBPort, config.DBUsername, config.DBPassword, config.DBName)
 	case "sqlite":
 		driverName = "sqlite3"
+		dsn = config.DBName
+	case "duckdb":
+		driverName = "duckdb"
 		dsn = config.DBName
 	default:
 		return nil, fmt.Errorf("unsupported database type: %s", config.DatabaseType)
@@ -1145,26 +1147,50 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 		}
 		return vm.ToValue(result)
 	})
+
 	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
-		var url, jsonData, username, password string
-		if len(call.Arguments) >= 1 {
-			url = call.Argument(0).String()
+		url := call.Argument(0).String()
+		jsonData := call.Argument(1).String()
+		username := call.Argument(2).String()
+		password := call.Argument(3).String()
+
+		// 第5引数：ヘッダー情報（オブジェクトまたはJSON文字列）
+		var headers map[string]string
+		if len(call.Arguments) >= 5 {
+			// まずは、GojaのExportを使って直接オブジェクトとして取り出す
+			if obj, ok := call.Argument(4).Export().(map[string]interface{}); ok {
+				headers = make(map[string]string)
+				for key, value := range obj {
+					if s, ok := value.(string); ok {
+						headers[key] = s
+					} else {
+						// 文字列以外なら fmt.Sprintで文字列化
+						headers[key] = fmt.Sprint(value)
+					}
+				}
+			} else {
+				// オブジェクトとして取得できなければ、JSON文字列として処理する
+				headerJSON := call.Argument(4).String()
+				if err := json.Unmarshal([]byte(headerJSON), &headers); err != nil {
+					panic(vm.ToValue("Invalid header JSON: " + err.Error()))
+				}
+			}
 		}
-		if len(call.Arguments) >= 2 {
-			jsonData = call.Argument(1).String()
-		}
-		if len(call.Arguments) >= 3 {
-			username = call.Argument(2).String()
-		}
-		if len(call.Arguments) >= 4 {
-			password = call.Argument(3).String()
-		}
-		result, err := jsonAPI(url, []byte(jsonData), username, password)
+
+		result, err := jsonAPI(url, []byte(jsonData), username, password, headers)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
 		return vm.ToValue(result)
 	})
+
+	// VM にホストコマンド実行関数 nyanHostExec を登録
+	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
+		return nyanHostExecWrapper(vm, call)
+	})
+
+	vm.Set("nyanGetFile", newNyanGetFile(vm))
+
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
 		return false, 500, nil, "", fmt.Errorf("check script error: %v", err)
@@ -1202,21 +1228,36 @@ func getAPI(url, username, password string) (string, error) {
 	return string(body), nil
 }
 
-func jsonAPI(url string, jsonData []byte, username, password string) (string, error) {
+// POSTリクエストを行うGo関数
+func jsonAPI(url string, jsonData []byte, username, password string, headers map[string]string) (string, error) {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", err
 	}
-	basicAuth := username + ":" + password
-	basicAuthEncoded := base64.StdEncoding.EncodeToString([]byte(basicAuth))
-	req.Header.Set("Authorization", "Basic "+basicAuthEncoded)
+
+	// BASIC認証のセットアップ（usernameが空でなければ）
+	if username != "" {
+		basicAuth := username + ":" + password
+		basicAuthEncoded := base64.StdEncoding.EncodeToString([]byte(basicAuth))
+		req.Header.Set("Authorization", "Basic "+basicAuthEncoded)
+	}
+
 	req.Header.Set("Content-Type", "application/json")
+
+	// 追加のヘッダーが指定されていれば設定（複数指定可能）
+	if headers != nil {
+		for key, value := range headers {
+			req.Header.Set(key, value)
+		}
+	}
+
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
@@ -1308,7 +1349,7 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 		},
 	})
 
-	// VM にその他のヘルパー関数をセット（例: nyanGetAPI, nyanJsonAPI, nyanRunSQL）
+	// VM ヘルパー関数をセット
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
 		var url, username, password string
 		if len(call.Arguments) >= 1 {
@@ -1326,29 +1367,53 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 		}
 		return vm.ToValue(result)
 	})
+
 	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
-		var url, jsonData, username, password string
-		if len(call.Arguments) >= 1 {
-			url = call.Argument(0).String()
+		url := call.Argument(0).String()
+		jsonData := call.Argument(1).String()
+		username := call.Argument(2).String()
+		password := call.Argument(3).String()
+
+		// 第5引数：ヘッダー情報（オブジェクトまたはJSON文字列）
+		var headers map[string]string
+		if len(call.Arguments) >= 5 {
+			// まずは、GojaのExportを使って直接オブジェクトとして取り出す
+			if obj, ok := call.Argument(4).Export().(map[string]interface{}); ok {
+				headers = make(map[string]string)
+				for key, value := range obj {
+					if s, ok := value.(string); ok {
+						headers[key] = s
+					} else {
+						// 文字列以外なら fmt.Sprintで文字列化
+						headers[key] = fmt.Sprint(value)
+					}
+				}
+			} else {
+				// オブジェクトとして取得できなければ、JSON文字列として処理する
+				headerJSON := call.Argument(4).String()
+				if err := json.Unmarshal([]byte(headerJSON), &headers); err != nil {
+					panic(vm.ToValue("Invalid header JSON: " + err.Error()))
+				}
+			}
 		}
-		if len(call.Arguments) >= 2 {
-			jsonData = call.Argument(1).String()
-		}
-		if len(call.Arguments) >= 3 {
-			username = call.Argument(2).String()
-		}
-		if len(call.Arguments) >= 4 {
-			password = call.Argument(3).String()
-		}
-		result, err := jsonAPI(url, []byte(jsonData), username, password)
+
+		result, err := jsonAPI(url, []byte(jsonData), username, password, headers)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
 		return vm.ToValue(result)
 	})
+
 	vm.Set("nyanRunSQL", func(call goja.FunctionCall) goja.Value {
 		return nyanRunSQLHandler(vm, call)
 	})
+
+	// VM にホストコマンド実行関数 nyanHostExec を登録
+	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
+		return nyanHostExecWrapper(vm, call)
+	})
+
+	vm.Set("nyanGetFile", newNyanGetFile(vm))
 
 	// スクリプト実行
 	value, err := vm.RunString(combinedScript.String())
@@ -1523,5 +1588,110 @@ func (h *Hub) Broadcast(channel string, message []byte) {
 		if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
 			log.Printf("チャネル [%s] への送信エラー: %v", channel, err)
 		}
+	}
+}
+
+// execCommand は指定されたコマンドを実行し、その結果を返します。
+func execCommand(commandLine string) (*ExecResult, error) {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/C", commandLine)
+	} else {
+		cmd = exec.Command("sh", "-c", commandLine)
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	err := cmd.Run()
+
+	result := &ExecResult{
+		Success:  false,
+		ExitCode: 0,
+		Stdout:   stdoutBuf.String(),
+		Stderr:   stderrBuf.String(),
+	}
+
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			result.ExitCode = exitErr.ExitCode()
+		} else {
+			result.ExitCode = -1
+		}
+		return result, fmt.Errorf("failed to exec: %w", err)
+	}
+
+	result.Success = true
+	return result, nil
+}
+
+// nyanHostExecWrapper は、nyanHostExec の実装部分を切り出した関数です。
+// コマンドを実行し、JSON タグに沿ったマップとして結果を返します。
+func nyanHostExecWrapper(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
+	if len(call.Arguments) < 1 {
+		panic(vm.ToValue("exec: No command provided"))
+	}
+	// コマンドライン文字列を取得
+	commandLine := call.Argument(0).String()
+	// コマンドを実行する
+	result, err := execCommand(commandLine)
+	if err != nil {
+		panic(vm.ToValue(err.Error()))
+	}
+	// 構造体を JSON にシリアライズし、再度 Unmarshal してマップに変換することで、
+	// JSON タグに基づいたキーが反映される
+	jsonBytes, err := json.Marshal(result)
+	if err != nil {
+		panic(vm.ToValue(err.Error()))
+	}
+	var out interface{}
+	if err := json.Unmarshal(jsonBytes, &out); err != nil {
+		panic(vm.ToValue(err.Error()))
+	}
+	return vm.ToValue(out)
+}
+
+func adjustPaths(execDir string, config *Config) {
+	if config.CertPath != "" && !filepath.IsAbs(config.CertPath) {
+		config.CertPath = filepath.Join(execDir, config.CertPath)
+	}
+	if config.KeyPath != "" && !filepath.IsAbs(config.KeyPath) {
+		config.KeyPath = filepath.Join(execDir, config.KeyPath)
+	}
+	// sqlite と duckdb の場合、DBName が相対パスなら絶対パスに変換
+	if (config.DatabaseType == "sqlite" || config.DatabaseType == "duckdb") && config.DBName != "" && !filepath.IsAbs(config.DBName) {
+		config.DBName = filepath.Join(execDir, config.DBName)
+	}
+}
+
+// newNyanGetFile は、渡された vm をクロージャーにキャプチャして nyanGetFile を返します。
+func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		// 引数のチェック
+		if len(call.Arguments) < 1 {
+			// vm を使ってエラーオブジェクトを生成する
+			panic(vm.NewTypeError("nyanGetFileには1つの引数（ファイルパス）が必要です"))
+		}
+		relativePath := call.Arguments[0].String()
+
+		// 実行中のバイナリのパスを取得し、ディレクトリ部分を取得
+		exePath, err := os.Executable()
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		exeDir := filepath.Dir(exePath)
+
+		// バイナリディレクトリからの相対パスを結合してフルパスを作成
+		fullPath := filepath.Join(exeDir, relativePath)
+
+		// ファイルを読み込み
+		content, err := ioutil.ReadFile(fullPath)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+
+		// 読み込んだ内容を文字列として返す
+		return vm.ToValue(string(content))
 	}
 }

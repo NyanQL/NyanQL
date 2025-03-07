@@ -12,7 +12,7 @@
   "DBType": "sqlite",
   "DBUser": "",
   "DBPassword": "",
-  "DBName": "./stamps.db",
+  "DBName": "stamps.db",
   "DBHost": "",
   "DBPort": "",
   "log": {
