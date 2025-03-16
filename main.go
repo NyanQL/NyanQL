@@ -591,25 +591,44 @@ func isSelectQuery(query string) bool {
 }
 
 func prepareQueryWithParams(query string, params map[string]interface{}) (string, []interface{}) {
+	// / * paramName * / 'xxxxx' などを捕まえる正規表現
 	re := regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
-	mapping := make(map[string]string)
-	args := []interface{}{}
+
+	var args []interface{}
 	placeholderCounter := 1
+
 	replacedQuery := re.ReplaceAllStringFunc(query, func(match string) string {
 		groups := re.FindStringSubmatch(match)
 		paramName := strings.TrimSpace(groups[1])
-		if placeholder, exists := mapping[paramName]; exists {
-			return placeholder
-		}
+
+		// パラメータマップから値を取得
 		value, ok := params[paramName]
 		if !ok {
-			log.Printf("Parameter %s not found in provided parameters", paramName)
+			// 該当パラメータが無いなら nil で置き換え
 			value = nil
 		}
+
 		rv := reflect.ValueOf(value)
-		if rv.IsValid() && rv.Kind() == reflect.Slice {
-			var placeholders []string
-			for i := 0; i < rv.Len(); i++ {
+		// 値が nil (rv.IsValid() == false) もしくは単なる <nil> interface などを考慮
+		if !rv.IsValid() {
+			// とりあえず 1 個の placeholder にして args に nil を入れる
+			args = append(args, nil)
+			if dbType == "postgres" {
+				place := fmt.Sprintf("$%d", placeholderCounter)
+				placeholderCounter++
+				return place
+			}
+			return "?"
+		}
+
+		if rv.Kind() == reflect.Slice {
+			// === スライスの場合 ===
+			n := rv.Len()
+			if n == 0 {
+				return "NULL"
+			}
+			placeholders := make([]string, 0, n)
+			for i := 0; i < n; i++ {
 				args = append(args, rv.Index(i).Interface())
 				if dbType == "postgres" {
 					placeholders = append(placeholders, fmt.Sprintf("$%d", placeholderCounter))
@@ -618,10 +637,9 @@ func prepareQueryWithParams(query string, params map[string]interface{}) (string
 				}
 				placeholderCounter++
 			}
-			placeholder := strings.Join(placeholders, ",")
-			mapping[paramName] = placeholder
-			return placeholder
+			return strings.Join(placeholders, ",")
 		} else {
+			// 単一値の場合 year=2025 など ⇒ `?` or `$1`
 			args = append(args, value)
 			var placeholder string
 			if dbType == "postgres" {
@@ -629,12 +647,10 @@ func prepareQueryWithParams(query string, params map[string]interface{}) (string
 			} else {
 				placeholder = "?"
 			}
-			mapping[paramName] = placeholder
 			placeholderCounter++
 			return placeholder
 		}
 	})
-	log.Print("Replaced Query: ", replacedQuery)
 	return replacedQuery, args
 }
 
