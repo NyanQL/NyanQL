@@ -15,6 +15,9 @@
   "DBName": "stamps.db",
   "DBHost": "",
   "DBPort": "",
+  "MaxOpenConnections": 10,
+  "MaxIdleConnections": 5,
+  "ConnMaxLifetimeSeconds": 3600,
   "log": {
     "Filename": "./logs/nyanql.log",
     "MaxSize": 5,
