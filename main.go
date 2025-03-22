@@ -514,7 +514,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		log.Print("Processed SQL: ", processed)
 		queryStr, args := prepareQueryWithParams(processed, params)
 		log.Print("Final Query: ", queryStr)
-		if isSelectQuery(queryStr) {
+		if isSelectQuery(queryStr) || isReturningQuery(queryStr) {
 			var rows *sql.Rows
 			if tx != nil {
 				rows, err = tx.Query(queryStr, args...)
@@ -1067,6 +1067,11 @@ func parseScriptConstants(scriptPath string) (map[string]interface{}, []string, 
 	return acceptedParams, outputColumns, nil
 }
 
+func isReturningQuery(query string) bool {
+	upper := strings.ToUpper(query)
+	return strings.Contains(upper, "RETURNING")
+}
+
 func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	// 第一引数: SQLファイルのパス
 	if len(call.Arguments) < 1 {
@@ -1118,8 +1123,9 @@ func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	}
 
 	// SQL の実行
-	if isSelectQuery(queryStr) {
-		rows, err := execer.Query(queryStr, args...)
+	// SELECT 文、または RETURNING 句を含む場合は Query を使用して結果セットを取得
+	if isSelectQuery(queryStr) || isReturningQuery(queryStr) {
+        rows, err := execer.Query(queryStr, args...)
 		if err != nil {
 			panic(vm.ToValue(fmt.Sprintf("error executing SQL query: %v", err)))
 		}
@@ -1128,9 +1134,15 @@ func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 		if err != nil {
 			panic(vm.ToValue(fmt.Sprintf("error converting rows to JSON: %v", err)))
 		}
-		return vm.ToValue(string(jsonBytes))
+		// 返却する前に JSON 文字列を Go の値にパースする
+		var result interface{}
+		if err := json.Unmarshal(jsonBytes, &result); err != nil {
+			panic(vm.ToValue(fmt.Sprintf("error parsing JSON: %v", err)))
+		}
+		return vm.ToValue(result)
 	} else {
-		result, err := execer.Exec(queryStr, args...)
+	    // それ以外の場合は Exec を使用して結果を取得
+        result, err := execer.Exec(queryStr, args...)
 		if err != nil {
 			panic(vm.ToValue(fmt.Sprintf("error executing SQL query: %v", err)))
 		}
@@ -1142,9 +1154,15 @@ func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 			"rowsAffected": affected,
 		}
 		jsonResp, _ := json.Marshal(response)
-		return vm.ToValue(string(jsonResp))
+		var res interface{}
+		if err := json.Unmarshal(jsonResp, &res); err != nil {
+			panic(vm.ToValue(fmt.Sprintf("error parsing JSON: %v", err)))
+		}
+		return vm.ToValue(res)
 	}
 }
+
+
 
 func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, string, error) {
 	var combinedScript strings.Builder
@@ -1758,3 +1776,4 @@ func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 		return vm.ToValue(string(content))
 	}
 }
+
