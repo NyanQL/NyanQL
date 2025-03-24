@@ -26,24 +26,28 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Config struct {
-	Name              string          `json:"name"`
-	Profile           string          `json:"profile"`
-	Version           string          `json:"version"`
-	Port              int             `json:"Port"`
-	CertPath          string          `json:"CertPath"`
-	KeyPath           string          `json:"KeyPath"`
-	DatabaseType      string          `json:"DBType"`
-	DBUsername        string          `json:"DBUser"`
-	DBPassword        string          `json:"DBPassword"`
-	DBName            string          `json:"DBName"`
-	DBHost            string          `json:"DBHost"`
-	DBPort            string          `json:"DBPort"`
-	BasicAuth         BasicAuthConfig `json:"BasicAuth"`
-	Log               LogConfig       `json:"log"`
-	JavascriptInclude []string        `json:"javascript_include,omitempty"`
+	Name                   string          `json:"name"`
+	Profile                string          `json:"profile"`
+	Version                string          `json:"version"`
+	Port                   int             `json:"Port"`
+	CertPath               string          `json:"CertPath"`
+	KeyPath                string          `json:"KeyPath"`
+	DatabaseType           string          `json:"DBType"`
+	DBUsername             string          `json:"DBUser"`
+	DBPassword             string          `json:"DBPassword"`
+	DBName                 string          `json:"DBName"`
+	DBHost                 string          `json:"DBHost"`
+	DBPort                 string          `json:"DBPort"`
+	MaxOpenConnections     int             `json:"MaxOpenConnections"`
+	MaxIdleConnections     int             `json:"MaxIdleConnections"`
+	ConnMaxLifetimeSeconds int             `json:"ConnMaxLifetimeSeconds"`
+	BasicAuth              BasicAuthConfig `json:"BasicAuth"`
+	Log                    LogConfig       `json:"log"`
+	JavascriptInclude      []string        `json:"javascript_include,omitempty"`
 }
 
 type BasicAuthConfig struct {
@@ -296,22 +300,65 @@ func connectDB(config Config) (*sql.DB, error) {
 	var driverName, dsn string
 	switch config.DatabaseType {
 	case "mysql":
+		// MySQLの場合
 		driverName = "mysql"
-		dsn = fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", config.DBUsername, config.DBPassword, config.DBHost, config.DBPort, config.DBName)
+		dsn = fmt.Sprintf("%s:%s@tcp(%s:%s)/%s",
+			config.DBUsername, config.DBPassword,
+			config.DBHost, config.DBPort, config.DBName)
+
 	case "postgres":
+		// PostgreSQLの場合
 		driverName = "postgres"
-		dsn = fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable", config.DBHost, config.DBPort, config.DBUsername, config.DBPassword, config.DBName)
+		dsn = fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+			config.DBHost, config.DBPort, config.DBUsername, config.DBPassword, config.DBName)
+
 	case "sqlite":
+		// SQLiteの場合
 		driverName = "sqlite3"
+		// DBNameにファイルパスが入っていると仮定
 		dsn = config.DBName
+
 	case "duckdb":
+		// DuckDBの場合
 		driverName = "duckdb"
+		// DBNameにファイルパスが入っていると仮定
 		dsn = config.DBName
+
 	default:
 		return nil, fmt.Errorf("unsupported database type: %s", config.DatabaseType)
 	}
+
+	// グローバル変数などでDB種類を後から参照する場合があればセット
 	dbType = driverName
-	return sql.Open(driverName, dsn)
+
+	// ここでDB接続をオープン。実際にはまだ物理コネクションは張られない可能性あり
+	db, err := sql.Open(driverName, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open DB: %w", err)
+	}
+
+	// 最大オープン接続数を設定 (0以下なら制限なし)
+	if config.MaxOpenConnections > 0 {
+		db.SetMaxOpenConns(config.MaxOpenConnections)
+	}
+
+	// 最大アイドル接続数を設定
+	if config.MaxIdleConnections > 0 {
+		db.SetMaxIdleConns(config.MaxIdleConnections)
+	}
+
+	// コネクションの最大寿命を設定 (秒指定をDurationに変換)
+	if config.ConnMaxLifetimeSeconds > 0 {
+		db.SetConnMaxLifetime(time.Duration(config.ConnMaxLifetimeSeconds) * time.Second)
+	}
+
+	// 実際に接続が有効かどうか確かめるためPingを打つ(任意)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to ping DB: %w", err)
+	}
+
+	return db, nil
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
@@ -467,7 +514,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		log.Print("Processed SQL: ", processed)
 		queryStr, args := prepareQueryWithParams(processed, params)
 		log.Print("Final Query: ", queryStr)
-		if isSelectQuery(queryStr) {
+		if isSelectQuery(queryStr) || isReturningQuery(queryStr) {
 			var rows *sql.Rows
 			if tx != nil {
 				rows, err = tx.Query(queryStr, args...)
@@ -1020,6 +1067,11 @@ func parseScriptConstants(scriptPath string) (map[string]interface{}, []string, 
 	return acceptedParams, outputColumns, nil
 }
 
+func isReturningQuery(query string) bool {
+	upper := strings.ToUpper(query)
+	return strings.Contains(upper, "RETURNING")
+}
+
 func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	// 第一引数: SQLファイルのパス
 	if len(call.Arguments) < 1 {
@@ -1071,8 +1123,9 @@ func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	}
 
 	// SQL の実行
-	if isSelectQuery(queryStr) {
-		rows, err := execer.Query(queryStr, args...)
+	// SELECT 文、または RETURNING 句を含む場合は Query を使用して結果セットを取得
+	if isSelectQuery(queryStr) || isReturningQuery(queryStr) {
+        rows, err := execer.Query(queryStr, args...)
 		if err != nil {
 			panic(vm.ToValue(fmt.Sprintf("error executing SQL query: %v", err)))
 		}
@@ -1081,9 +1134,15 @@ func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 		if err != nil {
 			panic(vm.ToValue(fmt.Sprintf("error converting rows to JSON: %v", err)))
 		}
-		return vm.ToValue(string(jsonBytes))
+		// 返却する前に JSON 文字列を Go の値にパースする
+		var result interface{}
+		if err := json.Unmarshal(jsonBytes, &result); err != nil {
+			panic(vm.ToValue(fmt.Sprintf("error parsing JSON: %v", err)))
+		}
+		return vm.ToValue(result)
 	} else {
-		result, err := execer.Exec(queryStr, args...)
+	    // それ以外の場合は Exec を使用して結果を取得
+        result, err := execer.Exec(queryStr, args...)
 		if err != nil {
 			panic(vm.ToValue(fmt.Sprintf("error executing SQL query: %v", err)))
 		}
@@ -1095,9 +1154,15 @@ func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 			"rowsAffected": affected,
 		}
 		jsonResp, _ := json.Marshal(response)
-		return vm.ToValue(string(jsonResp))
+		var res interface{}
+		if err := json.Unmarshal(jsonResp, &res); err != nil {
+			panic(vm.ToValue(fmt.Sprintf("error parsing JSON: %v", err)))
+		}
+		return vm.ToValue(res)
 	}
 }
+
+
 
 func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, string, error) {
 	var combinedScript strings.Builder
@@ -1711,3 +1776,4 @@ func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 		return vm.ToValue(string(content))
 	}
 }
+
