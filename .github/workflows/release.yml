@@ -13,7 +13,7 @@ jobs:
         os: [linux, darwin, windows]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v4
@@ -36,7 +36,7 @@ jobs:
           go build -o ${binary_name} main.go
 
       - name: Upload artifact for ${{ matrix.os }}
-        uses: actions/upload-artifact@v3.1.2
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.os }}-binary
           path: NyanQL_${{ matrix.os }}*
@@ -46,19 +46,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download Linux binary artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: linux-binary
           path: artifacts/linux
 
       - name: Download Darwin binary artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: darwin-binary
           path: artifacts/darwin
 
       - name: Download Windows binary artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: windows-binary
           path: artifacts/windows
