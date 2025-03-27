@@ -3,7 +3,7 @@ name: Build and Release Binaries
 on:
   push:
     tags:
-      - 'v*.*.*'  # タグ（例: v1.0.0）のプッシュ時にトリガー
+      - 'v*.*.*'
 
 jobs:
   build:
@@ -18,7 +18,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.24'  # ご利用のGoバージョンに合わせて変更してください
+          go-version: '1.24'
 
       - name: Build binary for ${{ matrix.os }}
         env:
@@ -36,7 +36,7 @@ jobs:
           go build -o ${binary_name} main.go
 
       - name: Upload artifact for ${{ matrix.os }}
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3.1.2
         with:
           name: ${{ matrix.os }}-binary
           path: NyanQL_${{ matrix.os }}*
