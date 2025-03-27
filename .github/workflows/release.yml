@@ -69,6 +69,8 @@ jobs:
           path: NyanQL_${{ matrix.os }}.zip
 
   release:
+    permissions:
+      contents: write
     needs: build
     runs-on: ubuntu-latest
     steps:
