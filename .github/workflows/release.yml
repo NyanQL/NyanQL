@@ -3,7 +3,7 @@ name: Build and Release Binaries
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - 'v*.*.*'  # 例: v1.0.0 のようなタグをプッシュすると実行
 
 jobs:
   build:
@@ -12,22 +12,25 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # リポジトリのチェックアウト
       - name: Check out repository
         uses: actions/checkout@v4
 
+      # Windowsでzipコマンドを使うためにChocolateyからインストール
       - name: Install zip on Windows
         if: matrix.os == 'windows-latest'
         shell: powershell
         run: choco install zip -y
 
+      # Go のセットアップ
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
           go-version: '1.24'
 
+      # ビルド＆zipパッケージ化
       - name: Build and Package
-        # すべてのOSで共通してbashを利用する
-        shell: bash
+        shell: bash  # 全OSで同じbashスクリプトを使う
         env:
           CGO_ENABLED: 1
           GIN_MODE: release
@@ -55,11 +58,80 @@ jobs:
           cp -r sql release_package/
           cp -r ssl release_package/
 
-          # zipを作成 (OS名をファイル名に含める例)
+          # zipを作成（OS名を含めたファイル名にする例）
           zip -r "NyanQL_${{ matrix.os }}.zip" release_package
 
+      # アーティファクト（zip）をアップロード
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.os }}-package
           path: NyanQL_${{ matrix.os }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # buildジョブでアップロードしたArtifactをOS別にダウンロード
+      - name: Download Linux package
+        uses: actions/download-artifact@v4
+        with:
+          name: ubuntu-latest-package
+          path: artifacts/linux
+
+      - name: Download macOS package
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-latest-package
+          path: artifacts/macos
+
+      - name: Download Windows package
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-latest-package
+          path: artifacts/windows
+
+      # タグを元にリリースを作成
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # GitHub提供のトークン
+        with:
+          tag_name: ${{ github.ref }}               # v1.0.0など
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+
+      # リリースアセットをアップロード（Linux版）
+      - name: Upload Linux Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/linux/NyanQL_ubuntu-latest.zip
+          asset_name: NyanQL_ubuntu-latest.zip
+          asset_content_type: application/zip
+
+      # リリースアセットをアップロード（macOS版）
+      - name: Upload macOS Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/macos/NyanQL_macos-latest.zip
+          asset_name: NyanQL_macos-latest.zip
+          asset_content_type: application/zip
+
+      # リリースアセットをアップロード（Windows版）
+      - name: Upload Windows Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/windows/NyanQL_windows-latest.zip
+          asset_name: NyanQL_windows-latest.zip
+          asset_content_type: application/zip
