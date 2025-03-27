@@ -3,7 +3,10 @@ name: Build and Release Binaries
 on:
   push:
     tags:
-      - 'v*.*.*'  # 例: v1.0.0 のようなタグをプッシュすると実行
+      - 'v*.*.*'
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -12,56 +15,39 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      # リポジトリのチェックアウト
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # Windowsでzipコマンドを使うためにChocolateyからインストール
       - name: Install zip on Windows
         if: matrix.os == 'windows-latest'
         shell: powershell
         run: choco install zip -y
 
-      # Go のセットアップ
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
           go-version: '1.24'
 
-      # ビルド＆zipパッケージ化
       - name: Build and Package
-        shell: bash  # 全OSで同じbashスクリプトを使う
+        shell: bash
         env:
           CGO_ENABLED: 1
           GIN_MODE: release
         run: |
-          # OSに応じてバイナリ名を決定
           binary_name="NyanQL"
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             binary_name="${binary_name}.exe"
           fi
 
-          # main.goをビルド
           go build -o "${binary_name}" main.go
 
-          # パッケージ用のフォルダ作成
           mkdir release_package
-
           cp "${binary_name}" release_package/
-          cp README.md release_package/
-          cp LICENSE.md release_package/
-          cp config.json release_package/
-          cp api.json release_package/
-          cp stamps.db release_package/
-          cp -r javascript release_package/
-          cp -r logs release_package/
-          cp -r sql release_package/
-          cp -r ssl release_package/
+          cp README.md LICENSE.md config.json api.json stamps.db release_package/
+          cp -r javascript logs sql ssl release_package/
 
-          # zipを作成（OS名を含めたファイル名にする例）
           zip -r "NyanQL_${{ matrix.os }}.zip" release_package
 
-      # アーティファクト（zip）をアップロード
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -69,12 +55,9 @@ jobs:
           path: NyanQL_${{ matrix.os }}.zip
 
   release:
-    permissions:
-      contents: write
     needs: build
     runs-on: ubuntu-latest
     steps:
-      # buildジョブでアップロードしたArtifactをOS別にダウンロード
       - name: Download Linux package
         uses: actions/download-artifact@v4
         with:
@@ -93,47 +76,14 @@ jobs:
           name: windows-latest-package
           path: artifacts/windows
 
-      # タグを元にリリースを作成
-      - name: Create GitHub Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # GitHub提供のトークン
+      - name: Create GitHub Release & Upload Assets
+        uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref_name }}               # v1.0.0など
-          release_name: "Release ${{ github.ref_name }}"
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          files: |
+            artifacts/linux/NyanQL_ubuntu-latest.zip
+            artifacts/macos/NyanQL_macos-latest.zip
+            artifacts/windows/NyanQL_windows-latest.zip
           draft: false
           prerelease: false
-
-      # リリースアセットをアップロード（Linux版）
-      - name: Upload Linux Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/linux/NyanQL_ubuntu-latest.zip
-          asset_name: NyanQL_ubuntu-latest.zip
-          asset_content_type: application/zip
-
-      # リリースアセットをアップロード（macOS版）
-      - name: Upload macOS Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/macos/NyanQL_macos-latest.zip
-          asset_name: NyanQL_macos-latest.zip
-          asset_content_type: application/zip
-
-      # リリースアセットをアップロード（Windows版）
-      - name: Upload Windows Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/windows/NyanQL_windows-latest.zip
-          asset_name: NyanQL_windows-latest.zip
-          asset_content_type: application/zip
