@@ -98,8 +98,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # GitHub提供のトークン
         with:
-          tag_name: ${{ github.ref }}               # v1.0.0など
-          release_name: Release ${{ github.ref }}
+          tag_name: ${{ github.ref_name }}               # v1.0.0など
+          release_name: "Release ${{ github.ref_name }}"
           draft: false
           prerelease: false
 
