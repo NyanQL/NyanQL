@@ -1,0 +1,89 @@
+name: Build and Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install zip on Windows
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: choco install zip -y
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.24'
+
+      - name: Build and Package
+        shell: bash
+        env:
+          CGO_ENABLED: 1
+          GIN_MODE: release
+        run: |
+          binary_name="NyanQL"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            binary_name="${binary_name}.exe"
+          fi
+
+          go build -o "${binary_name}" main.go
+
+          mkdir release_package
+          cp "${binary_name}" release_package/
+          cp README.md LICENSE.md config.json api.json stamps.db release_package/
+          cp -r javascript logs sql ssl release_package/
+
+          zip -r "NyanQL_${{ matrix.os }}.zip" release_package
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-package
+          path: NyanQL_${{ matrix.os }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Linux package
+        uses: actions/download-artifact@v4
+        with:
+          name: ubuntu-latest-package
+          path: artifacts/linux
+
+      - name: Download macOS package
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-latest-package
+          path: artifacts/macos
+
+      - name: Download Windows package
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-latest-package
+          path: artifacts/windows
+
+      - name: Create GitHub Release & Upload Assets
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          files: |
+            artifacts/linux/NyanQL_ubuntu-latest.zip
+            artifacts/macos/NyanQL_macos-latest.zip
+            artifacts/windows/NyanQL_windows-latest.zip
+          draft: false
+          prerelease: false
