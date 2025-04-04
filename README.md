@@ -450,6 +450,10 @@ stamp API の実行後、設定された push ("list" など) の結果が WebSo
 WebSocket クライアントは、たとえば ws://localhost:{Port}/list に接続することで、push で送信される最新の list API の結果を受信できます。
 WebSocketでの接続の場合GETクエリパラメータは利用できませんので /API名の形で接続してください。
 
+# このAPIサーバの情報を取得する場合
+http(s)://{hostname}:{port}/nyan にアクセスすると、このAPIサーバの情報を取得することができます。
+http(s)://{hostname}:{port}/nyan/API名 にアクセスすると、そのAPIの情報を取得することができます。
+
 # 予約語について
 apiとnyanから始まるものは予約語となります。 
 パラメータなどで使用しないようご注意ください。 NyanQLとその仲間の共通ルールです。
