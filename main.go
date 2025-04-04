@@ -64,10 +64,6 @@ type LogConfig struct {
 	EnableLogging bool   `json:"EnableLogging"`
 }
 
-type ErrorResponse struct {
-	Error interface{} `json:"error"`
-}
-
 type APIConfig struct {
 	SQL         []string `json:"sql,omitempty"`
 	Script      string   `json:"script,omitempty"`
@@ -115,6 +111,26 @@ type ExecResult struct {
 	ExitCode int    `json:"exit_code"`
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
+}
+
+type JSONRPCRequest struct {
+	JSONRPC string                 `json:"jsonrpc"`
+	Method  string                 `json:"method"`
+	Params  map[string]interface{} `json:"params"`
+	ID      interface{}            `json:"id"`
+}
+
+type JSONRPCResponse struct {
+	JSONRPC string           `json:"jsonrpc"`
+	Result  interface{}      `json:"result,omitempty"`
+	Error   *JSONRPCError    `json:"error,omitempty"`
+	ID      interface{}      `json:"id,omitempty"`
+}
+
+type JSONRPCError struct {
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
 }
 
 var config Config
@@ -168,6 +184,8 @@ func main() {
 
 	hub = NewHub()
 
+	http.Handle("/nyan-mcp", corsHandler.Handler(http.HandlerFunc(basicAuth(handleNyanMCP, config))))
+
 	http.Handle("/nyan/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		basicAuth(handleNyanOrDetail, config)(w, r)
 	})))
@@ -205,6 +223,7 @@ func (h *Hub) RemoveClient(channel string, conn *websocket.Conn) {
 		}
 	}
 }
+
 func NewHub() *Hub {
 	return &Hub{
 		clients: make(map[string]map[*websocket.Conn]bool),
@@ -272,6 +291,7 @@ func loadSQLFiles(execDir string) {
 			log.Fatalf("Configuration error in api.json for API '%s': If 'script' is set, 'sql' cannot be specified.", apiKey)
 		}
 	}
+
 	for apiKey, apiConfig := range sqlFiles {
 		for i, sqlPath := range apiConfig.SQL {
 			if !filepath.IsAbs(sqlPath) {
@@ -366,6 +386,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+
 	contentType := r.Header.Get("Content-Type")
 	var params map[string]interface{}
 	if contentType == "application/json" {
@@ -569,7 +590,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		lastJSON = []byte("[]")
 	}
 
-	// push 処理
 	// push 処理
 	if apiConfig.Push != "" {
 		pushConfig, exists := sqlFiles[apiConfig.Push]
@@ -873,44 +893,6 @@ func isFloat(s string) bool {
 	return regexp.MustCompile(`^[+-]?\d+(\.\d+)?$`).MatchString(s)
 }
 
-func parseSelectColumns(sqlFilePath string) ([]string, error) {
-	data, err := ioutil.ReadFile(sqlFilePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file %s: %v", sqlFilePath, err)
-	}
-	content := string(data)
-	upper := strings.ToUpper(content)
-	selectIdx := strings.Index(upper, "SELECT")
-	if selectIdx == -1 {
-		return nil, nil
-	}
-	fromIdx := strings.Index(upper, "FROM")
-	if fromIdx == -1 || fromIdx < selectIdx {
-		return nil, nil
-	}
-	selectPart := strings.TrimSpace(content[selectIdx+len("SELECT") : fromIdx])
-	if selectPart == "" {
-		return nil, nil
-	}
-	if selectPart == "*" {
-		return []string{"*"}, nil
-	}
-	colExprs := splitTopLevelColumns(selectPart)
-	var aliases []string
-	for _, expr := range colExprs {
-		upperExpr := strings.ToUpper(expr)
-		asIdx := strings.Index(upperExpr, " AS ")
-		if asIdx >= 0 {
-			aliasPart := strings.TrimSpace(expr[asIdx+4:])
-			aliases = append(aliases, aliasPart)
-		} else {
-			trimmed := strings.TrimSpace(expr)
-			aliases = append(aliases, trimmed)
-		}
-	}
-	return aliases, nil
-}
-
 func splitTopLevelColumns(selectPart string) []string {
 	var result []string
 	var sb strings.Builder
@@ -1038,33 +1020,6 @@ func processConditionals(query string, params map[string]interface{}) string {
 		query = processConditionalsOnce(query, params)
 	}
 	return query
-}
-
-// --- 従来の parseScriptConstants もそのまま ---
-func parseScriptConstants(scriptPath string) (map[string]interface{}, []string, error) {
-	data, err := ioutil.ReadFile(scriptPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read script file %s: %v", scriptPath, err)
-	}
-	content := string(data)
-	var acceptedParams map[string]interface{}
-	var outputColumns []string
-	reAcceptedParams := regexp.MustCompile(`(?s)const\s+nyanAcceptedParams\s*=\s*({[\s\S]*?})\s*;`)
-	if match := reAcceptedParams.FindStringSubmatch(content); match != nil && len(match) > 1 {
-		jsonStr := match[1]
-		if err := json.Unmarshal([]byte(jsonStr), &acceptedParams); err != nil {
-			return nil, nil, fmt.Errorf("failed to parse nyanAcceptedParams: %v", err)
-		}
-	}
-	reOutputColumns := regexp.MustCompile(`(?s)const\s+nyanOutputColumns\s*=\s*(\[[\s\S]*?\])\s*;`)
-	if match := reOutputColumns.FindStringSubmatch(content); match != nil && len(match) > 1 {
-		jsonStr := match[1]
-		if err := json.Unmarshal([]byte(jsonStr), &outputColumns); err != nil {
-			return nil, nil, fmt.Errorf("failed to parse nyanOutputColumns: %v", err)
-		}
-	}
-	log.Print(outputColumns)
-	return acceptedParams, outputColumns, nil
 }
 
 func isReturningQuery(query string) bool {
@@ -1774,6 +1729,308 @@ func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 
 		// 読み込んだ内容を文字列として返す
 		return vm.ToValue(string(content))
+	}
+}
+
+// parseScriptConstants は、指定されたスクリプトファイルから定数をパースします。
+func parseScriptConstants(scriptPath string) (map[string]interface{}, []string, error) {
+    data, err := ioutil.ReadFile(scriptPath)
+    if err != nil {
+        return nil, nil, fmt.Errorf("failed to read script file %s: %v", scriptPath, err)
+    }
+    content := string(data)
+
+    // 戻り値用の変数
+    var acceptedParams map[string]interface{} = map[string]interface{}{}
+    var outputColumns []string
+
+    // const nyanAcceptedParams = {...};
+    reAcceptedParams := regexp.MustCompile(`(?s)const\s+nyanAcceptedParams\s*=\s*({[\s\S]*?})\s*;`)
+    if match := reAcceptedParams.FindStringSubmatch(content); len(match) >= 2 {
+        jsonStr := match[1]
+        if err := json.Unmarshal([]byte(jsonStr), &acceptedParams); err != nil {
+            return nil, nil, fmt.Errorf("failed to parse nyanAcceptedParams: %v", err)
+        }
+    }
+
+    // const nyanOutputColumns = [...];
+    reOutputColumns := regexp.MustCompile(`(?s)const\s+nyanOutputColumns\s*=\s*(\[[\s\S]*?\])\s*;`)
+    if match := reOutputColumns.FindStringSubmatch(content); len(match) >= 2 {
+        jsonStr := match[1]
+        if err := json.Unmarshal([]byte(jsonStr), &outputColumns); err != nil {
+            return nil, nil, fmt.Errorf("failed to parse nyanOutputColumns: %v", err)
+        }
+    }
+
+    return acceptedParams, outputColumns, nil
+}
+
+func respondJSONRPCError(w http.ResponseWriter, id interface{}, code int, message string, data interface{}) {
+	if data == nil {
+		data = map[string]interface{}{}
+	}
+	resp := JSONRPCResponse{
+		JSONRPC: "2.0",
+		Error: &JSONRPCError{
+			Code:    code,
+			Message: message,
+			Data:    data,
+		},
+		ID: id,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	// JSON-RPCのエラーコードとHTTPステータスを対応付け(例)
+	var httpStatus int
+	switch code {
+	case -32601:
+		httpStatus = http.StatusNotFound
+	case -32602:
+		httpStatus = http.StatusBadRequest
+	case -32603, -32001:
+		httpStatus = http.StatusInternalServerError
+	case -32700:
+		httpStatus = http.StatusBadRequest // JSONパースエラー
+	default:
+		httpStatus = http.StatusInternalServerError
+	}
+	w.WriteHeader(httpStatus)
+	json.NewEncoder(w).Encode(resp)
+}
+
+func handleNyanMCP(w http.ResponseWriter, r *http.Request) {
+	log.Println("DEBUG: handleNyanMCP was called")
+	// 1) リクエストボディを読み込み、JSONRPCRequestにパースする
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		respondJSONRPCError(w, nil, -32700, "Parse error (failed to read body)", err.Error())
+		return
+	}
+	defer r.Body.Close()
+
+	var rpcReq JSONRPCRequest
+	if err := json.Unmarshal(body, &rpcReq); err != nil {
+		respondJSONRPCError(w, nil, -32700, "Parse error (invalid JSON)", err.Error())
+		return
+	}
+
+	// 2) JSON-RPCの基本チェック
+	if rpcReq.JSONRPC != "2.0" {
+		respondJSONRPCError(w, rpcReq.ID, -32600, "Invalid Request: 'jsonrpc' must be '2.0'", nil)
+		return
+	}
+	if rpcReq.Method == "" {
+		respondJSONRPCError(w, rpcReq.ID, -32601, "Method not found (empty)", nil)
+		return
+	}
+
+	// 3) 既存のハンドリングと同様に、api.json から対象設定を取得
+	//    JSON-RPCでは、"method" を api キーとして扱う
+	allParams := make(map[string]interface{})
+	for k, v := range rpcReq.Params {
+		allParams[k] = v
+	}
+	if _, ok := allParams["api"]; !ok {
+		allParams["api"] = rpcReq.Method
+	}
+	apiKey, ok := allParams["api"].(string)
+	if !ok || apiKey == "" {
+		respondJSONRPCError(w, rpcReq.ID, -32602, "API key is required and must be a string", nil)
+		return
+	}
+	apiConfig, exists := sqlFiles[apiKey]
+	if !exists {
+		respondJSONRPCError(w, rpcReq.ID, -32601, "SQL files not found", nil)
+		return
+	}
+
+	// 4) チェックスクリプトが設定されていれば実行
+	nyanMode, _ := allParams["nyan_mode"].(string)
+	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
+	if err != nil {
+		log.Printf("Failed to get accepted params keys: %v", err)
+		acceptedKeys = []string{}
+	}
+	if apiConfig.Check != "" {
+		success, statusCode, errorObj, jsonStr, err := runCheckScript(apiConfig.Check, allParams, acceptedKeys)
+		if err != nil {
+			respondJSONRPCError(w, rpcReq.ID, -32603, "Check script error", err.Error())
+			return
+		}
+		if !success {
+			errData := map[string]interface{}{
+				"message": "Request check failed",
+				"detail":  errorObj,
+			}
+			respondJSONRPCError(w, rpcReq.ID, -32602, "Invalid params", errData)
+			return
+		}
+		// nyan_mode=checkOnly ならチェック結果のみ返す
+		if nyanMode == "checkOnly" {
+			var checkResult map[string]interface{}
+			if err := json.Unmarshal([]byte(jsonStr), &checkResult); err != nil {
+				respondJSONRPCError(w, rpcReq.ID, -32603, "Failed to parse check result", err.Error())
+				return
+			}
+			// statusCode はチェックスクリプトが返した値を使用
+			rpcResp := JSONRPCResponse{
+				JSONRPC: "2.0",
+				Result:  checkResult,
+				ID:      rpcReq.ID,
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(statusCode)
+			json.NewEncoder(w).Encode(rpcResp)
+			return
+		}
+	}
+
+	// 5) メインの処理: Script または SQL の実行
+	var finalResult map[string]interface{}
+	if apiConfig.Script != "" {
+		scriptResult, err := runScript([]string{apiConfig.Script}, allParams)
+		if err != nil {
+			respondJSONRPCError(w, rpcReq.ID, -32603, "Script execution error", err.Error())
+			return
+		}
+		if err := json.Unmarshal([]byte(scriptResult), &finalResult); err != nil {
+			respondJSONRPCError(w, rpcReq.ID, -32603, "Failed to parse script result as JSON", err.Error())
+			return
+		}
+	} else if len(apiConfig.SQL) > 0 {
+		var tx *sql.Tx
+		if len(apiConfig.SQL) > 1 {
+			tx, err = db.Begin()
+			if err != nil {
+				respondJSONRPCError(w, rpcReq.ID, -32603, "Failed to start transaction", err.Error())
+				return
+			}
+			defer tx.Rollback()
+		}
+		var lastJSON []byte
+		for _, sqlPath := range apiConfig.SQL {
+			query, err := ioutil.ReadFile(sqlPath)
+			if err != nil {
+				respondJSONRPCError(w, rpcReq.ID, -32603, "Error reading SQL file", err.Error())
+				return
+			}
+			processed := processWhereBlock(string(query), allParams)
+			processed = processConditionals(processed, allParams)
+			queryStr, args := prepareQueryWithParams(processed, allParams)
+			if isSelectQuery(queryStr) || isReturningQuery(queryStr) {
+				var rows *sql.Rows
+				if tx != nil {
+					rows, err = tx.Query(queryStr, args...)
+				} else {
+					rows, err = db.Query(queryStr, args...)
+				}
+				if err != nil {
+					respondJSONRPCError(w, rpcReq.ID, -32603, "Error executing SQL query", err.Error())
+					return
+				}
+				defer rows.Close()
+				lastJSON, err = RowsToJSON(rows)
+				if err != nil {
+					respondJSONRPCError(w, rpcReq.ID, -32603, "Error formatting SQL results", err.Error())
+					return
+				}
+			} else {
+				var result sql.Result
+				if tx != nil {
+					result, err = tx.Exec(queryStr, args...)
+				} else {
+					result, err = db.Exec(queryStr, args...)
+				}
+				if err != nil {
+					respondJSONRPCError(w, rpcReq.ID, -32603, "Error executing SQL query", err.Error())
+					return
+				}
+				rowsAffected, err := result.RowsAffected()
+				if err != nil {
+					respondJSONRPCError(w, rpcReq.ID, -32603, "Error retrieving rows affected", err.Error())
+					return
+				}
+				log.Printf("Rows affected: %d", rowsAffected)
+				lastJSON = []byte("{}")
+			}
+		}
+		if tx != nil {
+			if err := tx.Commit(); err != nil {
+				respondJSONRPCError(w, rpcReq.ID, -32603, "Failed to commit transaction", err.Error())
+				return
+			}
+		}
+		if string(lastJSON) == "null" {
+			lastJSON = []byte("[]")
+		}
+		finalResult = map[string]interface{}{
+			"success": true,
+			"status":  200,
+			"result":  json.RawMessage(lastJSON),
+		}
+	} else {
+		respondJSONRPCError(w, rpcReq.ID, -32603, "No script or SQL defined for this method", nil)
+		return
+	}
+
+	// 6) Push処理（必要な場合）
+	if apiConfig.Push != "" {
+		pushConfig, exists := sqlFiles[apiConfig.Push]
+		if exists {
+			var pushResult []byte
+			var err error
+			if pushConfig.Script != "" {
+				s, err := runScript([]string{pushConfig.Script}, allParams)
+				if err != nil {
+					log.Printf("Push script error: %v", err)
+				} else {
+					pushResult = []byte(s)
+				}
+			} else {
+				pushResult, err = executeAPIConfig(pushConfig)
+				if err != nil {
+					log.Printf("Push API execution error: %v", err)
+				} else {
+					type SQLResponse struct {
+						Success bool            `json:"success"`
+						Status  int             `json:"status"`
+						Result  json.RawMessage `json:"result"`
+					}
+					response := SQLResponse{
+						Success: true,
+						Status:  200,
+						Result:  pushResult,
+					}
+					pushResult, err = json.Marshal(response)
+					if err != nil {
+						log.Printf("Push response JSON marshal error: %v", err)
+					}
+				}
+			}
+			if pushResult != nil {
+				log.Printf("Broadcasting push result to channel [%s]: %s", apiConfig.Push, pushResult)
+				hub.Broadcast(apiConfig.Push, pushResult)
+			}
+		} else {
+			log.Printf("Push API config [%s] not found", apiConfig.Push)
+		}
+	}
+
+	// 7) 最終レスポンスの返却
+	statusCode := 200
+	if st, ok := finalResult["status"].(float64); ok {
+		statusCode = int(st)
+		delete(finalResult, "status")
+	}
+	rpcResp := JSONRPCResponse{
+		JSONRPC: "2.0",
+		Result:  finalResult,
+		ID:      rpcReq.ID,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	if err := json.NewEncoder(w).Encode(rpcResp); err != nil {
+		log.Printf("Failed to encode JSON-RPC response: %v", err)
 	}
 }
 
