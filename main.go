@@ -184,11 +184,11 @@ func main() {
 
 	hub = NewHub()
 
+	http.Handle("/nyan-rpc", corsHandler.Handler(http.HandlerFunc(basicAuth(handleJSONRPC, config))))
+
 	http.Handle("/nyan/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		basicAuth(handleNyanOrDetail, config)(w, r)
 	})))
-
-	http.Handle("/nyan-mcp", corsHandler.Handler(http.HandlerFunc(basicAuth(handleJSONRPC, config))))
 
 	http.Handle("/", corsHandler.Handler(http.HandlerFunc(unifiedHandler)))
 
@@ -591,7 +591,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// push 処理
-	performPush(apiConfig, allParams)
+	performPush(apiConfig, params)
 
 	// SQL実行結果を固定順序の構造体で返す
 	type SQLResponse struct {
