@@ -184,11 +184,11 @@ func main() {
 
 	hub = NewHub()
 
-	http.Handle("/nyan-mcp", corsHandler.Handler(http.HandlerFunc(basicAuth(handleNyanMCP, config))))
-
 	http.Handle("/nyan/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		basicAuth(handleNyanOrDetail, config)(w, r)
 	})))
+
+	http.Handle("/nyan-mcp", corsHandler.Handler(http.HandlerFunc(basicAuth(handleJSONRPC, config))))
 
 	http.Handle("/", corsHandler.Handler(http.HandlerFunc(unifiedHandler)))
 
@@ -591,50 +591,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// push 処理
-	if apiConfig.Push != "" {
-		pushConfig, exists := sqlFiles[apiConfig.Push]
-		if exists {
-			var pushResult []byte
-			var err error
-			// push対象のAPIで script が設定されている場合は、その結果をそのまま使用
-			if pushConfig.Script != "" {
-				scriptResult, err := runScript([]string{pushConfig.Script}, params)
-				if err != nil {
-					log.Printf("Push API script error: %v", err)
-				} else {
-					pushResult = []byte(scriptResult)
-				}
-			} else {
-				// それ以外の場合は、SQL実行結果をラップする
-				pushResult, err = executeAPIConfig(pushConfig)
-				if err != nil {
-					log.Printf("Push API execution error: %v", err)
-				} else {
-					// SQLの場合は、固定のラッパーで出力する
-					type SQLResponse struct {
-						Success bool            `json:"success"`
-						Status  int             `json:"status"`
-						Result  json.RawMessage `json:"result"`
-					}
-					response := SQLResponse{
-						Success: true,
-						Status:  200,
-						Result:  pushResult,
-					}
-					pushResult, err = json.Marshal(response)
-					if err != nil {
-						log.Printf("Push response JSON marshal error: %v", err)
-					}
-				}
-			}
-			if pushResult != nil {
-				log.Printf("Broadcasting push result to channel [%s]: %s", apiConfig.Push, pushResult)
-				hub.Broadcast(apiConfig.Push, pushResult)
-			}
-		} else {
-			log.Printf("Push API設定 [%s] が見つかりません", apiConfig.Push)
-		}
-	}
+	performPush(apiConfig, allParams)
 
 	// SQL実行結果を固定順序の構造体で返す
 	type SQLResponse struct {
@@ -1798,8 +1755,7 @@ func respondJSONRPCError(w http.ResponseWriter, id interface{}, code int, messag
 	json.NewEncoder(w).Encode(resp)
 }
 
-func handleNyanMCP(w http.ResponseWriter, r *http.Request) {
-	log.Println("DEBUG: handleNyanMCP was called")
+func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 	// 1) リクエストボディを読み込み、JSONRPCRequestにパースする
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
@@ -1838,7 +1794,9 @@ func handleNyanMCP(w http.ResponseWriter, r *http.Request) {
 		respondJSONRPCError(w, rpcReq.ID, -32602, "API key is required and must be a string", nil)
 		return
 	}
+
 	apiConfig, exists := sqlFiles[apiKey]
+	fmt.Print(apiConfig);
 	if !exists {
 		respondJSONRPCError(w, rpcReq.ID, -32601, "SQL files not found", nil)
 		return
@@ -1974,6 +1932,27 @@ func handleNyanMCP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 6) Push処理（必要な場合）
+	performPush(apiConfig, allParams)
+
+	// 7) 最終レスポンスの返却
+	statusCode := 200
+	if st, ok := finalResult["status"].(float64); ok {
+		statusCode = int(st)
+		delete(finalResult, "status")
+	}
+	rpcResp := JSONRPCResponse{
+		JSONRPC: "2.0",
+		Result:  finalResult,
+		ID:      rpcReq.ID,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	if err := json.NewEncoder(w).Encode(rpcResp); err != nil {
+		log.Printf("Failed to encode JSON-RPC response: %v", err)
+	}
+}
+
+func performPush(apiConfig APIConfig, allParams map[string]interface{}) {
 	if apiConfig.Push != "" {
 		pushConfig, exists := sqlFiles[apiConfig.Push]
 		if exists {
@@ -2015,22 +1994,4 @@ func handleNyanMCP(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Push API config [%s] not found", apiConfig.Push)
 		}
 	}
-
-	// 7) 最終レスポンスの返却
-	statusCode := 200
-	if st, ok := finalResult["status"].(float64); ok {
-		statusCode = int(st)
-		delete(finalResult, "status")
-	}
-	rpcResp := JSONRPCResponse{
-		JSONRPC: "2.0",
-		Result:  finalResult,
-		ID:      rpcReq.ID,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	if err := json.NewEncoder(w).Encode(rpcResp); err != nil {
-		log.Printf("Failed to encode JSON-RPC response: %v", err)
-	}
 }
-
