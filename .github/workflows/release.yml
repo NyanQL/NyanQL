@@ -12,7 +12,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
@@ -56,12 +56,12 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - name: Download Linux package
         uses: actions/download-artifact@v4
         with:
-          name: ubuntu-22.04-package
+          name: ubuntu-latest-package
           path: artifacts/linux
 
       - name: Download macOS package
