@@ -27,6 +27,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/hex"
 )
 
 type Config struct {
@@ -1956,4 +1959,30 @@ func registerNyanFuncs(vm *goja.Runtime, params map[string]interface{}, accepted
 		}
 		return goja.Undefined() // 成功時は undefined を返すだけ
 	})
+
+	vm.Set("sha256", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			panic(vm.ToValue("nyanSHA256(input) requires 1 argument"))
+		}
+		input := call.Argument(0).String()
+		return vm.ToValue(sha256Hash(input))
+	})
+
+	vm.Set("sha1", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			panic(vm.ToValue("nyanSHA1(input) requires 1 argument"))
+		}
+		input := call.Argument(0).String()
+		return vm.ToValue(sha1Hash(input))
+	})
+}
+
+func sha256Hash(input string) string {
+	hash := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(hash[:])
+}
+
+func sha1Hash(input string) string {
+	hash := sha1.Sum([]byte(input))
+	return hex.EncodeToString(hash[:])
 }
