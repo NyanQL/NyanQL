@@ -1094,95 +1094,8 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 	combinedScript.WriteString("\n")
 	log.Printf("Combined check script:\n%s", combinedScript.String())
 	vm := goja.New()
-	vm.Set("nyanAllParams", params)
-	vm.Set("nyanAcceptedParamsKeys", acceptedParamsKeys)
-	vm.Set("console", map[string]interface{}{
-		"log": func(call goja.FunctionCall) goja.Value {
-			var args []string
-			jsonStringifyVal := vm.Get("JSON").ToObject(vm).Get("stringify")
-			jsonStringify, ok := goja.AssertFunction(jsonStringifyVal)
-			if !ok {
-				log.Println("JSON.stringify is not a function")
-				return goja.Undefined()
-			}
-			for _, arg := range call.Arguments {
-				exported := arg.Export()
-				switch exported.(type) {
-				case map[string]interface{}, []interface{}:
-					s, err := jsonStringify(goja.Undefined(), arg)
-					if err == nil {
-						args = append(args, s.String())
-					} else {
-						args = append(args, arg.String())
-					}
-				default:
-					args = append(args, arg.String())
-				}
-			}
-			log.Println("[JS:check]", strings.Join(args, " "))
-			return goja.Undefined()
-		},
-	})
-	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
-		var url, username, password string
-		if len(call.Arguments) >= 1 {
-			url = call.Argument(0).String()
-		}
-		if len(call.Arguments) >= 2 {
-			username = call.Argument(1).String()
-		}
-		if len(call.Arguments) >= 3 {
-			password = call.Argument(2).String()
-		}
-		result, err := getAPI(url, username, password)
-		if err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
-		return vm.ToValue(result)
-	})
+	registerNyanFuncs(vm, params, acceptedParamsKeys)
 
-	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
-		url := call.Argument(0).String()
-		jsonData := call.Argument(1).String()
-		username := call.Argument(2).String()
-		password := call.Argument(3).String()
-
-		// 第5引数：ヘッダー情報（オブジェクトまたはJSON文字列）
-		var headers map[string]string
-		if len(call.Arguments) >= 5 {
-			// まずは、GojaのExportを使って直接オブジェクトとして取り出す
-			if obj, ok := call.Argument(4).Export().(map[string]interface{}); ok {
-				headers = make(map[string]string)
-				for key, value := range obj {
-					if s, ok := value.(string); ok {
-						headers[key] = s
-					} else {
-						// 文字列以外なら fmt.Sprintで文字列化
-						headers[key] = fmt.Sprint(value)
-					}
-				}
-			} else {
-				// オブジェクトとして取得できなければ、JSON文字列として処理する
-				headerJSON := call.Argument(4).String()
-				if err := json.Unmarshal([]byte(headerJSON), &headers); err != nil {
-					panic(vm.ToValue("Invalid header JSON: " + err.Error()))
-				}
-			}
-		}
-
-		result, err := jsonAPI(url, []byte(jsonData), username, password, headers)
-		if err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
-		return vm.ToValue(result)
-	})
-
-	// VM にホストコマンド実行関数 nyanHostExec を登録
-	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
-		return nyanHostExecWrapper(vm, call)
-	})
-
-	vm.Set("nyanGetFile", newNyanGetFile(vm))
 
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
@@ -1309,104 +1222,7 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 
 	// JavaScript VM の生成
 	vm := goja.New()
-	// VM にパラメータとトランザクションオブジェクトをセット
-	vm.Set("nyanAllParams", params)
-	vm.Set("nyanTx", tx)
-
-	// console.log の定義
-	vm.Set("console", map[string]interface{}{
-		"log": func(call goja.FunctionCall) goja.Value {
-			var args []string
-			jsonStringifyVal := vm.Get("JSON").ToObject(vm).Get("stringify")
-			jsonStringify, ok := goja.AssertFunction(jsonStringifyVal)
-			if !ok {
-				log.Println("JSON.stringify is not a function")
-				return goja.Undefined()
-			}
-			for _, arg := range call.Arguments {
-				exported := arg.Export()
-				switch exported.(type) {
-				case map[string]interface{}, []interface{}:
-					s, err := jsonStringify(goja.Undefined(), arg)
-					if err == nil {
-						args = append(args, s.String())
-					} else {
-						args = append(args, arg.String())
-					}
-				default:
-					args = append(args, arg.String())
-				}
-			}
-			log.Println("[JS:script]", strings.Join(args, " "))
-			return goja.Undefined()
-		},
-	})
-
-	// VM ヘルパー関数をセット
-	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
-		var url, username, password string
-		if len(call.Arguments) >= 1 {
-			url = call.Argument(0).String()
-		}
-		if len(call.Arguments) >= 2 {
-			username = call.Argument(1).String()
-		}
-		if len(call.Arguments) >= 3 {
-			password = call.Argument(2).String()
-		}
-		result, err := getAPI(url, username, password)
-		if err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
-		return vm.ToValue(result)
-	})
-
-	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
-		url := call.Argument(0).String()
-		jsonData := call.Argument(1).String()
-		username := call.Argument(2).String()
-		password := call.Argument(3).String()
-
-		// 第5引数：ヘッダー情報（オブジェクトまたはJSON文字列）
-		var headers map[string]string
-		if len(call.Arguments) >= 5 {
-			// まずは、GojaのExportを使って直接オブジェクトとして取り出す
-			if obj, ok := call.Argument(4).Export().(map[string]interface{}); ok {
-				headers = make(map[string]string)
-				for key, value := range obj {
-					if s, ok := value.(string); ok {
-						headers[key] = s
-					} else {
-						// 文字列以外なら fmt.Sprintで文字列化
-						headers[key] = fmt.Sprint(value)
-					}
-				}
-			} else {
-				// オブジェクトとして取得できなければ、JSON文字列として処理する
-				headerJSON := call.Argument(4).String()
-				if err := json.Unmarshal([]byte(headerJSON), &headers); err != nil {
-					panic(vm.ToValue("Invalid header JSON: " + err.Error()))
-				}
-			}
-		}
-
-		result, err := jsonAPI(url, []byte(jsonData), username, password, headers)
-		if err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
-		return vm.ToValue(result)
-	})
-
-	vm.Set("nyanRunSQL", func(call goja.FunctionCall) goja.Value {
-		return nyanRunSQLHandler(vm, call)
-	})
-
-	// VM にホストコマンド実行関数 nyanHostExec を登録
-	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
-		return nyanHostExecWrapper(vm, call)
-	})
-
-	vm.Set("nyanGetFile", newNyanGetFile(vm))
+	registerNyanFuncs(vm, params, nil)
 
 	// スクリプト実行
 	value, err := vm.RunString(combinedScript.String())
@@ -1994,4 +1810,150 @@ func performPush(apiConfig APIConfig, allParams map[string]interface{}) {
 			log.Printf("Push API config [%s] not found", apiConfig.Push)
 		}
 	}
+}
+
+// saveBase64ToFile decodes a Base64 string and writes it to destPath.
+// If destPath is relative, it is treated as relative to the executable directory.
+func saveBase64ToFile(destPath, b64 string) error {
+	// 1) パス解決（実行ファイルのディレクトリ基準）
+	if !filepath.IsAbs(destPath) {
+		exe, _ := os.Executable()
+		destPath = filepath.Join(filepath.Dir(exe), destPath)
+	}
+	// 2) デコード
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return fmt.Errorf("invalid base64: %w", err)
+	}
+	// 3) 中間ディレクトリ自動生成
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+		return err
+	}
+	// 4) 書き込み（既存なら上書き）
+	return os.WriteFile(destPath, data, 0o644)
+}
+
+func registerNyanFuncs(vm *goja.Runtime, params map[string]interface{}, acceptedParamsKeys []string) {
+	vm.Set("nyanAllParams", params)
+	vm.Set("nyanAcceptedParamsKeys", acceptedParamsKeys)
+	vm.Set("console", map[string]interface{}{
+		"log": func(call goja.FunctionCall) goja.Value {
+			var args []string
+			jsonStringifyVal := vm.Get("JSON").ToObject(vm).Get("stringify")
+			jsonStringify, ok := goja.AssertFunction(jsonStringifyVal)
+			if !ok {
+				log.Println("JSON.stringify is not a function")
+				return goja.Undefined()
+			}
+			for _, arg := range call.Arguments {
+				exported := arg.Export()
+				switch exported.(type) {
+				case map[string]interface{}, []interface{}:
+					s, err := jsonStringify(goja.Undefined(), arg)
+					if err == nil {
+						args = append(args, s.String())
+					} else {
+						args = append(args, arg.String())
+					}
+				default:
+					args = append(args, arg.String())
+				}
+			}
+			log.Println("[JS:check]", strings.Join(args, " "))
+			return goja.Undefined()
+		},
+	})
+	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
+		var url, username, password string
+		if len(call.Arguments) >= 1 {
+			url = call.Argument(0).String()
+		}
+		if len(call.Arguments) >= 2 {
+			username = call.Argument(1).String()
+		}
+		if len(call.Arguments) >= 3 {
+			password = call.Argument(2).String()
+		}
+		result, err := getAPI(url, username, password)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(result)
+	})
+	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
+		url := call.Argument(0).String()
+		jsonData := call.Argument(1).String()
+		username := call.Argument(2).String()
+		password := call.Argument(3).String()
+
+		// 第5引数：ヘッダー情報（オブジェクトまたはJSON文字列）
+		var headers map[string]string
+		if len(call.Arguments) >= 5 {
+			// まずは、GojaのExportを使って直接オブジェクトとして取り出す
+			if obj, ok := call.Argument(4).Export().(map[string]interface{}); ok {
+				headers = make(map[string]string)
+				for key, value := range obj {
+					if s, ok := value.(string); ok {
+						headers[key] = s
+					} else {
+						// 文字列以外なら fmt.Sprintで文字列化
+						headers[key] = fmt.Sprint(value)
+					}
+				}
+			} else {
+				// オブジェクトとして取得できなければ、JSON文字列として処理する
+				headerJSON := call.Argument(4).String()
+				if err := json.Unmarshal([]byte(headerJSON), &headers); err != nil {
+					panic(vm.ToValue("Invalid header JSON: " + err.Error()))
+				}
+			}
+		}
+
+		result, err := jsonAPI(url, []byte(jsonData), username, password, headers)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(result)
+	})
+	// VM にホストコマンド実行関数 nyanHostExec を登録
+	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
+		return nyanHostExecWrapper(vm, call)
+	})
+	vm.Set("nyanRunSQL", func(call goja.FunctionCall) goja.Value {
+		return nyanRunSQLHandler(vm, call)
+	})
+	vm.Set("nyanGetFile", newNyanGetFile(vm))
+	vm.Set("nyanBase64Encode", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			panic(vm.ToValue("nyanBase64Encode(data) : data が必要です"))
+		}
+		// ①第一引数を文字列として取得（Uint8Array などにしたい場合は要調整）
+		src := call.Argument(0).String()
+		// ②Base64 へ
+		b64 := base64.StdEncoding.EncodeToString([]byte(src))
+		return vm.ToValue(b64)
+	})
+	vm.Set("nyanBase64Decode", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			panic(vm.ToValue("nyanBase64Decode(b64) : b64 が必要です"))
+		}
+		b64 := call.Argument(0).String()
+		bin, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			panic(vm.ToValue("base64 decode error: " + err.Error()))
+		}
+		// 戻り値は UTF-8 文字列を想定（バイナリを扱う場合は Uint8Array などへ変換を）
+		return vm.ToValue(string(bin))
+	})
+	vm.Set("nyanSaveFile", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 2 {
+			panic(vm.ToValue("nyanSaveFile(base64, path) requires 2 arguments"))
+		}
+		b64   := call.Argument(0).String()
+		path  := call.Argument(1).String()
+		if err := saveBase64ToFile(path, b64); err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return goja.Undefined() // 成功時は undefined を返すだけ
+	})
 }
