@@ -1477,33 +1477,39 @@ func adjustPaths(execDir string, config *Config) {
 	}
 }
 
-// newNyanGetFile は、渡された vm をクロージャーにキャプチャして nyanGetFile を返します。
-func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+// nyanGetFile
+func nyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		// 引数のチェック
 		if len(call.Arguments) < 1 {
-			// vm を使ってエラーオブジェクトを生成する
 			panic(vm.NewTypeError("nyanGetFileには1つの引数（ファイルパス）が必要です"))
 		}
 		relativePath := call.Arguments[0].String()
 
-		// 実行中のバイナリのパスを取得し、ディレクトリ部分を取得
+		// 実行中のバイナリのディレクトリからの相対パスに解決
 		exePath, err := os.Executable()
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
 		exeDir := filepath.Dir(exePath)
-
-		// バイナリディレクトリからの相対パスを結合してフルパスを作成
 		fullPath := filepath.Join(exeDir, relativePath)
 
-		// ファイルを読み込み
-		content, err := ioutil.ReadFile(fullPath)
+		// ディレクトリ指定なら null
+		if fi, err := os.Stat(fullPath); err == nil && fi.IsDir() {
+			return goja.Null()
+		}
+
+		// 読み込み。存在しないなら null、その他はエラーを投げる
+		content, err := os.ReadFile(fullPath)
 		if err != nil {
+			if os.IsNotExist(err) {
+				return goja.Null()
+			}
+			// 権限など他のエラーはJS例外に（従来の動作）
 			panic(vm.ToValue(err.Error()))
 		}
 
-		// 読み込んだ内容を文字列として返す
+		// 読み込んだ内容を文字列で返す（バイナリは Base64 を使う nyanReadFileB64 を推奨）
 		return vm.ToValue(string(content))
 	}
 }
@@ -1925,7 +1931,7 @@ func registerNyanFuncs(vm *goja.Runtime, params map[string]interface{}, accepted
 	vm.Set("nyanRunSQL", func(call goja.FunctionCall) goja.Value {
 		return nyanRunSQLHandler(vm, call)
 	})
-	vm.Set("nyanGetFile", newNyanGetFile(vm))
+	vm.Set("nyanGetFile", nyanGetFile(vm))
 	vm.Set("nyanBase64Encode", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
 			panic(vm.ToValue("nyanBase64Encode(data) : data が必要です"))

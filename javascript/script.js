@@ -10,13 +10,17 @@ function main(){
     console.log(nyanAllParams);
     let data = nyanAllParams;
     console.log(JSON.stringify(data));
-    data.ids = [2];
-    console.log(data);
     //SQLファイル取り込みの確認
-    let result = JSON.parse(nyanRunSQL("./sql/sqlite/checkToday.sql" , {}));
-    console.log(JSON.stringify(result));
+    let sqlResult = nyanRunSQL("./sql/sqlite/checkToday.sql", {});
+    console.log(typeof nyanSaveFile)
 
-    return JSON.stringify({success: true, status: 200, result: result , api: nyanAllParams.api });
+    //ファイルの保存テスト
+    const b64 = nyanBase64Encode("こんにちは！ にゃんくる");
+    nyanSaveFile(b64, "./test/test.txt");
+
+    console.log(sha256("test"));
+
+    return JSON.stringify({success: true, status: 200, result: sqlResult , api: nyanAllParams.api });
 }
 
 main();
