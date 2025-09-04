@@ -27,6 +27,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/hex"
 )
 
 type Config struct {
@@ -1474,33 +1477,39 @@ func adjustPaths(execDir string, config *Config) {
 	}
 }
 
-// newNyanGetFile は、渡された vm をクロージャーにキャプチャして nyanGetFile を返します。
-func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+// nyanGetFile
+func nyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		// 引数のチェック
 		if len(call.Arguments) < 1 {
-			// vm を使ってエラーオブジェクトを生成する
 			panic(vm.NewTypeError("nyanGetFileには1つの引数（ファイルパス）が必要です"))
 		}
 		relativePath := call.Arguments[0].String()
 
-		// 実行中のバイナリのパスを取得し、ディレクトリ部分を取得
+		// 実行中のバイナリのディレクトリからの相対パスに解決
 		exePath, err := os.Executable()
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
 		exeDir := filepath.Dir(exePath)
-
-		// バイナリディレクトリからの相対パスを結合してフルパスを作成
 		fullPath := filepath.Join(exeDir, relativePath)
 
-		// ファイルを読み込み
-		content, err := ioutil.ReadFile(fullPath)
+		// ディレクトリ指定なら null
+		if fi, err := os.Stat(fullPath); err == nil && fi.IsDir() {
+			return goja.Null()
+		}
+
+		// 読み込み。存在しないなら null、その他はエラーを投げる
+		content, err := os.ReadFile(fullPath)
 		if err != nil {
+			if os.IsNotExist(err) {
+				return goja.Null()
+			}
+			// 権限など他のエラーはJS例外に（従来の動作）
 			panic(vm.ToValue(err.Error()))
 		}
 
-		// 読み込んだ内容を文字列として返す
+		// 読み込んだ内容を文字列で返す（バイナリは Base64 を使う nyanReadFileB64 を推奨）
 		return vm.ToValue(string(content))
 	}
 }
@@ -1922,7 +1931,7 @@ func registerNyanFuncs(vm *goja.Runtime, params map[string]interface{}, accepted
 	vm.Set("nyanRunSQL", func(call goja.FunctionCall) goja.Value {
 		return nyanRunSQLHandler(vm, call)
 	})
-	vm.Set("nyanGetFile", newNyanGetFile(vm))
+	vm.Set("nyanGetFile", nyanGetFile(vm))
 	vm.Set("nyanBase64Encode", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
 			panic(vm.ToValue("nyanBase64Encode(data) : data が必要です"))
@@ -1956,4 +1965,30 @@ func registerNyanFuncs(vm *goja.Runtime, params map[string]interface{}, accepted
 		}
 		return goja.Undefined() // 成功時は undefined を返すだけ
 	})
+
+	vm.Set("sha256", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			panic(vm.ToValue("nyanSHA256(input) requires 1 argument"))
+		}
+		input := call.Argument(0).String()
+		return vm.ToValue(sha256Hash(input))
+	})
+
+	vm.Set("sha1", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			panic(vm.ToValue("nyanSHA1(input) requires 1 argument"))
+		}
+		input := call.Argument(0).String()
+		return vm.ToValue(sha1Hash(input))
+	})
+}
+
+func sha256Hash(input string) string {
+	hash := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(hash[:])
+}
+
+func sha1Hash(input string) string {
+	hash := sha1.Sum([]byte(input))
+	return hex.EncodeToString(hash[:])
 }

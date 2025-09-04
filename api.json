@@ -33,5 +33,9 @@
   "ids": {
     "sql": ["./sql/sqlite/get_by_ids.sql"],
     "description": "idsをテスト inの場合は、[1,2,3]と言った形でリクエストをしてください。"
+  },
+  "if_sample": {
+    "sql": ["./sql/sqlite/if_sample.sql"],
+    "description": "sql上のIFの処理のサンプル"
   }
 }
