@@ -19,6 +19,7 @@ function main(){
     nyanSaveFile(b64, "./test/test.txt");
 
     console.log(sha256("test"));
+    console.log(sha1("test"));
 
     return JSON.stringify({success: true, status: 200, result: sqlResult , api: nyanAllParams.api });
 }

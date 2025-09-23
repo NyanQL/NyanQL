@@ -618,68 +618,112 @@ func isSelectQuery(query string) bool {
 }
 
 func prepareQueryWithParams(query string, params map[string]interface{}) (string, []interface{}) {
-	// / * paramName * / 'xxxxx' などを捕まえる正規表現
-	re := regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
+    re := regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
 
-	var args []interface{}
-	placeholderCounter := 1
+    var args []interface{}
+    placeholderCounter := 1
 
-	replacedQuery := re.ReplaceAllStringFunc(query, func(match string) string {
-		groups := re.FindStringSubmatch(match)
-		paramName := strings.TrimSpace(groups[1])
+    replacedQuery := re.ReplaceAllStringFunc(query, func(match string) string {
+        groups := re.FindStringSubmatch(match)
+        paramName := strings.TrimSpace(groups[1])
 
-		// パラメータマップから値を取得
-		value, ok := params[paramName]
-		if !ok {
-			// 該当パラメータが無いなら nil で置き換え
-			value = nil
-		}
+        // パラメータ取得
+        value, ok := params[paramName]
+        if !ok {
+            args = append(args, nil)
+            if dbType == "postgres" {
+                place := fmt.Sprintf("$%d", placeholderCounter)
+                placeholderCounter++
+                return place
+            }
+            return "?"
+        }
 
-		rv := reflect.ValueOf(value)
-		// 値が nil (rv.IsValid() == false) もしくは単なる <nil> interface などを考慮
-		if !rv.IsValid() {
-			// とりあえず 1 個の placeholder にして args に nil を入れる
-			args = append(args, nil)
-			if dbType == "postgres" {
-				place := fmt.Sprintf("$%d", placeholderCounter)
-				placeholderCounter++
-				return place
-			}
-			return "?"
-		}
+        rv := reflect.ValueOf(value)
+        if !rv.IsValid() {
+            args = append(args, nil)
+            if dbType == "postgres" {
+                place := fmt.Sprintf("$%d", placeholderCounter)
+                placeholderCounter++
+                return place
+            }
+            return "?"
+        }
 
-		if rv.Kind() == reflect.Slice {
-			// === スライスの場合 ===
-			n := rv.Len()
-			if n == 0 {
-				return "NULL"
-			}
-			placeholders := make([]string, 0, n)
-			for i := 0; i < n; i++ {
-				args = append(args, rv.Index(i).Interface())
-				if dbType == "postgres" {
-					placeholders = append(placeholders, fmt.Sprintf("$%d", placeholderCounter))
-				} else {
-					placeholders = append(placeholders, "?")
-				}
-				placeholderCounter++
-			}
-			return strings.Join(placeholders, ",")
-		} else {
-			// 単一値の場合 year=2025 など ⇒ `?` or `$1`
-			args = append(args, value)
-			var placeholder string
-			if dbType == "postgres" {
-				placeholder = fmt.Sprintf("$%d", placeholderCounter)
-			} else {
-				placeholder = "?"
-			}
-			placeholderCounter++
-			return placeholder
-		}
-	})
-	return replacedQuery, args
+        // --- JSONB/文字列系の特別扱い ---
+        // []byte は 1つの値として扱う
+        if b, ok := value.([]byte); ok {
+            args = append(args, string(b))
+            place := "?"
+            if dbType == "postgres" {
+                place = fmt.Sprintf("$%d", placeholderCounter)
+            }
+            placeholderCounter++
+            return place
+        }
+
+        // json.RawMessage も 1つの値として扱う
+        if jm, ok := value.(json.RawMessage); ok {
+            args = append(args, string(jm))
+            place := "?"
+            if dbType == "postgres" {
+                place = fmt.Sprintf("$%d", placeholderCounter)
+            }
+            placeholderCounter++
+            return place
+        }
+
+        // map や struct は JSON に変換して 1値として扱う
+        kind := rv.Kind()
+        if kind == reflect.Map || kind == reflect.Struct {
+            jb, err := json.Marshal(value)
+            if err != nil {
+                args = append(args, value)
+            } else {
+                args = append(args, string(jb))
+            }
+            place := "?"
+            if dbType == "postgres" {
+                place = fmt.Sprintf("$%d", placeholderCounter)
+            }
+            placeholderCounter++
+            return place
+        }
+
+        // --- 通常のスライスは IN (...) 展開 ---
+        if kind == reflect.Slice {
+            n := rv.Len()
+            if n == 0 {
+                return "NULL"
+            }
+            placeholders := make([]string, 0, n)
+            for i := 0; i < n; i++ {
+                args = append(args, rv.Index(i).Interface())
+                var p string
+                if dbType == "postgres" {
+                    p = fmt.Sprintf("$%d", placeholderCounter)
+                } else {
+                    p = "?"
+                }
+                placeholders = append(placeholders, p)
+                placeholderCounter++
+            }
+            return strings.Join(placeholders, ",")
+        }
+
+        // --- 通常の単一値 ---
+        args = append(args, value)
+        place := "?"
+        if dbType == "postgres" {
+            place = fmt.Sprintf("$%d", placeholderCounter)
+        }
+        placeholderCounter++
+        return place
+    })
+
+    return replacedQuery, args
 }
+
 
 func RowsToJSON(rows *sql.Rows) ([]byte, error) {
 	columns, err := rows.Columns()
