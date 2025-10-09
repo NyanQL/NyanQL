@@ -760,9 +760,11 @@ func RowsToJSON(rows *sql.Rows) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	var results []map[string]interface{}
 	values := make([]interface{}, len(columns))
 	valuePtrs := make([]interface{}, len(columns))
+
 	for rows.Next() {
 		for i := range columns {
 			valuePtrs[i] = &values[i]
@@ -770,21 +772,34 @@ func RowsToJSON(rows *sql.Rows) ([]byte, error) {
 		if err := rows.Scan(valuePtrs...); err != nil {
 			return nil, err
 		}
+
 		entry := make(map[string]interface{})
 		for i, col := range columns {
-			var v interface{}
 			val := values[i]
-			if b, ok := val.([]byte); ok {
-				v = string(b)
-			} else {
-				v = val
+
+			switch v := val.(type) {
+			case []byte:
+				// JSON っぽいならパースを試みる（先頭が { または [ または "n"=null）
+				s := string(v)
+				if len(s) > 0 && (s[0] == '{' || s[0] == '[' || s == "null") {
+					var any interface{}
+					if err := json.Unmarshal(v, &any); err == nil {
+						entry[col] = any
+						continue
+					}
+				}
+				// それ以外は文字列として扱う
+				entry[col] = s
+			default:
+				entry[col] = v
 			}
-			entry[col] = v
 		}
 		results = append(results, entry)
 	}
+
 	return json.Marshal(results)
 }
+
 
 func basicAuth(next http.HandlerFunc, config Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
