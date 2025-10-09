@@ -614,81 +614,157 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func isSelectQuery(query string) bool {
-	return strings.HasPrefix(strings.TrimSpace(strings.ToUpper(query)), "SELECT")
+	u := strings.TrimSpace(strings.ToUpper(query))
+	if strings.HasPrefix(u, "SELECT") {
+		return true
+	}
+	// CTE で始まる場合は SELECT かどうかをざっくり判定
+	if strings.HasPrefix(u, "WITH") {
+		// 最初の文の中に SELECT が含まれていれば結果セットを返す想定
+		// （単純化: INSERT/UPDATE/DELETE の CTE を誤判定したくなければ、より厳密にパースする）
+		// まずセミコロンまでを見る（無ければ全文）
+		semi := strings.Index(u, ";")
+		head := u
+		if semi >= 0 {
+			head = u[:semi]
+		}
+		// 代表的なデータ修正文より SELECT が先に現れるなら SELECT とみなす
+		sel := strings.Index(head, "SELECT")
+		ins := strings.Index(head, "INSERT")
+		upd := strings.Index(head, "UPDATE")
+		del := strings.Index(head, "DELETE")
+
+		// SELECT が存在し、かつ INSERT/UPDATE/DELETE より前に出る場合を SELECT とみなす
+		firstMut := -1
+		for _, i := range []int{ins, upd, del} {
+			if i >= 0 && (firstMut == -1 || i < firstMut) {
+				firstMut = i
+			}
+		}
+		return sel >= 0 && (firstMut == -1 || sel < firstMut)
+	}
+	return false
 }
+
 
 func prepareQueryWithParams(query string, params map[string]interface{}) (string, []interface{}) {
-	// / * paramName * / 'xxxxx' などを捕まえる正規表現
-	re := regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
+    re := regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
 
-	var args []interface{}
-	placeholderCounter := 1
+    var args []interface{}
+    placeholderCounter := 1
 
-	replacedQuery := re.ReplaceAllStringFunc(query, func(match string) string {
-		groups := re.FindStringSubmatch(match)
-		paramName := strings.TrimSpace(groups[1])
+    replacedQuery := re.ReplaceAllStringFunc(query, func(match string) string {
+        groups := re.FindStringSubmatch(match)
+        paramName := strings.TrimSpace(groups[1])
 
-		// パラメータマップから値を取得
-		value, ok := params[paramName]
-		if !ok {
-			// 該当パラメータが無いなら nil で置き換え
-			value = nil
-		}
+        // パラメータ取得
+        value, ok := params[paramName]
+        if !ok {
+            args = append(args, nil)
+            if dbType == "postgres" {
+                place := fmt.Sprintf("$%d", placeholderCounter)
+                placeholderCounter++
+                return place
+            }
+            return "?"
+        }
 
-		rv := reflect.ValueOf(value)
-		// 値が nil (rv.IsValid() == false) もしくは単なる <nil> interface などを考慮
-		if !rv.IsValid() {
-			// とりあえず 1 個の placeholder にして args に nil を入れる
-			args = append(args, nil)
-			if dbType == "postgres" {
-				place := fmt.Sprintf("$%d", placeholderCounter)
-				placeholderCounter++
-				return place
-			}
-			return "?"
-		}
+        rv := reflect.ValueOf(value)
+        if !rv.IsValid() {
+            args = append(args, nil)
+            if dbType == "postgres" {
+                place := fmt.Sprintf("$%d", placeholderCounter)
+                placeholderCounter++
+                return place
+            }
+            return "?"
+        }
 
-		if rv.Kind() == reflect.Slice {
-			// === スライスの場合 ===
-			n := rv.Len()
-			if n == 0 {
-				return "NULL"
-			}
-			placeholders := make([]string, 0, n)
-			for i := 0; i < n; i++ {
-				args = append(args, rv.Index(i).Interface())
-				if dbType == "postgres" {
-					placeholders = append(placeholders, fmt.Sprintf("$%d", placeholderCounter))
-				} else {
-					placeholders = append(placeholders, "?")
-				}
-				placeholderCounter++
-			}
-			return strings.Join(placeholders, ",")
-		} else {
-			// 単一値の場合 year=2025 など ⇒ `?` or `$1`
-			args = append(args, value)
-			var placeholder string
-			if dbType == "postgres" {
-				placeholder = fmt.Sprintf("$%d", placeholderCounter)
-			} else {
-				placeholder = "?"
-			}
-			placeholderCounter++
-			return placeholder
-		}
-	})
-	return replacedQuery, args
+        // --- JSONB/文字列系の特別扱い ---
+        // []byte は 1つの値として扱う
+        if b, ok := value.([]byte); ok {
+            args = append(args, string(b))
+            place := "?"
+            if dbType == "postgres" {
+                place = fmt.Sprintf("$%d", placeholderCounter)
+            }
+            placeholderCounter++
+            return place
+        }
+
+        // json.RawMessage も 1つの値として扱う
+        if jm, ok := value.(json.RawMessage); ok {
+            args = append(args, string(jm))
+            place := "?"
+            if dbType == "postgres" {
+                place = fmt.Sprintf("$%d", placeholderCounter)
+            }
+            placeholderCounter++
+            return place
+        }
+
+        // map や struct は JSON に変換して 1値として扱う
+        kind := rv.Kind()
+        if kind == reflect.Map || kind == reflect.Struct {
+            jb, err := json.Marshal(value)
+            if err != nil {
+                args = append(args, value)
+            } else {
+                args = append(args, string(jb))
+            }
+            place := "?"
+            if dbType == "postgres" {
+                place = fmt.Sprintf("$%d", placeholderCounter)
+            }
+            placeholderCounter++
+            return place
+        }
+
+        // --- 通常のスライスは IN (...) 展開 ---
+        if kind == reflect.Slice {
+            n := rv.Len()
+            if n == 0 {
+                return "NULL"
+            }
+            placeholders := make([]string, 0, n)
+            for i := 0; i < n; i++ {
+                args = append(args, rv.Index(i).Interface())
+                var p string
+                if dbType == "postgres" {
+                    p = fmt.Sprintf("$%d", placeholderCounter)
+                } else {
+                    p = "?"
+                }
+                placeholders = append(placeholders, p)
+                placeholderCounter++
+            }
+            return strings.Join(placeholders, ",")
+        }
+
+        // --- 通常の単一値 ---
+        args = append(args, value)
+        place := "?"
+        if dbType == "postgres" {
+            place = fmt.Sprintf("$%d", placeholderCounter)
+        }
+        placeholderCounter++
+        return place
+    })
+
+    return replacedQuery, args
 }
+
 
 func RowsToJSON(rows *sql.Rows) ([]byte, error) {
 	columns, err := rows.Columns()
 	if err != nil {
 		return nil, err
 	}
+
 	var results []map[string]interface{}
 	values := make([]interface{}, len(columns))
 	valuePtrs := make([]interface{}, len(columns))
+
 	for rows.Next() {
 		for i := range columns {
 			valuePtrs[i] = &values[i]
@@ -696,21 +772,34 @@ func RowsToJSON(rows *sql.Rows) ([]byte, error) {
 		if err := rows.Scan(valuePtrs...); err != nil {
 			return nil, err
 		}
+
 		entry := make(map[string]interface{})
 		for i, col := range columns {
-			var v interface{}
 			val := values[i]
-			if b, ok := val.([]byte); ok {
-				v = string(b)
-			} else {
-				v = val
+
+			switch v := val.(type) {
+			case []byte:
+				// JSON っぽいならパースを試みる（先頭が { または [ または "n"=null）
+				s := string(v)
+				if len(s) > 0 && (s[0] == '{' || s[0] == '[' || s == "null") {
+					var any interface{}
+					if err := json.Unmarshal(v, &any); err == nil {
+						entry[col] = any
+						continue
+					}
+				}
+				// それ以外は文字列として扱う
+				entry[col] = s
+			default:
+				entry[col] = v
 			}
-			entry[col] = v
 		}
 		results = append(results, entry)
 	}
+
 	return json.Marshal(results)
 }
+
 
 func basicAuth(next http.HandlerFunc, config Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
