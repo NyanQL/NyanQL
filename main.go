@@ -614,8 +614,38 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func isSelectQuery(query string) bool {
-	return strings.HasPrefix(strings.TrimSpace(strings.ToUpper(query)), "SELECT")
+	u := strings.TrimSpace(strings.ToUpper(query))
+	if strings.HasPrefix(u, "SELECT") {
+		return true
+	}
+	// CTE で始まる場合は SELECT かどうかをざっくり判定
+	if strings.HasPrefix(u, "WITH") {
+		// 最初の文の中に SELECT が含まれていれば結果セットを返す想定
+		// （単純化: INSERT/UPDATE/DELETE の CTE を誤判定したくなければ、より厳密にパースする）
+		// まずセミコロンまでを見る（無ければ全文）
+		semi := strings.Index(u, ";")
+		head := u
+		if semi >= 0 {
+			head = u[:semi]
+		}
+		// 代表的なデータ修正文より SELECT が先に現れるなら SELECT とみなす
+		sel := strings.Index(head, "SELECT")
+		ins := strings.Index(head, "INSERT")
+		upd := strings.Index(head, "UPDATE")
+		del := strings.Index(head, "DELETE")
+
+		// SELECT が存在し、かつ INSERT/UPDATE/DELETE より前に出る場合を SELECT とみなす
+		firstMut := -1
+		for _, i := range []int{ins, upd, del} {
+			if i >= 0 && (firstMut == -1 || i < firstMut) {
+				firstMut = i
+			}
+		}
+		return sel >= 0 && (firstMut == -1 || sel < firstMut)
+	}
+	return false
 }
+
 
 func prepareQueryWithParams(query string, params map[string]interface{}) (string, []interface{}) {
     re := regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
