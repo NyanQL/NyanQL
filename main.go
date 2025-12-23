@@ -1277,7 +1277,7 @@ func getAcceptedParamsKeys(sqlPaths []string) ([]string, error) {
 
 // runScript は、指定された JavaScript ファイル群を結合して実行します。
 // この関数の先頭で DB トランザクションを開始し、グローバル変数 "nyanTx" として VM に渡します。
-// スクリプト内で複数の nyanRunSQLHandler 呼び出しがあった場合、すべて同一トランザクション下で実行されます。
+// スクリプト内で複数の nyanRunSQL 呼び出しがあった場合、すべて同一トランザクション下で実行されます。
 // スクリプトの実行が成功すればコミット、エラーがあればロールバックします。
 func runScript(scriptPaths []string, params map[string]interface{}) (string, error) {
 	// トランザクション開始
@@ -1285,16 +1285,20 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 	if err != nil {
 		return "", fmt.Errorf("failed to begin transaction: %v", err)
 	}
-	// コミット済みかどうかのフラグ（defer で rollback するため）
+
 	committed := false
 	defer func() {
+		// committed=false のままなら rollback（成功時や commit 後は rollback しない）
 		if !committed {
-			tx.Rollback()
+			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+				log.Printf("transaction rollback error: %v", rbErr)
+			}
 		}
 	}()
 
 	// javascript_include に指定されたファイルと scriptPaths の内容を結合
 	var combinedScript strings.Builder
+
 	for _, includePath := range config.JavascriptInclude {
 		content, err := ioutil.ReadFile(includePath)
 		if err != nil {
@@ -1314,22 +1318,30 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 
 	// JavaScript VM の生成
 	vm := goja.New()
+
+	// 既存の関数群を登録
 	registerNyanFuncs(vm, params, nil)
+
+	// ★重要：トランザクションを VM に渡す（nyanRunSQLHandler がこれを拾って tx で実行する）
+	vm.Set("nyanTx", tx)
 
 	// スクリプト実行
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
+		// committed は false のままなので defer rollback が動く
 		return "", fmt.Errorf("script execution error: %v", err)
 	}
 
 	// トランザクションコミット
 	if err := tx.Commit(); err != nil {
+		// committed は false のままなので defer rollback が動く（ErrTxDone 以外はログ）
 		return "", fmt.Errorf("failed to commit transaction: %v", err)
 	}
-	committed = true
 
+	committed = true
 	return value.String(), nil
 }
+
 
 // evaluateCondition は、条件文字列（例："id != null OR date != null" や "id != null AND date != null"）を解析して評価します。
 // まず "OR" で分割し、各部分についてさらに "AND" で分割、すべてが成立すればそのOR部分は成立とみなし、
