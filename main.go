@@ -1665,8 +1665,24 @@ func processCommentConditionals(block string, params map[string]interface{}) str
 
 // 余分な空白文字（改行、タブ、連続するスペース）を1つのスペースに正規化する関数
 func normalizeSQL(sqlText string) string {
+	// 行コメントを削除してから空白を正規化する
+	lines := strings.Split(sqlText, "\n")
+	for i, line := range lines {
+		inSingleQuote := false
+		for j := 0; j+1 < len(line); j++ {
+			if line[j] == '\'' {
+				inSingleQuote = !inSingleQuote
+				continue
+			}
+			if !inSingleQuote && line[j] == '-' && line[j+1] == '-' {
+				lines[i] = line[:j]
+				break
+			}
+		}
+	}
+	withoutLineComments := strings.Join(lines, "\n")
 	// \s+ は空白文字（スペース、タブ、改行など）の連続にマッチする
-	return regexp.MustCompile(`\s+`).ReplaceAllString(sqlText, " ")
+	return regexp.MustCompile(`\s+`).ReplaceAllString(withoutLineComments, " ")
 }
 
 func executeAPIConfig(apiConfig APIConfig) ([]byte, error) {
