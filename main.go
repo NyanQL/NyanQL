@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -27,9 +30,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"crypto/sha1"
-	"crypto/sha256"
-	"encoding/hex"
 )
 
 type Config struct {
@@ -73,6 +73,8 @@ type APIConfig struct {
 	Check       string   `json:"check,omitempty"`
 	Push        string   `json:"push,omitempty"`
 	Description string   `json:"description"`
+	Type        string   `json:"type,omitempty"`
+	ConnectURL  string   `json:"connectURL,omitempty"`
 }
 
 type Hub struct {
@@ -140,6 +142,11 @@ var config Config
 var db *sql.DB
 var sqlFiles map[string]APIConfig
 var dbType string
+var buildVersion = "v0.0.16"
+const (
+	apiTypeAPI      = "api"
+	apiTypeWSClient = "ws_client"
+)
 
 // reParams は、/*id*/ のようなプレースホルダーを抽出する正規表現
 var reParams = regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
@@ -170,14 +177,18 @@ func main() {
 		log.Fatalf("Failed to decode config JSON: %v", err)
 	}
 	adjustPaths(execDir, &config)
-	log.Printf("Starting application version: %s", config.Version)
 	setupLogger(execDir)
+	log.Printf("Binary version: %s", buildVersion)
+	log.Printf("Config version: %s", config.Version)
 
 	db, err = connectDB(config)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	loadSQLFiles(execDir)
+	if err := startWebSocketClients(execDir); err != nil {
+		log.Printf("Failed to start WebSocket clients: %v", err)
+	}
 
 	corsHandler := cors.New(cors.Options{
 		AllowedOrigins: []string{"*"},
@@ -301,6 +312,191 @@ func loadSQLFiles(execDir string) {
 				sqlFiles[apiKey].SQL[i] = filepath.Join(execDir, sqlPath)
 			}
 		}
+	}
+}
+
+func getAPIType(apiConfig APIConfig) string {
+	t := strings.TrimSpace(apiConfig.Type)
+	if t == "" {
+		return apiTypeAPI
+	}
+	return t
+}
+
+// connectURL が env:XXXX 形式なら環境変数 XXXX で解決する。空や未設定はエラー。
+func resolveConnectURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("connectURL is empty")
+	}
+	if strings.HasPrefix(raw, "env:") {
+		key := strings.TrimPrefix(raw, "env:")
+		if key == "" {
+			return "", fmt.Errorf("connectURL env: prefix is empty")
+		}
+		val := os.Getenv(key)
+		if val == "" {
+			return "", fmt.Errorf("environment variable %s is empty", key)
+		}
+		return val, nil
+	}
+	return raw, nil
+}
+
+type wsClientConfig struct {
+	name        string
+	scriptPath  string
+	connectURL  string
+	description string
+}
+
+// startWebSocketClients は api.json に定義された ws_client を起動する。
+func startWebSocketClients(execDir string) error {
+	var firstErr error
+	for name, apiConfig := range sqlFiles {
+		if getAPIType(apiConfig) != apiTypeWSClient {
+			continue
+		}
+
+		scriptPath := strings.TrimSpace(apiConfig.Script)
+		connectURLRaw := strings.TrimSpace(apiConfig.ConnectURL)
+
+		if scriptPath == "" {
+			err := fmt.Errorf("ws_client %s: script is missing", name)
+			log.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if connectURLRaw == "" {
+			err := fmt.Errorf("ws_client %s: connectURL is missing", name)
+			log.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		connectURL, err := resolveConnectURL(connectURLRaw)
+		if err != nil {
+			log.Printf("ws_client %s: %v", name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		scriptAbs := scriptPath
+		if !filepath.IsAbs(scriptPath) {
+			scriptAbs = filepath.Join(execDir, scriptPath)
+		}
+
+		cfg := wsClientConfig{
+			name:        name,
+			scriptPath:  scriptAbs,
+			connectURL:  connectURL,
+			description: apiConfig.Description,
+		}
+
+		log.Printf("Starting WebSocket client %s -> %s", cfg.name, cfg.connectURL)
+		go runWebSocketClient(cfg)
+	}
+
+	return firstErr
+}
+
+// 常時接続を維持し、切断時は指数バックオフで再接続する。
+func runWebSocketClient(cfg wsClientConfig) {
+	backoff := time.Second
+	for {
+		err := connectAndListenWebSocket(cfg)
+		if err != nil {
+			log.Printf("WebSocket client %s disconnected: %v", cfg.name, err)
+		}
+
+		time.Sleep(backoff)
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+func connectAndListenWebSocket(cfg wsClientConfig) error {
+	conn, _, err := websocket.DefaultDialer.Dial(cfg.connectURL, nil)
+	if err != nil {
+		return fmt.Errorf("dial failed: %w", err)
+	}
+	defer conn.Close()
+
+	log.Printf("WebSocket client %s connected", cfg.name)
+
+	for {
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("read error: %w", err)
+		}
+
+		if msgType == websocket.CloseMessage {
+			return fmt.Errorf("close message received: %s", string(data))
+		}
+
+		log.Printf("ws_client %s received %s: %s", cfg.name, websocketMessageTypeLabel(msgType), string(data))
+
+		allParams := map[string]interface{}{
+			"api":             cfg.name,
+			"ws_client":       cfg.name,
+			"ws_message_type": websocketMessageTypeLabel(msgType),
+			"ws_message_text": string(data),
+			"ws_connect_url":  cfg.connectURL,
+			"ws_description":  cfg.description,
+		}
+
+		if msgType == websocket.BinaryMessage {
+			allParams["ws_message_base64"] = base64.StdEncoding.EncodeToString(data)
+		}
+
+		if msgType == websocket.TextMessage {
+			var decoded interface{}
+			if err := json.Unmarshal(data, &decoded); err == nil {
+				allParams["ws_message_json"] = decoded
+			}
+		}
+
+		result, err := runScript([]string{cfg.scriptPath}, allParams)
+		if err != nil {
+			log.Printf("ws_client %s script error: %v", cfg.name, err)
+			continue
+		}
+
+		trimmed := strings.TrimSpace(result)
+		if trimmed == "" {
+			continue
+		}
+
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(trimmed)); err != nil {
+			return fmt.Errorf("send error: %w", err)
+		}
+	}
+}
+
+func websocketMessageTypeLabel(t int) string {
+	switch t {
+	case websocket.TextMessage:
+		return "text"
+	case websocket.BinaryMessage:
+		return "binary"
+	case websocket.CloseMessage:
+		return "close"
+	case websocket.PingMessage:
+		return "ping"
+	case websocket.PongMessage:
+		return "pong"
+	default:
+		return fmt.Sprintf("unknown(%d)", t)
 	}
 }
 
@@ -453,6 +649,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		sendJSONError(w, "SQL files not found", http.StatusNotFound)
 		return
 	}
+	if getAPIType(apiConfig) != apiTypeAPI {
+		sendJSONError(w, fmt.Sprintf("API %s is not an HTTP/WebSocket endpoint", apiKey), http.StatusBadRequest)
+		return
+	}
 	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
 	if err != nil {
 		log.Printf("Failed to get accepted params keys: %v", err)
@@ -463,8 +663,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		sendJSONError(w, "No check script for this API", http.StatusNotFound)
 		return
 	}
-	if apiConfig.Check != "" {
-		success, statusCode, errorObj, jsonStr, err := runCheckScript(apiConfig.Check, params, acceptedKeys)
+		if apiConfig.Check != "" {
+			success, statusCode, errorObj, jsonStr, err := runCheckScript(apiConfig.Check, params, acceptedKeys)
 		if err != nil {
 			log.Printf("Check script error: %v", err)
 			sendJSONError(w, err.Error(), statusCode)
@@ -485,24 +685,27 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if nyanMode == "checkOnly" {
+			performPush(apiConfig, params)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
 			w.Write([]byte(jsonStr))
 			return
 		}
-		if apiConfig.Script != "" {
-			scriptResult, err := runScript([]string{apiConfig.Script}, params)
-			if err != nil {
-				log.Printf("Script execution error: %v", err)
-				sendJSONError(w, err.Error(), http.StatusInternalServerError)
+			if apiConfig.Script != "" {
+				scriptResult, err := runScript([]string{apiConfig.Script}, params)
+				if err != nil {
+					log.Printf("Script execution error: %v", err)
+					sendJSONError(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				performPush(apiConfig, params)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(scriptResult))
 				return
 			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(scriptResult))
-			return
-		}
 		if len(apiConfig.SQL) == 0 && apiConfig.Script == "" {
+			performPush(apiConfig, params)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
 			w.Write([]byte(jsonStr))
@@ -822,6 +1025,9 @@ func handleNyan(w http.ResponseWriter, r *http.Request) {
 	// sqlFiles は map[string]APIConfig になっているので、必要な情報のみ抽出します。
 	filteredApis := make(map[string]APIDetails)
 	for key, apiConf := range sqlFiles {
+		if getAPIType(apiConf) != apiTypeAPI {
+			continue
+		}
 		filteredApis[key] = APIDetails{
 			Description: apiConf.Description,
 		}
@@ -863,6 +1069,10 @@ func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	apiConfig, exists := sqlFiles[apiName]
 	if !exists {
+		sendJSONError(w, "API not found", http.StatusNotFound)
+		return
+	}
+	if getAPIType(apiConfig) != apiTypeAPI {
 		sendJSONError(w, "API not found", http.StatusNotFound)
 		return
 	}
@@ -1277,7 +1487,7 @@ func getAcceptedParamsKeys(sqlPaths []string) ([]string, error) {
 
 // runScript は、指定された JavaScript ファイル群を結合して実行します。
 // この関数の先頭で DB トランザクションを開始し、グローバル変数 "nyanTx" として VM に渡します。
-// スクリプト内で複数の nyanRunSQLHandler 呼び出しがあった場合、すべて同一トランザクション下で実行されます。
+// スクリプト内で複数の nyanRunSQL 呼び出しがあった場合、すべて同一トランザクション下で実行されます。
 // スクリプトの実行が成功すればコミット、エラーがあればロールバックします。
 func runScript(scriptPaths []string, params map[string]interface{}) (string, error) {
 	// トランザクション開始
@@ -1285,16 +1495,20 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 	if err != nil {
 		return "", fmt.Errorf("failed to begin transaction: %v", err)
 	}
-	// コミット済みかどうかのフラグ（defer で rollback するため）
+
 	committed := false
 	defer func() {
+		// committed=false のままなら rollback（成功時や commit 後は rollback しない）
 		if !committed {
-			tx.Rollback()
+			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
+				log.Printf("transaction rollback error: %v", rbErr)
+			}
 		}
 	}()
 
 	// javascript_include に指定されたファイルと scriptPaths の内容を結合
 	var combinedScript strings.Builder
+
 	for _, includePath := range config.JavascriptInclude {
 		content, err := ioutil.ReadFile(includePath)
 		if err != nil {
@@ -1314,22 +1528,30 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 
 	// JavaScript VM の生成
 	vm := goja.New()
+
+	// 既存の関数群を登録
 	registerNyanFuncs(vm, params, nil)
+
+	// ★重要：トランザクションを VM に渡す（nyanRunSQLHandler がこれを拾って tx で実行する）
+	vm.Set("nyanTx", tx)
 
 	// スクリプト実行
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
+		// committed は false のままなので defer rollback が動く
 		return "", fmt.Errorf("script execution error: %v", err)
 	}
 
 	// トランザクションコミット
 	if err := tx.Commit(); err != nil {
+		// committed は false のままなので defer rollback が動く（ErrTxDone 以外はログ）
 		return "", fmt.Errorf("failed to commit transaction: %v", err)
 	}
-	committed = true
 
+	committed = true
 	return value.String(), nil
 }
+
 
 // evaluateCondition は、条件文字列（例："id != null OR date != null" や "id != null AND date != null"）を解析して評価します。
 // まず "OR" で分割し、各部分についてさらに "AND" で分割、すべてが成立すればそのOR部分は成立とみなし、
@@ -1443,8 +1665,24 @@ func processCommentConditionals(block string, params map[string]interface{}) str
 
 // 余分な空白文字（改行、タブ、連続するスペース）を1つのスペースに正規化する関数
 func normalizeSQL(sqlText string) string {
+	// 行コメントを削除してから空白を正規化する
+	lines := strings.Split(sqlText, "\n")
+	for i, line := range lines {
+		inSingleQuote := false
+		for j := 0; j+1 < len(line); j++ {
+			if line[j] == '\'' {
+				inSingleQuote = !inSingleQuote
+				continue
+			}
+			if !inSingleQuote && line[j] == '-' && line[j+1] == '-' {
+				lines[i] = line[:j]
+				break
+			}
+		}
+	}
+	withoutLineComments := strings.Join(lines, "\n")
 	// \s+ は空白文字（スペース、タブ、改行など）の連続にマッチする
-	return regexp.MustCompile(`\s+`).ReplaceAllString(sqlText, " ")
+	return regexp.MustCompile(`\s+`).ReplaceAllString(withoutLineComments, " ")
 }
 
 func executeAPIConfig(apiConfig APIConfig) ([]byte, error) {
@@ -1713,6 +1951,10 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 	fmt.Print(apiConfig);
 	if !exists {
 		respondJSONRPCError(w, rpcReq.ID, -32601, "SQL files not found", nil)
+		return
+	}
+	if getAPIType(apiConfig) != apiTypeAPI {
+		respondJSONRPCError(w, rpcReq.ID, -32601, "Method not found", nil)
 		return
 	}
 

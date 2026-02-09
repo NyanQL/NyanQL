@@ -34,7 +34,8 @@ NyanQL には以下の機能があります：
 8. [レスポンス形式](#レスポンス形式)
 9. [アクセス方法](#アクセス方法)
 10. [JSON-RPC サポート](#json-rpc-サポート)
-11. [予約語](#予約語)
+11. [トランザクション](#トランザクション)
+12. [予約語](#予約語)
 
 ---
 
@@ -57,9 +58,9 @@ NyanQL には以下の機能があります：
 
 ---
 
-## 設定ファイル {#設定ファイル}
+## 設定ファイル
 
-### config.json {#configjson}
+### config.json
 
 NyanQL サーバの全体設定を記述します。
 
@@ -120,7 +121,7 @@ NyanQL サーバの全体設定を記述します。
 
 ---
 
-### api.json {#apijson}
+### api.json
 
 各 API エンドポイントごとに実行する SQL/スクリプトを定義します。
 
@@ -143,11 +144,65 @@ NyanQL サーバの全体設定を記述します。
 }
 ```
 
+#### type と WebSocket クライアント（ws_client）
+
+- `type` を省略した場合は従来通り HTTP/WS サーバーの API (`"type": "api"`) として動作します。
+- `type: "ws_client"` を指定すると NyanQL 自身が WebSocket クライアントになり、起動時に常時接続します。
+- `connectURL` が `env:XXXX` の場合、環境変数 `XXXX` で接続 URL を解決します。
+
+```json
+"websocket_clients_local": {
+  "type": "ws_client",
+  "script": "./javascript/ws/receiver_main.js",
+  "connectURL": "ws://localhost:8890/hello",
+  "description": "ローカル動作確認用（自身の /hello に接続）"
+}
+```
+
+受信したメッセージは `script` で指定した JavaScript に `nyanAllParams` として渡され、戻り値がそのまま上流の WebSocket へ送信されます（空文字を返すと返信しません）。
+
 ---
 
-## SQL テンプレート構文 {#sql-テンプレート構文}
+## トランザクション
 
-### パラメータ置換 {#パラメータ置換}
+NyanQL は、1つの API 呼び出しの中で複数の SQL を実行する場合、**それらを1つのトランザクションとしてまとめて実行**します。  
+これにより、途中でエラーが発生した場合は **それまでの変更がすべてロールバック**され、データの整合性を保てます。
+
+注:
+- 1SQL でも「必ずトランザクションにしたい」場合は、`script` を使うか、SQL を分割して複数指定してください。
+- `check` はトランザクション開始前に実行されます。`check` が失敗した場合、SQL / script は実行されません。
+- 「失敗」とは、`nyanRunSQL()` の実行エラー、またはスクリプト実行時の例外（panic）など、Go 側でエラーとして扱われる状態を指します。
+
+### SQL 配列（api.json の `sql`）のトランザクション
+
+`api.json` の `sql` が **2ファイル以上**指定されている場合、NyanQL は実行開始時に DB トランザクションを開始します。
+
+- **開始**: API 実行の先頭で `BEGIN`
+- **実行**: 配列に並んだ SQL を上から順に同一トランザクション内で実行
+- **成功**: 全て成功したら `COMMIT`
+- **失敗**: Go 側でエラーとして扱われた場合は `ROLLBACK`（以降の SQL は実行されません）
+
+※ `sql` が **1ファイルのみ**の場合は、通常はトランザクションを開始しません（DB の自動コミット動作になります）。
+
+### script（JavaScript）実行時のトランザクション
+
+`api.json` で `script` が指定されている場合、NyanQL はスクリプト実行の先頭でトランザクションを開始し、  
+VM に `nyanTx` として渡します。スクリプト内で `nyanRunSQL()` を複数回呼んでも **同一トランザクション内**で実行されます。
+
+- **開始**: `script` 実行開始時に `BEGIN`
+- **実行**: `nyanRunSQL()` は `nyanTx` を使って Query/Exec
+- **成功**: スクリプトが最後まで成功したら `COMMIT`
+- **失敗**: Go 側でエラーとして扱われた場合は `ROLLBACK`
+
+### JSON-RPC のトランザクション
+
+JSON-RPC（`/nyan-rpc`）でも HTTP と同様に、`sql` が複数指定されている場合はトランザクションでまとめて実行されます。
+
+---
+
+## SQL テンプレート構文
+
+### パラメータ置換 
 
 ```sql
 SELECT count(id) AS this_days_count
@@ -157,7 +212,7 @@ WHERE date = /*date*/'2025-02-15';
 
 リクエスト `?date=2024-02-15` で動的に置換されます。
 
-### 条件分岐ブロック {#条件分岐ブロック}
+### 条件分岐ブロック
 
 ```sql
 SELECT id, date FROM stamps
@@ -172,7 +227,7 @@ SELECT id, date FROM stamps
 
 ---
 
-## JavaScript Script / Check {#javascript-script--check}
+## JavaScript Script / Check
 
 - **check**: 入力検証用の JS。失敗時に `{ success:false, status:400, error:{ message: ... }}` を返す。
 - **script**: 自由に JSON を生成。`nyanRunSQL` や `nyanAllParams` が利用可能。
@@ -180,7 +235,7 @@ SELECT id, date FROM stamps
 
 ---
 
-## ファイル操作ユーティリティ {#ファイル操作ユーティリティ}
+## ファイル操作ユーティリティ
 
 ### `nyanBase64Encode(data: string): string`
 文字列を Base64 エンコードして返します。
@@ -199,7 +254,7 @@ nyanSaveFile(b64, "./storage/hello.txt");
 
 ---
 
-## サーバ情報取得エンドポイント {#サーバ情報取得エンドポイント}
+## サーバ情報取得エンドポイント
 
 ### `GET /nyan`
 サーバの基本情報と利用可能な API 一覧を取得します。
@@ -232,7 +287,7 @@ nyanSaveFile(b64, "./storage/hello.txt");
 
 ---
 
-## レスポンス形式 {#レスポンス形式}
+## レスポンス形式
 
 ### 成功時
 
@@ -256,7 +311,7 @@ nyanSaveFile(b64, "./storage/hello.txt");
 
 ---
 
-## アクセス方法 {#アクセス方法}
+## アクセス方法
 
 - HTTP: `http://localhost:{Port}/?api=API名`
 - HTTPS: `https://localhost:{Port}/?api=API名`
@@ -264,14 +319,13 @@ nyanSaveFile(b64, "./storage/hello.txt");
 
 ---
 
-## JSON-RPC サポート {#json-rpc-サポート}
+## JSON-RPC サポート
 
 - エンドポイント: `/nyan-rpc`
 - JSON-RPC 2.0 準拠(batchは未実装)
 
 ---
 
-## 予約語 {#予約語}
+## 予約語
 
 `api`、`nyan` から始まる名前は予約語です。パラメータに使用しないでください。
-

@@ -24,7 +24,7 @@ jobs:
         run: choco install zip -y
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v6
         with:
           go-version: '1.24'
 
@@ -39,7 +39,7 @@ jobs:
             binary_name="${binary_name}.exe"
           fi
 
-          go build -o "${binary_name}" main.go
+          go build -ldflags "-X main.buildVersion=${{ github.ref_name }}" -o "${binary_name}" main.go
 
           mkdir release_package
           cp "${binary_name}" release_package/
