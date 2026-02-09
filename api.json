@@ -37,5 +37,11 @@
   "if_sample": {
     "sql": ["./sql/sqlite/if_sample.sql"],
     "description": "sql上のIFの処理のサンプル"
+  },
+  "websocket_clients_local": {
+    "type": "ws_client",
+    "script": "./javascript/ws/receiver_main.js",
+    "connectURL": "ws://localhost:8890/hello",
+    "description": "ローカル動作確認用（自身の /hello に接続）"
   }
 }

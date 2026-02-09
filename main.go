@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -27,9 +30,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"crypto/sha1"
-	"crypto/sha256"
-	"encoding/hex"
 )
 
 type Config struct {
@@ -73,6 +73,8 @@ type APIConfig struct {
 	Check       string   `json:"check,omitempty"`
 	Push        string   `json:"push,omitempty"`
 	Description string   `json:"description"`
+	Type        string   `json:"type,omitempty"`
+	ConnectURL  string   `json:"connectURL,omitempty"`
 }
 
 type Hub struct {
@@ -140,7 +142,11 @@ var config Config
 var db *sql.DB
 var sqlFiles map[string]APIConfig
 var dbType string
-var buildVersion = "v1.1.16"
+var buildVersion = "v0.0.16"
+const (
+	apiTypeAPI      = "api"
+	apiTypeWSClient = "ws_client"
+)
 
 // reParams は、/*id*/ のようなプレースホルダーを抽出する正規表現
 var reParams = regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
@@ -180,6 +186,9 @@ func main() {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	loadSQLFiles(execDir)
+	if err := startWebSocketClients(execDir); err != nil {
+		log.Printf("Failed to start WebSocket clients: %v", err)
+	}
 
 	corsHandler := cors.New(cors.Options{
 		AllowedOrigins: []string{"*"},
@@ -303,6 +312,189 @@ func loadSQLFiles(execDir string) {
 				sqlFiles[apiKey].SQL[i] = filepath.Join(execDir, sqlPath)
 			}
 		}
+	}
+}
+
+func getAPIType(apiConfig APIConfig) string {
+	t := strings.TrimSpace(apiConfig.Type)
+	if t == "" {
+		return apiTypeAPI
+	}
+	return t
+}
+
+// connectURL が env:XXXX 形式なら環境変数 XXXX で解決する。空や未設定はエラー。
+func resolveConnectURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("connectURL is empty")
+	}
+	if strings.HasPrefix(raw, "env:") {
+		key := strings.TrimPrefix(raw, "env:")
+		if key == "" {
+			return "", fmt.Errorf("connectURL env: prefix is empty")
+		}
+		val := os.Getenv(key)
+		if val == "" {
+			return "", fmt.Errorf("environment variable %s is empty", key)
+		}
+		return val, nil
+	}
+	return raw, nil
+}
+
+type wsClientConfig struct {
+	name        string
+	scriptPath  string
+	connectURL  string
+	description string
+}
+
+// startWebSocketClients は api.json に定義された ws_client を起動する。
+func startWebSocketClients(execDir string) error {
+	var firstErr error
+	for name, apiConfig := range sqlFiles {
+		if getAPIType(apiConfig) != apiTypeWSClient {
+			continue
+		}
+
+		scriptPath := strings.TrimSpace(apiConfig.Script)
+		connectURLRaw := strings.TrimSpace(apiConfig.ConnectURL)
+
+		if scriptPath == "" {
+			err := fmt.Errorf("ws_client %s: script is missing", name)
+			log.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if connectURLRaw == "" {
+			err := fmt.Errorf("ws_client %s: connectURL is missing", name)
+			log.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		connectURL, err := resolveConnectURL(connectURLRaw)
+		if err != nil {
+			log.Printf("ws_client %s: %v", name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		scriptAbs := scriptPath
+		if !filepath.IsAbs(scriptPath) {
+			scriptAbs = filepath.Join(execDir, scriptPath)
+		}
+
+		cfg := wsClientConfig{
+			name:        name,
+			scriptPath:  scriptAbs,
+			connectURL:  connectURL,
+			description: apiConfig.Description,
+		}
+
+		log.Printf("Starting WebSocket client %s -> %s", cfg.name, cfg.connectURL)
+		go runWebSocketClient(cfg)
+	}
+
+	return firstErr
+}
+
+// 常時接続を維持し、切断時は指数バックオフで再接続する。
+func runWebSocketClient(cfg wsClientConfig) {
+	backoff := time.Second
+	for {
+		err := connectAndListenWebSocket(cfg)
+		if err != nil {
+			log.Printf("WebSocket client %s disconnected: %v", cfg.name, err)
+		}
+
+		time.Sleep(backoff)
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+func connectAndListenWebSocket(cfg wsClientConfig) error {
+	conn, _, err := websocket.DefaultDialer.Dial(cfg.connectURL, nil)
+	if err != nil {
+		return fmt.Errorf("dial failed: %w", err)
+	}
+	defer conn.Close()
+
+	log.Printf("WebSocket client %s connected", cfg.name)
+
+	for {
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("read error: %w", err)
+		}
+
+		if msgType == websocket.CloseMessage {
+			return fmt.Errorf("close message received: %s", string(data))
+		}
+
+		allParams := map[string]interface{}{
+			"api":             cfg.name,
+			"ws_client":       cfg.name,
+			"ws_message_type": websocketMessageTypeLabel(msgType),
+			"ws_message_text": string(data),
+			"ws_connect_url":  cfg.connectURL,
+			"ws_description":  cfg.description,
+		}
+
+		if msgType == websocket.BinaryMessage {
+			allParams["ws_message_base64"] = base64.StdEncoding.EncodeToString(data)
+		}
+
+		if msgType == websocket.TextMessage {
+			var decoded interface{}
+			if err := json.Unmarshal(data, &decoded); err == nil {
+				allParams["ws_message_json"] = decoded
+			}
+		}
+
+		result, err := runScript([]string{cfg.scriptPath}, allParams)
+		if err != nil {
+			log.Printf("ws_client %s script error: %v", cfg.name, err)
+			continue
+		}
+
+		trimmed := strings.TrimSpace(result)
+		if trimmed == "" {
+			continue
+		}
+
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(trimmed)); err != nil {
+			return fmt.Errorf("send error: %w", err)
+		}
+	}
+}
+
+func websocketMessageTypeLabel(t int) string {
+	switch t {
+	case websocket.TextMessage:
+		return "text"
+	case websocket.BinaryMessage:
+		return "binary"
+	case websocket.CloseMessage:
+		return "close"
+	case websocket.PingMessage:
+		return "ping"
+	case websocket.PongMessage:
+		return "pong"
+	default:
+		return fmt.Sprintf("unknown(%d)", t)
 	}
 }
 
@@ -453,6 +645,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	apiConfig, exists := sqlFiles[apiKey]
 	if !exists {
 		sendJSONError(w, "SQL files not found", http.StatusNotFound)
+		return
+	}
+	if getAPIType(apiConfig) != apiTypeAPI {
+		sendJSONError(w, fmt.Sprintf("API %s is not an HTTP/WebSocket endpoint", apiKey), http.StatusBadRequest)
 		return
 	}
 	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
@@ -1727,6 +1923,10 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 	fmt.Print(apiConfig);
 	if !exists {
 		respondJSONRPCError(w, rpcReq.ID, -32601, "SQL files not found", nil)
+		return
+	}
+	if getAPIType(apiConfig) != apiTypeAPI {
+		respondJSONRPCError(w, rpcReq.ID, -32601, "Method not found", nil)
 		return
 	}
 

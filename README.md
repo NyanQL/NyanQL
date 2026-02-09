@@ -144,6 +144,23 @@ NyanQL サーバの全体設定を記述します。
 }
 ```
 
+#### type と WebSocket クライアント（ws_client）
+
+- `type` を省略した場合は従来通り HTTP/WS サーバーの API (`"type": "api"`) として動作します。
+- `type: "ws_client"` を指定すると NyanQL 自身が WebSocket クライアントになり、起動時に常時接続します。
+- `connectURL` が `env:XXXX` の場合、環境変数 `XXXX` で接続 URL を解決します。
+
+```json
+"websocket_clients_local": {
+  "type": "ws_client",
+  "script": "./javascript/ws/receiver_main.js",
+  "connectURL": "ws://localhost:8890/hello",
+  "description": "ローカル動作確認用（自身の /hello に接続）"
+}
+```
+
+受信したメッセージは `script` で指定した JavaScript に `nyanAllParams` として渡され、戻り値がそのまま上流の WebSocket へ送信されます（空文字を返すと返信しません）。
+
 ---
 
 ## トランザクション
@@ -312,4 +329,3 @@ nyanSaveFile(b64, "./storage/hello.txt");
 ## 予約語
 
 `api`、`nyan` から始まる名前は予約語です。パラメータに使用しないでください。
-
