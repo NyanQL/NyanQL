@@ -663,8 +663,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		sendJSONError(w, "No check script for this API", http.StatusNotFound)
 		return
 	}
-	if apiConfig.Check != "" {
-		success, statusCode, errorObj, jsonStr, err := runCheckScript(apiConfig.Check, params, acceptedKeys)
+		if apiConfig.Check != "" {
+			success, statusCode, errorObj, jsonStr, err := runCheckScript(apiConfig.Check, params, acceptedKeys)
 		if err != nil {
 			log.Printf("Check script error: %v", err)
 			sendJSONError(w, err.Error(), statusCode)
@@ -691,18 +691,19 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(jsonStr))
 			return
 		}
-		if apiConfig.Script != "" {
-			scriptResult, err := runScript([]string{apiConfig.Script}, params)
-			if err != nil {
-				log.Printf("Script execution error: %v", err)
-				sendJSONError(w, err.Error(), http.StatusInternalServerError)
+			if apiConfig.Script != "" {
+				scriptResult, err := runScript([]string{apiConfig.Script}, params)
+				if err != nil {
+					log.Printf("Script execution error: %v", err)
+					sendJSONError(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				performPush(apiConfig, params)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(scriptResult))
 				return
 			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(scriptResult))
-			return
-		}
 		if len(apiConfig.SQL) == 0 && apiConfig.Script == "" {
 			performPush(apiConfig, params)
 			w.Header().Set("Content-Type", "application/json")
