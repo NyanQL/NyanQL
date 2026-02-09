@@ -140,6 +140,7 @@ var config Config
 var db *sql.DB
 var sqlFiles map[string]APIConfig
 var dbType string
+var buildVersion = "v1.1.16"
 
 // reParams は、/*id*/ のようなプレースホルダーを抽出する正規表現
 var reParams = regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
@@ -170,8 +171,9 @@ func main() {
 		log.Fatalf("Failed to decode config JSON: %v", err)
 	}
 	adjustPaths(execDir, &config)
-	log.Printf("Starting application version: %s", config.Version)
 	setupLogger(execDir)
+	log.Printf("Binary version: %s", buildVersion)
+	log.Printf("Config version: %s", config.Version)
 
 	db, err = connectDB(config)
 	if err != nil {

@@ -39,7 +39,7 @@ jobs:
             binary_name="${binary_name}.exe"
           fi
 
-          go build -o "${binary_name}" main.go
+          go build -ldflags "-X main.buildVersion=${{ github.ref_name }}" -o "${binary_name}" main.go
 
           mkdir release_package
           cp "${binary_name}" release_package/
