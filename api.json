@@ -23,6 +23,7 @@
   },
   "test1": {
     "check": "./javascript/check.js",
+    "push": "hello",
     "description": "checkだけでsqlなしです。"
   },
   "test2": {
@@ -38,10 +39,14 @@
     "sql": ["./sql/sqlite/if_sample.sql"],
     "description": "sql上のIFの処理のサンプル"
   },
+  "hello": {
+    "script": "./javascript/hello.js",
+    "description": "Helloを返すテスト用APIです。/helloにWebSocket接続すると受信内容を返します。"
+  },
   "websocket_clients_local": {
     "type": "ws_client",
     "script": "./javascript/ws/receiver_main.js",
-    "connectURL": "ws://localhost:8890/hello",
+    "connectURL": "ws://localhost:8443/hello",
     "description": "ローカル動作確認用（自身の /hello に接続）"
   }
 }

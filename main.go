@@ -444,6 +444,8 @@ func connectAndListenWebSocket(cfg wsClientConfig) error {
 			return fmt.Errorf("close message received: %s", string(data))
 		}
 
+		log.Printf("ws_client %s received %s: %s", cfg.name, websocketMessageTypeLabel(msgType), string(data))
+
 		allParams := map[string]interface{}{
 			"api":             cfg.name,
 			"ws_client":       cfg.name,
@@ -683,6 +685,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if nyanMode == "checkOnly" {
+			performPush(apiConfig, params)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
 			w.Write([]byte(jsonStr))
@@ -701,6 +704,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(apiConfig.SQL) == 0 && apiConfig.Script == "" {
+			performPush(apiConfig, params)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
 			w.Write([]byte(jsonStr))
@@ -1020,6 +1024,9 @@ func handleNyan(w http.ResponseWriter, r *http.Request) {
 	// sqlFiles は map[string]APIConfig になっているので、必要な情報のみ抽出します。
 	filteredApis := make(map[string]APIDetails)
 	for key, apiConf := range sqlFiles {
+		if getAPIType(apiConf) != apiTypeAPI {
+			continue
+		}
 		filteredApis[key] = APIDetails{
 			Description: apiConf.Description,
 		}
@@ -1061,6 +1068,10 @@ func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	apiConfig, exists := sqlFiles[apiName]
 	if !exists {
+		sendJSONError(w, "API not found", http.StatusNotFound)
+		return
+	}
+	if getAPIType(apiConfig) != apiTypeAPI {
 		sendJSONError(w, "API not found", http.StatusNotFound)
 		return
 	}
