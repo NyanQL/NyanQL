@@ -1552,6 +1552,36 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 	return value.String(), nil
 }
 
+// callNyanAPIFromVM は、JavaScript VM から api.json の script API を直接実行します。
+func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string, error) {
+	if strings.TrimSpace(apiName) == "" {
+		return "", fmt.Errorf("api name is required")
+	}
+
+	apiConfig, exists := sqlFiles[apiName]
+	if !exists {
+		return "", fmt.Errorf("API config not found: %s", apiName)
+	}
+	if getAPIType(apiConfig) != apiTypeAPI {
+		return "", fmt.Errorf("API %s is not an HTTP/WebSocket endpoint", apiName)
+	}
+	if strings.TrimSpace(apiConfig.Script) == "" {
+		return "", fmt.Errorf("script not found for API %s", apiName)
+	}
+
+	params := map[string]interface{}{}
+	for k, v := range allParams {
+		params[k] = v
+	}
+	params["api"] = apiName
+
+	result, err := runScript([]string{apiConfig.Script}, params)
+	if err != nil {
+		return "", fmt.Errorf("failed to run API %s: %v", apiName, err)
+	}
+	return result, nil
+}
+
 
 // evaluateCondition は、条件文字列（例："id != null OR date != null" や "id != null AND date != null"）を解析して評価します。
 // まず "OR" で分割し、各部分についてさらに "AND" で分割、すべてが成立すればそのOR部分は成立とみなし、
@@ -2263,6 +2293,46 @@ func registerNyanFuncs(vm *goja.Runtime, params map[string]interface{}, accepted
 		return nyanRunSQLHandler(vm, call)
 	})
 	vm.Set("nyanGetFile", nyanGetFile(vm))
+	vm.Set("nyanCallMe", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			panic(vm.ToValue("nyanCallMe(params) requires an object argument"))
+		}
+
+		apiName := "hello2"
+		var params map[string]interface{}
+
+		raw := call.Argument(0).Export()
+		if raw != nil {
+			if m, ok := raw.(map[string]interface{}); ok {
+				params = m
+			} else if obj, ok := call.Argument(0).(*goja.Object); ok {
+				exported := obj.Export()
+				if m, ok := exported.(map[string]interface{}); ok {
+					params = m
+				}
+			}
+		}
+		if params == nil {
+			panic(vm.ToValue("nyanCallMe(params) requires an object argument"))
+		}
+
+		if v, ok := params["api"]; ok {
+			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+				apiName = s
+			}
+		}
+		params["api"] = apiName
+
+		result, err := callNyanAPIFromVM(apiName, params)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		var parsed interface{}
+		if err := json.Unmarshal([]byte(result), &parsed); err == nil {
+			return vm.ToValue(parsed)
+		}
+		return vm.ToValue(result)
+	})
 	vm.Set("nyanBase64Encode", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
 			panic(vm.ToValue("nyanBase64Encode(data) : data が必要です"))

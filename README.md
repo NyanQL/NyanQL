@@ -233,6 +233,31 @@ SELECT id, date FROM stamps
 - **script**: 自由に JSON を生成。`nyanRunSQL` や `nyanAllParams` が利用可能。
 - **nyan_mode=checkOnly**: HTTP リクエストまたは JSON-RPC で `nyan_mode=checkOnly` パラメータを指定すると、`check` スクリプトのみを実行し、その結果を返します。`script` や SQL の実行は行われません。
 
+### `nyanCallMe(params: object): object|string`
+
+JavaScript の `script` 内から、`api.json` に定義された別 API（`type: "api"` かつ `script` 指定あり）を内部実行します。
+
+- `params.api` に呼び出し先 API 名を指定します。
+- `params` の内容は呼び出し先 `nyanAllParams` として渡されます。
+- 返り値が JSON として解釈できる場合はオブジェクトとして返し、解釈できない場合は文字列を返します。
+- 引数は必須で `object` のみ受け付けます（それ以外はエラーになります）。
+- `params.api` を省略した場合は既定値として `hello2` を使用します。
+
+```js
+function main() {
+  const res = nyanCallMe({
+    api: "sub_task",
+    user_id: nyanAllParams.user_id
+  });
+
+  return JSON.stringify({
+    success: true,
+    status: 200,
+    result: res
+  });
+}
+```
+
 ---
 
 ## ファイル操作ユーティリティ
