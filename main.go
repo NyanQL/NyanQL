@@ -2298,7 +2298,6 @@ func registerNyanFuncs(vm *goja.Runtime, params map[string]interface{}, accepted
 			panic(vm.ToValue("nyanCallMe(params) requires an object argument"))
 		}
 
-		apiName := "hello2"
 		var params map[string]interface{}
 
 		raw := call.Argument(0).Export()
@@ -2316,11 +2315,15 @@ func registerNyanFuncs(vm *goja.Runtime, params map[string]interface{}, accepted
 			panic(vm.ToValue("nyanCallMe(params) requires an object argument"))
 		}
 
-		if v, ok := params["api"]; ok {
-			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
-				apiName = s
-			}
+		v, ok := params["api"]
+		if !ok {
+			panic(vm.ToValue("nyanCallMe(params) requires params.api"))
 		}
+		apiName, ok := v.(string)
+		if !ok || strings.TrimSpace(apiName) == "" {
+			panic(vm.ToValue("nyanCallMe(params) requires params.api as non-empty string"))
+		}
+		apiName = strings.TrimSpace(apiName)
 		params["api"] = apiName
 
 		result, err := callNyanAPIFromVM(apiName, params)

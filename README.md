@@ -241,7 +241,7 @@ JavaScript の `script` 内から、`api.json` に定義された別 API（`type
 - `params` の内容は呼び出し先 `nyanAllParams` として渡されます。
 - 返り値が JSON として解釈できる場合はオブジェクトとして返し、解釈できない場合は文字列を返します。
 - 引数は必須で `object` のみ受け付けます（それ以外はエラーになります）。
-- `params.api` を省略した場合は既定値として `hello2` を使用します。
+- `params.api` は必須で、省略または空文字の場合はエラーになります。
 
 ```js
 function main() {
