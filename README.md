@@ -235,9 +235,11 @@ SELECT id, date FROM stamps
 
 ### `nyanCallMe(params: object): object|string`
 
-JavaScript の `script` 内から、`api.json` に定義された別 API（`type: "api"` かつ `script` 指定あり）を内部実行します。
+JavaScript の `script` 内から、`api.json` に定義された別 API（`type: "api"`）を内部実行します。
 
 - `params.api` に呼び出し先 API 名を指定します。
+- 呼び出し先 API は `check` / `script` / `sql` の定義に従って、通常 API 呼び出しと同じ流れで実行されます。
+- `params.nyan_mode = "checkOnly"` を指定すると、呼び出し先 API の `check` のみ実行します。
 - `params` の内容は呼び出し先 `nyanAllParams` として渡されます。
 - 返り値が JSON として解釈できる場合はオブジェクトとして返し、解釈できない場合は文字列を返します。
 - 引数は必須で `object` のみ受け付けます（それ以外はエラーになります）。
