@@ -43,6 +43,14 @@
     "script": "./javascript/hello.js",
     "description": "Helloを返すテスト用APIです。/helloにWebSocket接続すると受信内容を返します。"
   },
+  "nyan_callme_target": {
+    "script": "./javascript/nyan_callme_target.js",
+    "description": "nyanCallMe で内部呼び出しされる確認用APIです。"
+  },
+  "nyan_callme_check": {
+    "script": "./javascript/nyan_callme_check.js",
+    "description": "nyanCallMe の存在確認と内部API呼び出し結果を返します。"
+  },
   "websocket_clients_local": {
     "type": "ws_client",
     "script": "./javascript/ws/receiver_main.js",
