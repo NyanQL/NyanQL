@@ -229,19 +229,68 @@ SELECT id, date FROM stamps
 
 ## JavaScript Script / Check
 
-- **check**: 入力検証用の JS。失敗時に `{ success:false, status:400, error:{ message: ... }}` を返す。
+- **check**: 入力検証用の JS。`success` / `status` / `error` を持つ JSON 文字列を返します。失敗時の例: `{ success:false, status:401, error:{ message: "..." }}`。
 - **script**: 自由に JSON を生成。`nyanRunSQL` や `nyanAllParams` が利用可能。
-- **nyan_mode=checkOnly**: HTTP リクエストまたは JSON-RPC で `nyan_mode=checkOnly` パラメータを指定すると、`check` スクリプトのみを実行し、その結果を返します。`script` や SQL の実行は行われません。
+- **nyan_mode=checkOnly**: HTTP リクエストまたは JSON-RPC で `nyan_mode=checkOnly` パラメータを指定すると、`check` スクリプトのみを実行し、その結果を返します。`script` や SQL の実行は行われません。`push` が設定されている API では、`check` 成功時に Push は実行されます。
 
-### `nyanCallMe(params: object): object|string`
+### `nyanGetAPI / nyanJsonAPI / nyanCallAPI`
 
-JavaScript の `script` 内から、`api.json` に定義された別 API（`type: "api"`）を内部実行します。
+JavaScript の `script` / `check` から外部 API を呼び出します。
+
+- `nyanGetAPI(url, username, password)` は GET リクエストを送信します。
+- `nyanJsonAPI(url, jsonData, username, password, headers)` は JSON を POST します。
+- `nyanCallAPI(url, jsonData, username, password, headers)` は `nyanJsonAPI()` のラッパーで、引数と挙動は同じです。
+
+`jsonData` には JSON 文字列を渡してください。JavaScript オブジェクトを送る場合は `JSON.stringify()` してください。  
+`headers` は省略可能で、オブジェクトまたは JSON 文字列で指定できます。
+
+```js
+const getResponse = nyanGetAPI("https://api.example.com/data", "nyan", "password");
+console.log("GET Response:", getResponse);
+
+const postData = JSON.stringify({ key: "value" });
+const jsonResponse = nyanJsonAPI(
+  "https://api.example.com/update",
+  postData,
+  "nyan",
+  "password"
+);
+const callResponse = nyanCallAPI(
+  "https://api.example.com/update",
+  postData,
+  "nyan",
+  "password"
+);
+console.log("POST Response:", jsonResponse);
+console.log("POST Response via wrapper:", callResponse);
+```
+
+header を追加したい場合は第 5 引数に指定してください。
+
+```js
+const headers = {
+  "Content-Type": "application/json",
+  "X-Custom-Header": "CustomValue"
+};
+
+const response = nyanCallAPI(
+  "https://api.example.com/data",
+  postData,
+  "nyan",
+  "password",
+  headers
+);
+```
+
+### `nyanCallMe(params: object): any`
+
+JavaScript の `script` / `check` 内から、`api.json` に定義された別 API（`type: "api"`）を内部実行します。
 
 - `params.api` に呼び出し先 API 名を指定します。
 - 呼び出し先 API は `check` / `script` / `sql` の定義に従って、通常 API 呼び出しと同じ流れで実行されます。
-- `params.nyan_mode = "checkOnly"` を指定すると、呼び出し先 API の `check` のみ実行します。
+- `params.nyan_mode = "checkOnly"` を指定すると、呼び出し先 API の `check` のみ実行します。`push` が設定されている API では、`check` 成功時に Push は実行されます。
 - `params` の内容は呼び出し先 `nyanAllParams` として渡されます。
-- 返り値が JSON として解釈できる場合はオブジェクトとして返し、解釈できない場合は文字列を返します。
+- 返り値が JSON として解釈できる場合は、その JSON 値を返します。JSON として解釈できない場合は文字列を返します。
 - 引数は必須で `object` のみ受け付けます（それ以外はエラーになります）。
 - `params.api` は必須で、省略または空文字の場合はエラーになります。
 
@@ -271,7 +320,7 @@ function main() {
 Base64 をデコードして元の文字列を返します。
 
 ### `nyanSaveFile(b64: string, destPath: string)`
-エンコード済み Base64 をデコードし、`destPath` にファイル保存します。
+エンコード済み Base64 をデコードし、`destPath` にファイル保存します。相対パスは実行ファイルのディレクトリ基準で解決され、親ディレクトリが無ければ自動作成されます。
 
 ```js
 const raw = "こんにちは！ にゃんくる";

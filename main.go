@@ -9,14 +9,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/dop251/goja"
-	_ "github.com/duckdb/duckdb-go/v2"
-	_ "github.com/go-sql-driver/mysql"
-	"github.com/gorilla/websocket"
-	_ "github.com/lib/pq"
-	_ "github.com/mattn/go-sqlite3"
-	"github.com/natefinch/lumberjack"
-	"github.com/rs/cors"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -30,6 +22,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dop251/goja"
+	_ "github.com/duckdb/duckdb-go/v2"
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/gorilla/websocket"
+	_ "github.com/lib/pq"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/natefinch/lumberjack"
+	"github.com/rs/cors"
 )
 
 type Config struct {
@@ -142,7 +143,7 @@ var config Config
 var db *sql.DB
 var sqlFiles map[string]APIConfig
 var dbType string
-var buildVersion = "v0.0.16"
+var buildVersion = "v0.0.18"
 
 const (
 	apiTypeAPI      = "api"
@@ -2376,7 +2377,7 @@ func registerNyanFuncs(vm *goja.Runtime, params map[string]interface{}, accepted
 		}
 		return vm.ToValue(result)
 	})
-	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
+	jsonAPIFunc := func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
 		jsonData := call.Argument(1).String()
 		username := call.Argument(2).String()
@@ -2410,7 +2411,9 @@ func registerNyanFuncs(vm *goja.Runtime, params map[string]interface{}, accepted
 			panic(vm.ToValue(err.Error()))
 		}
 		return vm.ToValue(result)
-	})
+	}
+	vm.Set("nyanJsonAPI", jsonAPIFunc)
+	vm.Set("nyanCallAPI", jsonAPIFunc)
 	// VM にホストコマンド実行関数 nyanHostExec を登録
 	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
 		return nyanHostExecWrapper(vm, call)
