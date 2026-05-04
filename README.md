@@ -208,26 +208,26 @@ SQLiteとDuckDBでは、`DBName` に相対パスを書いた場合、実行フ�
 
 この例では、`/listItems` または `/?api=listItems` を呼び出すと、`./sql/listItems.sql` が実行されます。
 
-### checkで入力を確認してからSQLを実行するAPI
+### paramCheckで入力を確認してからSQLを実行するAPI
 
 ```json
 {
   "getItem": {
-    "check": "./javascript/checkGetItem.js",
+    "paramCheck": "./javascript/checkGetItem.js",
     "sql": ["./sql/getItem.sql"],
     "description": "商品を1件取得します"
   }
 }
 ```
 
-`check` に指定したJavaScriptが先に実行されます。ここでエラーを返すと、SQLは実行されません。
+`paramCheck` に指定したJavaScriptが先に実行されます。ここでエラーを返すと、SQLは実行されません。古い `check` キーも互換性のため読み込めます。
 
 ### scriptを実行するAPI
 
 ```json
 {
   "createOrder": {
-    "check": "./javascript/checkCreateOrder.js",
+    "paramCheck": "./javascript/checkCreateOrder.js",
     "script": "./javascript/createOrder.js",
     "description": "注文伝票を1件登録します"
   }
@@ -235,6 +235,29 @@ SQLiteとDuckDBでは、`DBName` に相対パスを書いた場合、実行フ�
 ```
 
 `script` を指定したAPIでは、JavaScriptファイルを実行します。この場合、同じAPI定義の中に `sql` は書けません。実装上、`script` と `sql` を同時に指定すると起動時にエラーになります。
+
+### publicフォルダを公開するAPI
+
+`type: "public"` を指定すると、`path` のフォルダ配下にあるファイルをそのまま配信します。`path` は実行ファイルがある場所からの相対パス、または絶対パスで指定できます。
+
+```json
+{
+  "public": {
+    "type": "public",
+    "path": "./public",
+    "description": "publicフォルダ"
+  }
+}
+```
+
+この例では `./public/app.js` を `http://localhost:8080/public/app.js` で取得できます。空パス、存在しないファイル、ディレクトリへのアクセスは 404 になります。ディレクトリ一覧や `index.html` の自動探索は行いません。
+
+`type: "public"` はBasic認証を通さずに配信します。認証や認可が必要なファイル公開では、`paramCheck` を指定してください。`paramCheck` と `outCheck` では、公開エンドポイント名とリクエストされた相対パスを参照できます。
+
+```js
+var endpoint = nyanAllParams.nyan_public_endpoint;
+var path = nyanAllParams.nyan_public_path;
+```
 
 ---
 
@@ -454,9 +477,10 @@ const nyanOutputColumns = ["order_id", "order_no"];
 
 ---
 
-## 入力チェック：check
+## 入力チェック：paramCheck
 
-`check` は、SQLやscriptを実行する前に、リクエスト内容を確認するためのJavaScriptです。
+`paramCheck` は、SQLやscriptを実行する前に、リクエスト内容を確認するためのJavaScriptです。
+古い設定との互換性のため、`check` も `paramCheck` の別名として使えます。
 
 たとえば、`id` が指定されていない場合にエラーを返すには、次のように書きます。
 
@@ -478,17 +502,41 @@ if (!nyanAllParams.id) {
 }
 ```
 
-`check` の戻り値は、JSON文字列にしてください。NyanQLは、そのJSONを読んで、`success` が `true` なら次の処理へ進みます。`false` の場合は、SQLやscriptを実行せずにエラーを返します。
+`paramCheck` の戻り値は、JSON文字列またはオブジェクトにしてください。NyanQLは、そのJSONを読んで、`success` が `true` なら次の処理へ進みます。`false` の場合は、SQLやscriptを実行せずにエラーを返します。
 
 ### checkだけを実行する
 
-`nyan_mode=checkOnly` を指定すると、`check` だけを実行できます。
+`nyan_mode=checkOnly` を指定すると、`paramCheck` だけを実行できます。`check` で指定した古い設定も、`paramCheck` として同じように実行されます。
 
 ```bash
 curl -u admin:secret "http://localhost:8080/getItem?id=1&nyan_mode=checkOnly"
 ```
 
 入力フォームの事前チェックなどに使えます。
+
+### 出力前チェック：outCheck
+
+`outCheck` を指定すると、SQLやscriptの実行後、または `type: "public"` のファイル送信前にJavaScriptを実行できます。`success: true` かつ `status: 200` の場合だけ本体の実行結果をそのまま返し、それ以外は `outCheck` の結果をJSONとして返します。
+
+```json
+{
+  "checked-api": {
+    "script": "./javascript/main.js",
+    "outCheck": "./javascript/out_check.js",
+    "description": "出力前チェック付きAPI"
+  }
+}
+```
+
+本体の実行結果は `nyanAllParams.nyan_output` で参照できます。互換用に `nyan_output_body` なども使えます。
+
+```js
+if (nyanAllParams.nyan_output.body.indexOf("expected") >= 0) {
+  ({ success: true, status: 200, result: {} });
+} else {
+  ({ success: false, status: 409, result: { message: "output mismatch" } });
+}
+```
 
 ---
 
@@ -790,4 +838,3 @@ NyanQLは開発中のソフトウェアです。ただし、SQL実行、2way-SQL
 ## ライセンス
 
 NyanQLはMITライセンスで公開されています。
-

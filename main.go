@@ -71,11 +71,58 @@ type LogConfig struct {
 type APIConfig struct {
 	SQL         []string `json:"sql,omitempty"`
 	Script      string   `json:"script,omitempty"`
-	Check       string   `json:"check,omitempty"`
+	Path        string   `json:"path,omitempty"`
+	ParamCheck  string   `json:"paramCheck,omitempty"`
+	Check       string   `json:"check,omitempty"` // Deprecated: use ParamCheck. Kept as a compatibility alias.
+	OutCheck    string   `json:"outCheck,omitempty"`
 	Push        string   `json:"push,omitempty"`
 	Description string   `json:"description"`
 	Type        string   `json:"type,omitempty"`
 	ConnectURL  string   `json:"connectURL,omitempty"`
+}
+
+func (apiConfig *APIConfig) UnmarshalJSON(data []byte) error {
+	type apiConfigJSON struct {
+		SQL             []string `json:"sql,omitempty"`
+		Script          string   `json:"script,omitempty"`
+		Path            string   `json:"path,omitempty"`
+		ParamCheck      string   `json:"paramCheck,omitempty"`
+		ParamCheckLower string   `json:"paramcheck,omitempty"`
+		Check           string   `json:"check,omitempty"`
+		OutCheck        string   `json:"outCheck,omitempty"`
+		OutCheckLower   string   `json:"outcheck,omitempty"`
+		Push            string   `json:"push,omitempty"`
+		Description     string   `json:"description"`
+		Type            string   `json:"type,omitempty"`
+		ConnectURL      string   `json:"connectURL,omitempty"`
+	}
+
+	var raw apiConfigJSON
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	apiConfig.SQL = raw.SQL
+	apiConfig.Script = raw.Script
+	apiConfig.Path = raw.Path
+	apiConfig.ParamCheck = raw.ParamCheck
+	if apiConfig.ParamCheck == "" {
+		apiConfig.ParamCheck = raw.ParamCheckLower
+	}
+	if apiConfig.ParamCheck == "" {
+		apiConfig.ParamCheck = raw.Check
+	}
+	apiConfig.Check = ""
+	apiConfig.OutCheck = raw.OutCheck
+	if apiConfig.OutCheck == "" {
+		apiConfig.OutCheck = raw.OutCheckLower
+	}
+	apiConfig.Push = raw.Push
+	apiConfig.Description = raw.Description
+	apiConfig.Type = raw.Type
+	apiConfig.ConnectURL = raw.ConnectURL
+
+	return nil
 }
 
 type Hub struct {
@@ -148,6 +195,7 @@ var buildVersion = "v0.0.18"
 const (
 	apiTypeAPI      = "api"
 	apiTypeWSClient = "ws_client"
+	apiTypePublic   = "public"
 )
 
 // reParams は、/*id*/ のようなプレースホルダーを抽出する正規表現
@@ -254,8 +302,42 @@ func unifiedHandler(w http.ResponseWriter, r *http.Request) {
 		handleWebSocket(w, r)
 		return
 	}
+	if apiKey, requestedPath, apiConfig, ok := findPublicAPIForPath(r.URL.Path); ok {
+		handlePublicRequest(w, r, apiKey, requestedPath, apiConfig)
+		return
+	}
 	// 通常のHTTPリクエストならBasicAuthを適用して処理
 	basicAuth(handleRequest, config)(w, r)
+}
+
+func findPublicAPIForPath(requestPath string) (string, string, APIConfig, bool) {
+	var matchedKey string
+	var matchedPath string
+	var matchedConfig APIConfig
+	for apiKey, apiConfig := range sqlFiles {
+		if getAPIType(apiConfig) != apiTypePublic {
+			continue
+		}
+		routePath := "/" + strings.Trim(strings.TrimSpace(apiKey), "/")
+		if routePath == "/" {
+			continue
+		}
+		if requestPath == routePath || strings.HasPrefix(requestPath, routePath+"/") {
+			if len(routePath) <= len(matchedPath) {
+				continue
+			}
+			matchedKey = apiKey
+			matchedPath = routePath
+			matchedConfig = apiConfig
+		}
+	}
+	if matchedKey == "" {
+		return "", "", APIConfig{}, false
+	}
+	if requestPath == matchedPath {
+		return matchedKey, "", matchedConfig, true
+	}
+	return matchedKey, strings.TrimPrefix(requestPath, matchedPath+"/"), matchedConfig, true
 }
 
 // WebSocketリクエストかどうかを判定する関数例
@@ -314,6 +396,10 @@ func loadSQLFiles(execDir string) {
 				sqlFiles[apiKey].SQL[i] = filepath.Join(execDir, sqlPath)
 			}
 		}
+		if apiConfig.Path != "" && !filepath.IsAbs(apiConfig.Path) {
+			apiConfig.Path = filepath.Join(execDir, apiConfig.Path)
+			sqlFiles[apiKey] = apiConfig
+		}
 	}
 }
 
@@ -323,6 +409,201 @@ func getAPIType(apiConfig APIConfig) string {
 		return apiTypeAPI
 	}
 	return t
+}
+
+func getParamCheckScriptPath(apiConfig APIConfig) string {
+	if apiConfig.ParamCheck != "" {
+		return apiConfig.ParamCheck
+	}
+	return apiConfig.Check
+}
+
+func cloneParams(params map[string]interface{}) map[string]interface{} {
+	cloned := make(map[string]interface{}, len(params))
+	for key, value := range params {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func runOutCheckScript(apiConfig APIConfig, params map[string]interface{}, statusCode int, contentType string, body []byte) (bool, int, string, error) {
+	outCheckPath := strings.TrimSpace(apiConfig.OutCheck)
+	if outCheckPath == "" {
+		return false, statusCode, "", nil
+	}
+
+	checkParams := cloneParams(params)
+	bodyString := string(body)
+	bodyBase64 := base64.StdEncoding.EncodeToString(body)
+	checkParams["nyan_output"] = map[string]interface{}{
+		"status":          statusCode,
+		"contentType":     contentType,
+		"headers":         map[string]string{},
+		"body":            bodyString,
+		"bodyBase64":      bodyBase64,
+		"bodyLength":      len(body),
+		"bodyLengthBytes": len(body),
+	}
+	checkParams["nyan_output_status"] = statusCode
+	checkParams["nyan_output_content_type"] = contentType
+	checkParams["nyan_output_body"] = bodyString
+	checkParams["nyan_output_body_base64"] = bodyBase64
+
+	success, checkStatusCode, _, jsonStr, err := runCheckScript(outCheckPath, checkParams, nil)
+	if err != nil {
+		return true, http.StatusInternalServerError, "", err
+	}
+	if checkStatusCode < 100 || checkStatusCode > 599 {
+		return true, http.StatusInternalServerError, "", fmt.Errorf("outCheck response status is out of range: %d", checkStatusCode)
+	}
+	if success && checkStatusCode == http.StatusOK {
+		return false, statusCode, "", nil
+	}
+	return true, checkStatusCode, jsonStr, nil
+}
+
+func isCheckOnlyMode(params map[string]interface{}) bool {
+	if params == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(fmt.Sprint(params["nyan_mode"])), "checkOnly")
+}
+
+func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
+	contentType := r.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "application/json") {
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			return nil, fmt.Errorf("error reading request body: %v", err)
+		}
+		var data map[string]interface{}
+		if len(strings.TrimSpace(string(body))) == 0 {
+			data = map[string]interface{}{}
+		} else if err := json.Unmarshal(body, &data); err != nil {
+			return nil, fmt.Errorf("error parsing JSON data: %v", err)
+		}
+		log.Printf("Received JSON: %v", data)
+		return data, nil
+	}
+
+	if err := r.ParseForm(); err != nil {
+		return nil, fmt.Errorf("error parsing form data: %v", err)
+	}
+	params := make(map[string]interface{})
+	for key, values := range r.Form {
+		if len(values) > 1 {
+			params[key] = values
+			continue
+		}
+		val := values[0]
+		if strings.HasPrefix(val, "[") && strings.HasSuffix(val, "]") {
+			var arr []interface{}
+			if err := json.Unmarshal([]byte(val), &arr); err == nil {
+				params[key] = arr
+				continue
+			}
+		}
+		if strings.Contains(val, ",") {
+			splitVals := strings.Split(val, ",")
+			for i := range splitVals {
+				splitVals[i] = strings.TrimSpace(splitVals[i])
+			}
+			params[key] = splitVals
+		} else {
+			params[key] = val
+		}
+	}
+	return params, nil
+}
+
+func handlePublicRequest(w http.ResponseWriter, r *http.Request, apiKey string, requestedPath string, apiConfig APIConfig) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	publicPath := strings.TrimSpace(apiConfig.Path)
+	if publicPath == "" {
+		sendJSONError(w, "public path is missing", http.StatusInternalServerError)
+		return
+	}
+
+	params, err := collectRequestParams(r)
+	if err != nil {
+		sendJSONError(w, "Invalid JSON data", http.StatusBadRequest)
+		return
+	}
+	params["api"] = apiKey
+	params["nyan_public_endpoint"] = apiKey
+	params["nyan_public_path"] = requestedPath
+
+	checkScriptPath := getParamCheckScriptPath(apiConfig)
+	if checkScriptPath == "" && isCheckOnlyMode(params) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"success":true,"status":200,"result":null}`))
+		return
+	}
+	if checkScriptPath != "" {
+		success, statusCode, errorObj, jsonStr, err := runCheckScript(checkScriptPath, params, nil)
+		if err != nil {
+			log.Printf("Public paramCheck script error: %v", err)
+			sendJSONError(w, err.Error(), statusCode)
+			return
+		}
+		allowed := success && statusCode == http.StatusOK
+		if isCheckOnlyMode(params) || !allowed {
+			if !success && errorObj != nil {
+				log.Printf("Public paramCheck rejected %s/%s: %v", apiKey, requestedPath, errorObj)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(statusCode)
+			w.Write([]byte(jsonStr))
+			return
+		}
+	}
+
+	if requestedPath == "" || !filepath.IsLocal(requestedPath) {
+		http.NotFound(w, r)
+		return
+	}
+	filePath := filepath.Join(publicPath, requestedPath)
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.NotFound(w, r)
+			return
+		}
+		sendJSONError(w, "failed to read public file", http.StatusInternalServerError)
+		return
+	}
+	if fileInfo.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+
+	if strings.TrimSpace(apiConfig.OutCheck) == "" {
+		http.ServeFile(w, r, filePath)
+		return
+	}
+	fileContent, err := os.ReadFile(filePath)
+	if err != nil {
+		sendJSONError(w, "failed to read public file", http.StatusInternalServerError)
+		return
+	}
+	contentType := http.DetectContentType(fileContent)
+	if handled, outStatusCode, outJSON, err := runOutCheckScript(apiConfig, params, http.StatusOK, contentType, fileContent); handled {
+		if err != nil {
+			log.Printf("Public outCheck script error: %v", err)
+			sendJSONError(w, err.Error(), outStatusCode)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(outStatusCode)
+		w.Write([]byte(outJSON))
+		return
+	}
+	http.ServeContent(w, r, fileInfo.Name(), fileInfo.ModTime(), bytes.NewReader(fileContent))
 }
 
 // connectURL が env:XXXX 形式なら環境変数 XXXX で解決する。空や未設定はエラー。
@@ -588,50 +869,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	contentType := r.Header.Get("Content-Type")
-	var params map[string]interface{}
-	if contentType == "application/json" {
-		body, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			sendJSONError(w, "Error reading request body", http.StatusInternalServerError)
-			return
-		}
-		var data map[string]interface{}
-		if err := json.Unmarshal(body, &data); err != nil {
-			sendJSONError(w, "Error parsing JSON data", http.StatusBadRequest)
-			return
-		}
-		log.Printf("Received JSON: %v", data)
-		params = data
-	} else {
-		if err := r.ParseForm(); err != nil {
-			sendJSONError(w, "Error parsing form data", http.StatusBadRequest)
-			return
-		}
-		params = make(map[string]interface{})
-		for key, values := range r.Form {
-			if len(values) > 1 {
-				params[key] = values
-			} else {
-				val := values[0]
-				if strings.HasPrefix(val, "[") && strings.HasSuffix(val, "]") {
-					var arr []interface{}
-					if err := json.Unmarshal([]byte(val), &arr); err == nil {
-						params[key] = arr
-						continue
-					}
-				}
-				if strings.Contains(val, ",") {
-					splitVals := strings.Split(val, ",")
-					for i := range splitVals {
-						splitVals[i] = strings.TrimSpace(splitVals[i])
-					}
-					params[key] = splitVals
-				} else {
-					params[key] = val
-				}
-			}
-		}
+	params, err := collectRequestParams(r)
+	if err != nil {
+		sendJSONError(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 	if r.URL.Path != "/" {
 		apiName := strings.TrimPrefix(r.URL.Path, "/")
@@ -661,12 +902,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		acceptedKeys = []string{}
 	}
 	nyanMode, _ := params["nyan_mode"].(string)
-	if nyanMode == "checkOnly" && apiConfig.Check == "" {
+	checkScriptPath := getParamCheckScriptPath(apiConfig)
+	if nyanMode == "checkOnly" && checkScriptPath == "" {
 		sendJSONError(w, "No check script for this API", http.StatusNotFound)
 		return
 	}
-	if apiConfig.Check != "" {
-		success, statusCode, errorObj, jsonStr, err := runCheckScript(apiConfig.Check, params, acceptedKeys)
+	if checkScriptPath != "" {
+		success, statusCode, errorObj, jsonStr, err := runCheckScript(checkScriptPath, params, acceptedKeys)
 		if err != nil {
 			log.Printf("Check script error: %v", err)
 			sendJSONError(w, err.Error(), statusCode)
@@ -693,19 +935,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(jsonStr))
 			return
 		}
-		if apiConfig.Script != "" {
-			scriptResult, err := runScript([]string{apiConfig.Script}, params)
-			if err != nil {
-				log.Printf("Script execution error: %v", err)
-				sendJSONError(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			performPush(apiConfig, params)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(scriptResult))
-			return
-		}
 		if len(apiConfig.SQL) == 0 && apiConfig.Script == "" {
 			performPush(apiConfig, params)
 			w.Header().Set("Content-Type", "application/json")
@@ -713,6 +942,32 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(jsonStr))
 			return
 		}
+	}
+
+	if apiConfig.Script != "" {
+		scriptResult, err := runScript([]string{apiConfig.Script}, params)
+		if err != nil {
+			log.Printf("Script execution error: %v", err)
+			sendJSONError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		body := []byte(scriptResult)
+		if handled, outStatusCode, outJSON, err := runOutCheckScript(apiConfig, params, http.StatusOK, "application/json", body); handled {
+			if err != nil {
+				log.Printf("outCheck script error: %v", err)
+				sendJSONError(w, err.Error(), outStatusCode)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(outStatusCode)
+			w.Write([]byte(outJSON))
+			return
+		}
+		performPush(apiConfig, params)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(body)
+		return
 	}
 
 	var tx *sql.Tx
@@ -798,9 +1053,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		lastJSON = []byte("[]")
 	}
 
-	// push 処理
-	performPush(apiConfig, params)
-
 	// SQL実行結果を固定順序の構造体で返す
 	type SQLResponse struct {
 		Success bool            `json:"success"`
@@ -812,10 +1064,26 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		Status:  200,
 		Result:  lastJSON,
 	}
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		log.Printf("Failed to encode JSON: %v", err)
+	body, err := json.Marshal(response)
+	if err != nil {
+		log.Printf("Failed to marshal JSON: %v", err)
+		sendJSONError(w, "Error formatting results", http.StatusInternalServerError)
+		return
 	}
+	if handled, outStatusCode, outJSON, err := runOutCheckScript(apiConfig, params, http.StatusOK, "application/json", body); handled {
+		if err != nil {
+			log.Printf("outCheck script error: %v", err)
+			sendJSONError(w, err.Error(), outStatusCode)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(outStatusCode)
+		w.Write([]byte(outJSON))
+		return
+	}
+	performPush(apiConfig, params)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(body)
 }
 
 func isSelectQuery(query string) bool {
@@ -1399,7 +1667,10 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 	if err != nil {
 		return false, 500, nil, "", fmt.Errorf("check script error: %v", err)
 	}
-	jsonStr := value.String()
+	jsonStr, err := checkResultToJSONString(value)
+	if err != nil {
+		return false, 500, nil, "", err
+	}
 	var result struct {
 		Success bool        `json:"success"`
 		Status  int         `json:"status"`
@@ -1409,6 +1680,21 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 		return false, 500, nil, jsonStr, fmt.Errorf("failed to unmarshal check result: %v", err)
 	}
 	return result.Success, result.Status, result.Error, jsonStr, nil
+}
+
+func checkResultToJSONString(value goja.Value) (string, error) {
+	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
+		return "", fmt.Errorf("check script must return JSON")
+	}
+	exported := value.Export()
+	if jsonStr, ok := exported.(string); ok {
+		return jsonStr, nil
+	}
+	b, err := json.Marshal(exported)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal check result: %v", err)
+	}
+	return string(b), nil
 }
 
 func getAPI(url, username, password string) (string, error) {
@@ -1574,12 +1860,13 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string
 		acceptedKeys = []string{}
 	}
 	nyanMode, _ := params["nyan_mode"].(string)
-	if nyanMode == "checkOnly" && apiConfig.Check == "" {
+	checkScriptPath := getParamCheckScriptPath(apiConfig)
+	if nyanMode == "checkOnly" && checkScriptPath == "" {
 		return "", fmt.Errorf("No check script for API %s", apiName)
 	}
 
-	if apiConfig.Check != "" {
-		success, statusCode, errorObj, jsonStr, err := runCheckScript(apiConfig.Check, params, acceptedKeys)
+	if checkScriptPath != "" {
+		success, statusCode, errorObj, jsonStr, err := runCheckScript(checkScriptPath, params, acceptedKeys)
 		if err != nil {
 			return "", fmt.Errorf("check script error: %v", err)
 		}
@@ -1607,6 +1894,12 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string
 			if err != nil {
 				return "", fmt.Errorf("failed to run API %s: %v", apiName, err)
 			}
+			if handled, _, outJSON, err := runOutCheckScript(apiConfig, params, http.StatusOK, "application/json", []byte(result)); handled {
+				if err != nil {
+					return "", fmt.Errorf("outCheck script error: %v", err)
+				}
+				return outJSON, nil
+			}
 			performPush(apiConfig, params)
 			return result, nil
 		}
@@ -1620,6 +1913,12 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string
 		result, err := runScript([]string{apiConfig.Script}, params)
 		if err != nil {
 			return "", fmt.Errorf("failed to run API %s: %v", apiName, err)
+		}
+		if handled, _, outJSON, err := runOutCheckScript(apiConfig, params, http.StatusOK, "application/json", []byte(result)); handled {
+			if err != nil {
+				return "", fmt.Errorf("outCheck script error: %v", err)
+			}
+			return outJSON, nil
 		}
 		performPush(apiConfig, params)
 		return result, nil
@@ -1696,8 +1995,6 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string
 		lastJSON = []byte("[]")
 	}
 
-	performPush(apiConfig, params)
-
 	response := SQLResponse{
 		Success: true,
 		Status:  200,
@@ -1707,6 +2004,13 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal SQL response for API %s: %v", apiName, err)
 	}
+	if handled, _, outJSON, err := runOutCheckScript(apiConfig, params, http.StatusOK, "application/json", b); handled {
+		if err != nil {
+			return "", fmt.Errorf("outCheck script error: %v", err)
+		}
+		return outJSON, nil
+	}
+	performPush(apiConfig, params)
 	return string(b), nil
 }
 
@@ -2064,6 +2368,24 @@ func respondJSONRPCError(w http.ResponseWriter, id interface{}, code int, messag
 	json.NewEncoder(w).Encode(resp)
 }
 
+func respondJSONRPCResultJSON(w http.ResponseWriter, id interface{}, statusCode int, jsonStr string) {
+	var result interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		respondJSONRPCError(w, id, -32603, "Failed to parse check result", err.Error())
+		return
+	}
+	rpcResp := JSONRPCResponse{
+		JSONRPC: "2.0",
+		Result:  result,
+		ID:      id,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	if err := json.NewEncoder(w).Encode(rpcResp); err != nil {
+		log.Printf("Failed to encode JSON-RPC response: %v", err)
+	}
+}
+
 func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 	// 1) リクエストボディを読み込み、JSONRPCRequestにパースする
 	body, err := ioutil.ReadAll(r.Body)
@@ -2122,8 +2444,9 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to get accepted params keys: %v", err)
 		acceptedKeys = []string{}
 	}
-	if apiConfig.Check != "" {
-		success, statusCode, errorObj, jsonStr, err := runCheckScript(apiConfig.Check, allParams, acceptedKeys)
+	checkScriptPath := getParamCheckScriptPath(apiConfig)
+	if checkScriptPath != "" {
+		success, statusCode, errorObj, jsonStr, err := runCheckScript(checkScriptPath, allParams, acceptedKeys)
 		if err != nil {
 			respondJSONRPCError(w, rpcReq.ID, -32603, "Check script error", err.Error())
 			return
@@ -2158,6 +2481,7 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 
 	// 5) メインの処理: Script または SQL の実行
 	var finalResult map[string]interface{}
+	var finalBody []byte
 	if apiConfig.Script != "" {
 		scriptResult, err := runScript([]string{apiConfig.Script}, allParams)
 		if err != nil {
@@ -2168,6 +2492,7 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 			respondJSONRPCError(w, rpcReq.ID, -32603, "Failed to parse script result as JSON", err.Error())
 			return
 		}
+		finalBody = []byte(scriptResult)
 	} else if len(apiConfig.SQL) > 0 {
 		var tx *sql.Tx
 		if len(apiConfig.SQL) > 1 {
@@ -2239,8 +2564,28 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 			"status":  200,
 			"result":  json.RawMessage(lastJSON),
 		}
+		finalBody, err = json.Marshal(finalResult)
+		if err != nil {
+			respondJSONRPCError(w, rpcReq.ID, -32603, "Failed to marshal SQL result", err.Error())
+			return
+		}
 	} else {
 		respondJSONRPCError(w, rpcReq.ID, -32603, "No script or SQL defined for this method", nil)
+		return
+	}
+
+	statusCode := 200
+	if st, ok := finalResult["status"].(float64); ok {
+		statusCode = int(st)
+	} else if st, ok := finalResult["status"].(int); ok {
+		statusCode = st
+	}
+	if handled, outStatusCode, outJSON, err := runOutCheckScript(apiConfig, allParams, statusCode, "application/json", finalBody); handled {
+		if err != nil {
+			respondJSONRPCError(w, rpcReq.ID, -32603, "outCheck script error", err.Error())
+			return
+		}
+		respondJSONRPCResultJSON(w, rpcReq.ID, outStatusCode, outJSON)
 		return
 	}
 
@@ -2248,9 +2593,10 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 	performPush(apiConfig, allParams)
 
 	// 7) 最終レスポンスの返却
-	statusCode := 200
 	if st, ok := finalResult["status"].(float64); ok {
 		statusCode = int(st)
+		delete(finalResult, "status")
+	} else if _, ok := finalResult["status"].(int); ok {
 		delete(finalResult, "status")
 	}
 	rpcResp := JSONRPCResponse{
