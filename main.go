@@ -9,7 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -229,6 +229,7 @@ func main() {
 	adjustPaths(execDir, &config)
 	setupLogger(execDir)
 	log.Printf("Binary version: %s", buildVersion)
+	log.Printf("Go runtime version: %s", runtime.Version())
 	log.Printf("Config version: %s", config.Version)
 
 	db, err = connectDB(config)
@@ -377,7 +378,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 func loadSQLFiles(execDir string) {
 	apiFilePath := filepath.Join(execDir, "api.json")
-	data, err := ioutil.ReadFile(apiFilePath)
+	data, err := os.ReadFile(apiFilePath)
 	if err != nil {
 		log.Fatalf("Failed to read SQL files config: %v", err)
 	}
@@ -472,7 +473,7 @@ func isCheckOnlyMode(params map[string]interface{}) bool {
 func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 	contentType := r.Header.Get("Content-Type")
 	if strings.HasPrefix(contentType, "application/json") {
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			return nil, fmt.Errorf("error reading request body: %v", err)
 		}
@@ -984,7 +985,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	var lastJSON []byte
 	for _, sqlPath := range apiConfig.SQL {
-		query, err := ioutil.ReadFile(sqlPath)
+		query, err := os.ReadFile(sqlPath)
 		if err != nil {
 			log.Printf("Failed to read SQL file: %v", err)
 			sendJSONError(w, "Error reading SQL file", http.StatusInternalServerError)
@@ -1377,7 +1378,7 @@ func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
 func parseSQLParams(filePaths []string) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
 	for _, filePath := range filePaths {
-		data, err := ioutil.ReadFile(filePath)
+		data, err := os.ReadFile(filePath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read file %s: %v", filePath, err)
 		}
@@ -1573,7 +1574,7 @@ func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	}
 
 	// SQLファイルの読み込み
-	sqlContent, err := ioutil.ReadFile(sqlFilePath)
+	sqlContent, err := os.ReadFile(sqlFilePath)
 	if err != nil {
 		panic(vm.ToValue(fmt.Sprintf("failed to read SQL file %s: %v", sqlFilePath, err)))
 	}
@@ -1646,14 +1647,14 @@ func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, string, error) {
 	var combinedScript strings.Builder
 	for _, includePath := range config.JavascriptInclude {
-		content, err := ioutil.ReadFile(includePath)
+		content, err := os.ReadFile(includePath)
 		if err != nil {
 			return false, 500, nil, "", fmt.Errorf("failed to read javascript include file %s: %v", includePath, err)
 		}
 		combinedScript.Write(content)
 		combinedScript.WriteString("\n")
 	}
-	checkContent, err := ioutil.ReadFile(apiCheckScriptPath)
+	checkContent, err := os.ReadFile(apiCheckScriptPath)
 	if err != nil {
 		return false, 500, nil, "", fmt.Errorf("failed to read check script %s: %v", apiCheckScriptPath, err)
 	}
@@ -1711,7 +1712,7 @@ func getAPI(url, username, password string) (string, error) {
 		return "", fmt.Errorf("error sending request: %v", err)
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("error reading response: %v", err)
 	}
@@ -1748,7 +1749,7 @@ func jsonAPI(url string, jsonData []byte, username, password string, headers map
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -1792,7 +1793,7 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 	var combinedScript strings.Builder
 
 	for _, includePath := range config.JavascriptInclude {
-		content, err := ioutil.ReadFile(includePath)
+		content, err := os.ReadFile(includePath)
 		if err != nil {
 			return "", fmt.Errorf("failed to read javascript include file %s: %v", includePath, err)
 		}
@@ -1800,7 +1801,7 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 		combinedScript.WriteString("\n")
 	}
 	for _, scriptPath := range scriptPaths {
-		content, err := ioutil.ReadFile(scriptPath)
+		content, err := os.ReadFile(scriptPath)
 		if err != nil {
 			return "", fmt.Errorf("failed to read script file %s: %v", scriptPath, err)
 		}
@@ -1939,7 +1940,7 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string
 
 	var lastJSON []byte
 	for _, sqlPath := range apiConfig.SQL {
-		query, err := ioutil.ReadFile(sqlPath)
+		query, err := os.ReadFile(sqlPath)
 		if err != nil {
 			return "", fmt.Errorf("failed to read SQL file for API %s: %v", apiName, err)
 		}
@@ -2149,7 +2150,7 @@ func normalizeSQL(sqlText string) string {
 func executeAPIConfig(apiConfig APIConfig) ([]byte, error) {
 	// ここでは、SQLが設定されている場合、最初のSQLファイルを実行する例です
 	if len(apiConfig.SQL) > 0 {
-		query, err := ioutil.ReadFile(apiConfig.SQL[0])
+		query, err := os.ReadFile(apiConfig.SQL[0])
 		if err != nil {
 			return nil, fmt.Errorf("failed to read SQL file: %v", err)
 		}
@@ -2304,7 +2305,7 @@ func nyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 
 // parseScriptConstants は、指定されたスクリプトファイルから定数をパースします。
 func parseScriptConstants(scriptPath string) (map[string]interface{}, []string, error) {
-	data, err := ioutil.ReadFile(scriptPath)
+	data, err := os.ReadFile(scriptPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read script file %s: %v", scriptPath, err)
 	}
@@ -2388,7 +2389,7 @@ func respondJSONRPCResultJSON(w http.ResponseWriter, id interface{}, statusCode 
 
 func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 	// 1) リクエストボディを読み込み、JSONRPCRequestにパースする
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		respondJSONRPCError(w, nil, -32700, "Parse error (failed to read body)", err.Error())
 		return
@@ -2505,7 +2506,7 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 		}
 		var lastJSON []byte
 		for _, sqlPath := range apiConfig.SQL {
-			query, err := ioutil.ReadFile(sqlPath)
+			query, err := os.ReadFile(sqlPath)
 			if err != nil {
 				respondJSONRPCError(w, rpcReq.ID, -32603, "Error reading SQL file", err.Error())
 				return
