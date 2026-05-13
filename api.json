@@ -51,6 +51,15 @@
     "script": "./javascript/nyan_callme_check.js",
     "description": "nyanCallMe の存在確認と内部API呼び出し結果を返します。"
   },
+  "schedule_debug_every_minute": {
+    "type": "schedule",
+    "script": "./javascript/schedule_debug.js",
+    "trigger": {
+      "type": "cron",
+      "value": "*/10 * * * *"
+    },
+    "description": "schedule の動作確認用。1分ごとにログへ実行時刻を出力します。"
+  },
   "websocket_clients_local": {
     "type": "ws_client",
     "script": "./javascript/ws/receiver_main.js",
