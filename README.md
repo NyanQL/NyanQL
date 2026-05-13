@@ -762,6 +762,73 @@ scriptが空文字を返した場合、接続先へ返信しません。空で�
 
 ---
 
+## 定期実行ジョブ
+
+`api.json` で `type: "schedule"` を指定すると、NyanQLの起動時に定期実行ジョブとして登録されます。
+
+```json
+{
+  "dailyJob": {
+    "type": "schedule",
+    "script": "./javascript/daily_job.js",
+    "trigger": {
+      "type": "cron",
+      "value": "0 10 * * *"
+    },
+    "description": "毎日10:00に実行します"
+  }
+}
+```
+
+この例では、毎日10:00に `./javascript/daily_job.js` が実行されます。`type: "schedule"` の定義はHTTP APIとしては公開されないため、外部リクエストから直接実行されません。
+
+cronは5フィールド形式です。
+
+```text
+分 時 日 月 曜日
+```
+
+たとえば、次のように指定できます。
+
+| cron | 実行タイミング |
+|---|---|
+| `* * * * *` | 1分ごと |
+| `*/10 * * * *` | 10分ごと |
+| `0 10 * * *` | 毎日10:00 |
+| `15,45 * * * *` | 毎時15分と45分 |
+| `0 9-18 * * *` | 9時から18時まで毎時0分 |
+
+現在の実装では秒単位の指定には対応していません。最短の実行間隔は1分です。`*/10` は「起動してから10分ごと」ではなく、crontabと同じく時計の分が `00, 10, 20, 30, 40, 50` のタイミングで実行されます。
+
+scheduleのscript内では、通常のscriptと同じように `nyanAllParams` や `nyanRunSQL()` などを使えます。加えて、次の値が `nyanAllParams` に入ります。
+
+| 名前 | 内容 |
+|---|---|
+| `nyanAllParams.nyan_job_name` | `api.json` 上のジョブ名です。 |
+| `nyanAllParams.nyan_schedule_trigger_type` | 現在は `cron` です。 |
+| `nyanAllParams.nyan_schedule_trigger` | cron式です。 |
+| `nyanAllParams.nyan_schedule_time` | 実行予定時刻です。 |
+
+動作確認用のscript例です。
+
+```js
+const now = new Date();
+
+console.log(
+  "[schedule_debug]",
+  "executed_at=" + now.toISOString(),
+  "job=" + nyanAllParams.nyan_job_name,
+  "scheduled_at=" + nyanAllParams.nyan_schedule_time,
+  "trigger=" + nyanAllParams.nyan_schedule_trigger
+);
+
+"schedule_debug executed at " + now.toISOString();
+```
+
+`javascript_include` に設定した共通JavaScriptは、scheduleのscript実行時にも毎回読み込まれます。
+
+---
+
 ## JSON-RPC
 
 NyanQLは、通常のHTTP APIに加えて、JSON-RPC 2.0形式でも呼び出せます。
