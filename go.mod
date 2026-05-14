@@ -1,8 +1,6 @@
 module NyanQL
 
-go 1.24
-
-toolchain go1.24.0
+go 1.26.3
 
 require (
 	github.com/dop251/goja v0.0.0-20250125213203-5ef83b82af17
