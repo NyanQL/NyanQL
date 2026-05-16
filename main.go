@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -200,6 +201,16 @@ var sqlFiles map[string]APIConfig
 var dbType string
 var buildVersion = "v0.0.20"
 
+type serviceFilePath struct {
+	Path   string
+	Source string
+}
+
+type serviceFilePaths struct {
+	API    serviceFilePath
+	Config serviceFilePath
+}
+
 const (
 	apiTypeAPI      = "api"
 	apiTypeWSClient = "ws_client"
@@ -218,6 +229,61 @@ var upgrader = websocket.Upgrader{
 
 var hub *Hub
 
+func resolveServiceFilePaths(execDir string, args []string) (serviceFilePaths, error) {
+	flags := flag.NewFlagSet("NyanQL", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	apiFlag := flags.String("api", "", "path to api.json")
+	configFlag := flags.String("config", "", "path to config.json")
+	if err := flags.Parse(args); err != nil {
+		return serviceFilePaths{}, err
+	}
+
+	apiPath, apiSource := chooseServiceFilePath(*apiFlag, "NYAN_API_PATH", filepath.Join(execDir, "api.json"), "--api")
+	configPath, configSource := chooseServiceFilePath(*configFlag, "NYAN_CONFIG_PATH", filepath.Join(execDir, "config.json"), "--config")
+
+	resolvedAPIPath, err := resolveExistingServiceFilePath(apiPath, "api", apiSource)
+	if err != nil {
+		return serviceFilePaths{}, err
+	}
+	resolvedConfigPath, err := resolveExistingServiceFilePath(configPath, "config", configSource)
+	if err != nil {
+		return serviceFilePaths{}, err
+	}
+
+	return serviceFilePaths{
+		API:    serviceFilePath{Path: resolvedAPIPath, Source: apiSource},
+		Config: serviceFilePath{Path: resolvedConfigPath, Source: configSource},
+	}, nil
+}
+
+func chooseServiceFilePath(cliValue, envName, defaultPath, cliSource string) (string, string) {
+	if strings.TrimSpace(cliValue) != "" {
+		return cliValue, cliSource
+	}
+	if envValue := strings.TrimSpace(os.Getenv(envName)); envValue != "" {
+		return envValue, envName
+	}
+	return defaultPath, "default"
+}
+
+func resolveExistingServiceFilePath(pathValue, label, source string) (string, error) {
+	resolvedPath, err := filepath.Abs(pathValue)
+	if err != nil {
+		return "", fmt.Errorf("%s file path could not be resolved: %s (source: %s): %w", label, pathValue, source, err)
+	}
+	info, err := os.Stat(resolvedPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("%s file not found: %s (source: %s)", label, resolvedPath, source)
+		}
+		return "", fmt.Errorf("%s file cannot be accessed: %s (source: %s): %w", label, resolvedPath, source, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("%s file is a directory: %s (source: %s)", label, resolvedPath, source)
+	}
+	return resolvedPath, nil
+}
+
 // main
 func main() {
 	execDir, err := os.Executable()
@@ -226,8 +292,12 @@ func main() {
 	}
 	execDir = filepath.Dir(execDir)
 
-	configFilePath := filepath.Join(execDir, "config.json")
-	configFile, err := os.Open(configFilePath)
+	paths, err := resolveServiceFilePaths(execDir, os.Args[1:])
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	configFile, err := os.Open(paths.Config.Path)
 	if err != nil {
 		log.Fatalf("Failed to open config file: %v", err)
 	}
@@ -235,21 +305,25 @@ func main() {
 	if err = json.NewDecoder(configFile).Decode(&config); err != nil {
 		log.Fatalf("Failed to decode config JSON: %v", err)
 	}
-	adjustPaths(execDir, &config)
-	setupLogger(execDir)
+	configBaseDir := filepath.Dir(paths.Config.Path)
+	apiBaseDir := filepath.Dir(paths.API.Path)
+	adjustPaths(configBaseDir, &config)
+	setupLogger(configBaseDir)
 	log.Printf("Binary version: %s", buildVersion)
 	log.Printf("Go runtime version: %s", runtime.Version())
+	log.Printf("Config file: %s (source: %s)", paths.Config.Path, paths.Config.Source)
+	log.Printf("API file: %s (source: %s)", paths.API.Path, paths.API.Source)
 	log.Printf("Config version: %s", config.Version)
 
 	db, err = connectDB(config)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
-	loadSQLFiles(execDir)
-	if err := startWebSocketClients(execDir); err != nil {
+	loadSQLFiles(paths.API.Path, apiBaseDir)
+	if err := startWebSocketClients(apiBaseDir); err != nil {
 		log.Printf("Failed to start WebSocket clients: %v", err)
 	}
-	if err := startScheduleJobs(execDir); err != nil {
+	if err := startScheduleJobs(apiBaseDir); err != nil {
 		log.Printf("Failed to start schedule jobs: %v", err)
 	}
 
@@ -388,8 +462,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func loadSQLFiles(execDir string) {
-	apiFilePath := filepath.Join(execDir, "api.json")
+func loadSQLFiles(apiFilePath, apiBaseDir string) {
 	data, err := os.ReadFile(apiFilePath)
 	if err != nil {
 		log.Fatalf("Failed to read SQL files config: %v", err)
@@ -406,14 +479,24 @@ func loadSQLFiles(execDir string) {
 	for apiKey, apiConfig := range sqlFiles {
 		for i, sqlPath := range apiConfig.SQL {
 			if !filepath.IsAbs(sqlPath) {
-				sqlFiles[apiKey].SQL[i] = filepath.Join(execDir, sqlPath)
+				sqlFiles[apiKey].SQL[i] = filepath.Join(apiBaseDir, sqlPath)
 			}
 		}
+		apiConfig.Script = resolvePathFromBase(apiBaseDir, apiConfig.Script)
+		apiConfig.ParamCheck = resolvePathFromBase(apiBaseDir, apiConfig.ParamCheck)
+		apiConfig.OutCheck = resolvePathFromBase(apiBaseDir, apiConfig.OutCheck)
 		if apiConfig.Path != "" && !filepath.IsAbs(apiConfig.Path) {
-			apiConfig.Path = filepath.Join(execDir, apiConfig.Path)
-			sqlFiles[apiKey] = apiConfig
+			apiConfig.Path = filepath.Join(apiBaseDir, apiConfig.Path)
 		}
+		sqlFiles[apiKey] = apiConfig
 	}
+}
+
+func resolvePathFromBase(baseDir, pathValue string) string {
+	if strings.TrimSpace(pathValue) == "" || filepath.IsAbs(pathValue) {
+		return pathValue
+	}
+	return filepath.Join(baseDir, pathValue)
 }
 
 func getAPIType(apiConfig APIConfig) string {
@@ -1043,8 +1126,8 @@ func websocketMessageTypeLabel(t int) string {
 	}
 }
 
-func setupLogger(execDir string) {
-	logFilePath := filepath.Join(execDir, config.Log.Filename)
+func setupLogger(configBaseDir string) {
+	logFilePath := resolvePathFromBase(configBaseDir, config.Log.Filename)
 	if config.Log.EnableLogging {
 		log.SetOutput(&lumberjack.Logger{
 			Filename:   logFilePath,
@@ -2512,16 +2595,19 @@ func nyanHostExecWrapper(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	return vm.ToValue(out)
 }
 
-func adjustPaths(execDir string, config *Config) {
+func adjustPaths(configBaseDir string, config *Config) {
 	if config.CertPath != "" && !filepath.IsAbs(config.CertPath) {
-		config.CertPath = filepath.Join(execDir, config.CertPath)
+		config.CertPath = filepath.Join(configBaseDir, config.CertPath)
 	}
 	if config.KeyPath != "" && !filepath.IsAbs(config.KeyPath) {
-		config.KeyPath = filepath.Join(execDir, config.KeyPath)
+		config.KeyPath = filepath.Join(configBaseDir, config.KeyPath)
 	}
 	// sqlite と duckdb の場合、DBName が相対パスなら絶対パスに変換
 	if (config.DatabaseType == "sqlite" || config.DatabaseType == "duckdb") && config.DBName != "" && !filepath.IsAbs(config.DBName) {
-		config.DBName = filepath.Join(execDir, config.DBName)
+		config.DBName = filepath.Join(configBaseDir, config.DBName)
+	}
+	for i, includePath := range config.JavascriptInclude {
+		config.JavascriptInclude[i] = resolvePathFromBase(configBaseDir, includePath)
 	}
 }
 
