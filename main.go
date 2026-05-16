@@ -198,7 +198,7 @@ var config Config
 var db *sql.DB
 var sqlFiles map[string]APIConfig
 var dbType string
-var buildVersion = "v0.0.18"
+var buildVersion = "v0.0.20"
 
 const (
 	apiTypeAPI      = "api"
