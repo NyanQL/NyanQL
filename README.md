@@ -94,8 +94,11 @@ SELECT句の `AS` で指定した列名が、そのままJSONの項目名にな�
 - PostgreSQL
 - SQLite
 - DuckDB
+- MagicaDB
 
-`config.json` の `DBType` に、`mysql`、`postgres`、`sqlite`、`duckdb` のいずれかを指定します。
+`config.json` の `DBType` に、`mysql`、`postgres`、`sqlite`、`duckdb`、`magicadb` のいずれかを指定します。
+
+MagicaDB は、`magicadb serve` のHTTP APIではなく、Goの `database/sql` driver として接続します。NyanQL内蔵 backend として使う場合は、NyanQL process がDBファイルを直接開きます。
 
 ---
 
@@ -182,12 +185,78 @@ Windowsでは、ビルド済みの実行ファイルをダブルクリックし�
 | `version` | `/nyan` で返す設定上のバージョンです。 |
 | `Port` | NyanQLが待ち受けるポート番号です。 |
 | `CertPath`, `KeyPath` | 両方を指定するとHTTPSで起動します。空ならHTTPで起動します。 |
-| `DBType` | `mysql`、`postgres`、`sqlite`、`duckdb` のいずれかを指定します。 |
-| `DBName` | データベース名、またはSQLite/DuckDBのファイルパスです。 |
+| `DBType` | `mysql`、`postgres`、`sqlite`、`duckdb`、`magicadb` のいずれかを指定します。 |
+| `DBName` | データベース名、またはSQLite/DuckDB/MagicaDBのファイルパスです。 |
 | `BasicAuth` | API呼び出し時のBasic認証ユーザ名とパスワードです。 |
 | `javascript_include` | `check` や `script` の実行前に読み込む共通JavaScriptです。 |
 
-SQLiteとDuckDBでは、`DBName` に相対パスを書いた場合、実行ファイルがある場所を基準にして扱われます。
+SQLite、DuckDB、MagicaDBでは、`DBName` に相対パスを書いた場合、実行ファイルがある場所を基準にして扱われます。
+
+### MagicaDBを使う設定例
+
+```json
+{
+  "name": "NyanQL MagicaDB Sample",
+  "profile": "MagicaDB backend test",
+  "version": "v1.0.0",
+  "Port": 8443,
+  "CertPath": "",
+  "KeyPath": "",
+  "DBType": "magicadb",
+  "DBUser": "",
+  "DBPassword": "",
+  "DBName": "magicadb.db",
+  "DBHost": "",
+  "DBPort": "",
+  "MaxOpenConnections": 1,
+  "MaxIdleConnections": 1,
+  "ConnMaxLifetimeSeconds": 3600,
+  "BasicAuth": {
+    "Username": "admin",
+    "Password": "secret"
+  },
+  "log": {
+    "Filename": "./logs/nyanql.log",
+    "MaxSize": 5,
+    "MaxBackups": 3,
+    "MaxAge": 7,
+    "Compress": true,
+    "EnableLogging": true
+  },
+  "javascript_include": [
+    "./javascript/common.js"
+  ]
+}
+```
+
+MagicaDBの `DBName` はDBファイルのパスです。`:memory:` もdriverとしては使えますが、通常運用ではファイルパスを指定することを想定しています。最初は `MaxOpenConnections` と `MaxIdleConnections` を `1` にすることを推奨します。
+
+起動中の `magicadb serve` が開いているDBファイルを、NyanQLが `database/sql` で同時に直接開く運用は避けてください。既に起動している `magicadb serve` に接続したい場合は、この `database/sql` backend ではなく、MagicaDB HTTP API client backend として別に設計する必要があります。
+
+#### MagicaDB依存関係の注意
+
+NyanQLではMagicaDB driverを次のimport pathで読み込みます。
+
+```go
+_ "github.com/genjidb/genji/driver"
+```
+
+現時点ではMagicaDB側のmodule宣言が `github.com/genjidb/genji` のため、`go.mod` では `replace` を使って `github.com/ahabu/MagicaDB` から解決します。
+
+```go
+require github.com/genjidb/genji v0.0.0-20260524200203-ea13a5f98857
+
+replace github.com/genjidb/genji => github.com/ahabu/MagicaDB v0.0.0-20260524200203-ea13a5f98857
+```
+
+`github.com/ahabu/MagicaDB` がprivate repository、またはSSH認証が必要な環境では、ビルドする開発環境で次のような設定が必要になる場合があります。
+
+```bash
+go env -w GOPRIVATE=github.com/ahabu/MagicaDB
+git config --global url.git@github.com:.insteadOf https://github.com/
+```
+
+公開tagやmodule pathが整理された段階では、上記のpseudo-versionや `replace` は実際のversionに置き換えてください。
 
 ---
 
@@ -319,6 +388,8 @@ SQL実行が成功した場合は、次の形式で返ります。
   "result": {}
 }
 ```
+
+MagicaDB driverなど、`RowsAffected()` を保証しないdriverでは、更新件数を取得できない場合があります。その場合でもSQL実行自体が成功していればAPIエラーにはせず、NyanQLはログに記録して処理を継続します。JavaScript helperで更新系SQLを実行した場合、`rowsAffected` は `null` になることがあります。
 
 エラー時は、次のような形式で返ります。
 
