@@ -25,6 +25,7 @@ import (
 
 	"github.com/dop251/goja"
 	_ "github.com/duckdb/duckdb-go/v2"
+	_ "github.com/genjidb/genji/driver"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/websocket"
 	_ "github.com/lib/pq"
@@ -1086,6 +1087,12 @@ func connectDB(config Config) (*sql.DB, error) {
 		// DBNameにファイルパスが入っていると仮定
 		dsn = config.DBName
 
+	case "magicadb":
+		// MagicaDB/Genjiの場合
+		driverName = "genji"
+		// DBNameにファイルパスが入っていると仮定
+		dsn = config.DBName
+
 	default:
 		return nil, fmt.Errorf("unsupported database type: %s", config.DatabaseType)
 	}
@@ -1291,11 +1298,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			}
 			rowsAffected, err := result.RowsAffected()
 			if err != nil {
-				log.Printf("Failed to retrieve rows affected: %v", err)
-				sendJSONError(w, "Error retrieving rows affected", http.StatusInternalServerError)
-				return
+				log.Printf("RowsAffected unsupported for %s: %v", dbType, err)
+			} else {
+				log.Printf("Rows affected: %d", rowsAffected)
 			}
-			log.Printf("Rows affected: %d", rowsAffected)
 			lastJSON = []byte("{}")
 		}
 	}
@@ -1887,12 +1893,14 @@ func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 		if err != nil {
 			panic(vm.ToValue(fmt.Sprintf("error executing SQL query: %v", err)))
 		}
-		affected, err := result.RowsAffected()
-		if err != nil {
-			panic(vm.ToValue(fmt.Sprintf("error retrieving rows affected: %v", err)))
+		var rowsAffected *int64
+		if affected, err := result.RowsAffected(); err != nil {
+			log.Printf("RowsAffected unsupported for %s: %v", dbType, err)
+		} else {
+			rowsAffected = &affected
 		}
 		response := map[string]interface{}{
-			"rowsAffected": affected,
+			"rowsAffected": rowsAffected,
 		}
 		jsonResp, _ := json.Marshal(response)
 		var res interface{}
@@ -2238,9 +2246,10 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string
 			}
 			rowsAffected, err := result.RowsAffected()
 			if err != nil {
-				return "", fmt.Errorf("failed to get rows affected for API %s: %v", apiName, err)
+				log.Printf("RowsAffected unsupported for %s in API %s: %v", dbType, apiName, err)
+			} else {
+				log.Printf("Rows affected: %d", rowsAffected)
 			}
-			log.Printf("Rows affected: %d", rowsAffected)
 			lastJSON = []byte("{}")
 		}
 	}
@@ -2519,8 +2528,8 @@ func adjustPaths(execDir string, config *Config) {
 	if config.KeyPath != "" && !filepath.IsAbs(config.KeyPath) {
 		config.KeyPath = filepath.Join(execDir, config.KeyPath)
 	}
-	// sqlite と duckdb の場合、DBName が相対パスなら絶対パスに変換
-	if (config.DatabaseType == "sqlite" || config.DatabaseType == "duckdb") && config.DBName != "" && !filepath.IsAbs(config.DBName) {
+	// file DB の場合、DBName が相対パスなら絶対パスに変換
+	if (config.DatabaseType == "sqlite" || config.DatabaseType == "duckdb" || config.DatabaseType == "magicadb") && config.DBName != "" && !filepath.IsAbs(config.DBName) {
 		config.DBName = filepath.Join(execDir, config.DBName)
 	}
 }
@@ -2803,10 +2812,10 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 				}
 				rowsAffected, err := result.RowsAffected()
 				if err != nil {
-					respondJSONRPCError(w, rpcReq.ID, -32603, "Error retrieving rows affected", err.Error())
-					return
+					log.Printf("RowsAffected unsupported for %s: %v", dbType, err)
+				} else {
+					log.Printf("Rows affected: %d", rowsAffected)
 				}
-				log.Printf("Rows affected: %d", rowsAffected)
 				lastJSON = []byte("{}")
 			}
 		}
