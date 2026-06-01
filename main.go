@@ -593,6 +593,13 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 			continue
 		}
 		val := values[0]
+		if strings.HasPrefix(val, "{") && strings.HasSuffix(val, "}") {
+			var obj map[string]interface{}
+			if err := json.Unmarshal([]byte(val), &obj); err == nil {
+				params[key] = obj
+				continue
+			}
+		}
 		if strings.HasPrefix(val, "[") && strings.HasSuffix(val, "]") {
 			var arr []interface{}
 			if err := json.Unmarshal([]byte(val), &arr); err == nil {
@@ -1181,7 +1188,7 @@ func connectDB(config Config) (*sql.DB, error) {
 	}
 
 	// グローバル変数などでDB種類を後から参照する場合があればセット
-	dbType = driverName
+	dbType = config.DatabaseType
 
 	// ここでDB接続をオープン。実際にはまだ物理コネクションは張られない可能性あり
 	db, err := sql.Open(driverName, dsn)
@@ -1469,110 +1476,290 @@ func isSelectQuery(query string) bool {
 }
 
 func prepareQueryWithParams(query string, params map[string]interface{}) (string, []interface{}) {
-	re := regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
-
 	var args []interface{}
 	placeholderCounter := 1
 
-	replacedQuery := re.ReplaceAllStringFunc(query, func(match string) string {
-		groups := re.FindStringSubmatch(match)
-		paramName := strings.TrimSpace(groups[1])
+	nextPlaceholder := func() string {
+		if dbType == "postgres" {
+			place := fmt.Sprintf("$%d", placeholderCounter)
+			placeholderCounter++
+			return place
+		}
+		placeholderCounter++
+		return "?"
+	}
+
+	appendSingleArg := func(value interface{}) string {
+		args = append(args, value)
+		return nextPlaceholder()
+	}
+
+	var out strings.Builder
+	for i := 0; i < len(query); {
+		start := strings.Index(query[i:], "/*")
+		if start < 0 {
+			out.WriteString(query[i:])
+			break
+		}
+		start += i
+		end := strings.Index(query[start+2:], "*/")
+		if end < 0 {
+			out.WriteString(query[i:])
+			break
+		}
+		end += start + 2
+
+		paramName := strings.TrimSpace(query[start+2 : end])
+		defaultStart, defaultEnd, defaultLiteral, ok := scanSQLCommentParameterDefault(query, end+2)
+		if !ok || strings.Contains(paramName, "*") || strings.Contains(paramName, "/") {
+			out.WriteString(query[i : end+2])
+			i = end + 2
+			continue
+		}
+
+		out.WriteString(query[i:start])
 
 		// パラメータ取得
 		value, ok := params[paramName]
 		if !ok {
-			args = append(args, nil)
-			if dbType == "postgres" {
-				place := fmt.Sprintf("$%d", placeholderCounter)
-				placeholderCounter++
-				return place
-			}
-			return "?"
+			out.WriteString(appendSingleArg(nil))
+			i = defaultEnd
+			continue
 		}
+		value = coerceSQLCommentParameterValue(value, defaultLiteral)
 
 		rv := reflect.ValueOf(value)
 		if !rv.IsValid() {
-			args = append(args, nil)
-			if dbType == "postgres" {
-				place := fmt.Sprintf("$%d", placeholderCounter)
-				placeholderCounter++
-				return place
-			}
-			return "?"
+			out.WriteString(appendSingleArg(nil))
+			i = defaultEnd
+			continue
 		}
 
 		// --- JSONB/文字列系の特別扱い ---
 		// []byte は 1つの値として扱う
 		if b, ok := value.([]byte); ok {
-			args = append(args, string(b))
-			place := "?"
-			if dbType == "postgres" {
-				place = fmt.Sprintf("$%d", placeholderCounter)
-			}
-			placeholderCounter++
-			return place
+			out.WriteString(appendSingleArg(string(b)))
+			i = defaultEnd
+			continue
 		}
 
 		// json.RawMessage も 1つの値として扱う
 		if jm, ok := value.(json.RawMessage); ok {
-			args = append(args, string(jm))
-			place := "?"
-			if dbType == "postgres" {
-				place = fmt.Sprintf("$%d", placeholderCounter)
+			if dbType == "magicadb" {
+				var decoded interface{}
+				if err := json.Unmarshal(jm, &decoded); err == nil {
+					out.WriteString(appendSingleArg(decoded))
+				} else {
+					out.WriteString(appendSingleArg(string(jm)))
+				}
+			} else {
+				out.WriteString(appendSingleArg(string(jm)))
 			}
-			placeholderCounter++
-			return place
+			i = defaultEnd
+			continue
 		}
 
 		// map や struct は JSON に変換して 1値として扱う
 		kind := rv.Kind()
 		if kind == reflect.Map || kind == reflect.Struct {
-			jb, err := json.Marshal(value)
-			if err != nil {
+			if dbType == "magicadb" {
 				args = append(args, value)
 			} else {
-				args = append(args, string(jb))
+				jb, err := json.Marshal(value)
+				if err != nil {
+					args = append(args, value)
+				} else {
+					args = append(args, string(jb))
+				}
 			}
-			place := "?"
-			if dbType == "postgres" {
-				place = fmt.Sprintf("$%d", placeholderCounter)
-			}
-			placeholderCounter++
-			return place
+			out.WriteString(nextPlaceholder())
+			i = defaultEnd
+			continue
 		}
 
 		// --- 通常のスライスは IN (...) 展開 ---
 		if kind == reflect.Slice {
 			n := rv.Len()
 			if n == 0 {
-				return "NULL"
+				out.WriteString("NULL")
+				i = defaultEnd
+				continue
 			}
 			placeholders := make([]string, 0, n)
 			for i := 0; i < n; i++ {
 				args = append(args, rv.Index(i).Interface())
-				var p string
-				if dbType == "postgres" {
-					p = fmt.Sprintf("$%d", placeholderCounter)
-				} else {
-					p = "?"
-				}
-				placeholders = append(placeholders, p)
-				placeholderCounter++
+				placeholders = append(placeholders, nextPlaceholder())
 			}
-			return strings.Join(placeholders, ",")
+			out.WriteString(strings.Join(placeholders, ","))
+			i = defaultEnd
+			continue
 		}
 
 		// --- 通常の単一値 ---
-		args = append(args, value)
-		place := "?"
-		if dbType == "postgres" {
-			place = fmt.Sprintf("$%d", placeholderCounter)
-		}
-		placeholderCounter++
-		return place
-	})
+		out.WriteString(appendSingleArg(value))
+		i = defaultEnd
 
-	return replacedQuery, args
+		_ = defaultStart
+	}
+
+	return out.String(), args
+}
+
+func scanSQLCommentParameterDefault(query string, pos int) (int, int, string, bool) {
+	for pos < len(query) && isSQLSpace(query[pos]) {
+		pos++
+	}
+	if pos >= len(query) {
+		return pos, pos, "", false
+	}
+	start := pos
+	switch query[pos] {
+	case '\'', '"':
+		end, ok := scanSQLQuotedLiteral(query, pos)
+		if !ok {
+			return start, pos, "", false
+		}
+		return start, end, query[start:end], true
+	case '{':
+		end, ok := scanBalancedJSONLikeLiteral(query, pos, '{', '}')
+		if !ok {
+			return start, pos, "", false
+		}
+		return start, end, query[start:end], true
+	case '[':
+		end, ok := scanBalancedJSONLikeLiteral(query, pos, '[', ']')
+		if !ok {
+			return start, pos, "", false
+		}
+		return start, end, query[start:end], true
+	default:
+		for pos < len(query) && !isSQLSpace(query[pos]) && !strings.ContainsRune(",;)", rune(query[pos])) {
+			pos++
+		}
+		if pos == start {
+			return start, pos, "", false
+		}
+		return start, pos, query[start:pos], true
+	}
+}
+
+func scanSQLQuotedLiteral(query string, pos int) (int, bool) {
+	quote := query[pos]
+	pos++
+	for pos < len(query) {
+		if query[pos] == '\\' {
+			pos += 2
+			continue
+		}
+		if query[pos] == quote {
+			if pos+1 < len(query) && query[pos+1] == quote {
+				pos += 2
+				continue
+			}
+			return pos + 1, true
+		}
+		pos++
+	}
+	return pos, false
+}
+
+func scanBalancedJSONLikeLiteral(query string, pos int, open, close byte) (int, bool) {
+	depth := 0
+	for pos < len(query) {
+		switch query[pos] {
+		case '\'', '"':
+			end, ok := scanSQLQuotedLiteral(query, pos)
+			if !ok {
+				return pos, false
+			}
+			pos = end
+			continue
+		case open:
+			depth++
+		case close:
+			depth--
+			if depth == 0 {
+				return pos + 1, true
+			}
+		}
+		pos++
+	}
+	return pos, false
+}
+
+func isSQLSpace(b byte) bool {
+	return b == ' ' || b == '\n' || b == '\r' || b == '\t'
+}
+
+func coerceSQLCommentParameterValue(value interface{}, defaultLiteral string) interface{} {
+	defaultLiteral = strings.TrimSpace(defaultLiteral)
+	if defaultLiteral == "" {
+		return value
+	}
+
+	if raw, ok := value.(string); ok {
+		raw = strings.TrimSpace(raw)
+		if (strings.HasPrefix(defaultLiteral, "{") && strings.HasSuffix(defaultLiteral, "}")) ||
+			(strings.HasPrefix(defaultLiteral, "[") && strings.HasSuffix(defaultLiteral, "]")) {
+			var decoded interface{}
+			if err := json.Unmarshal([]byte(raw), &decoded); err == nil {
+				return decoded
+			}
+			return value
+		}
+
+		if isSQLNumericLiteral(defaultLiteral) {
+			if unquoted, ok := decodeJSONStringLiteral(raw); ok {
+				raw = unquoted
+			}
+			if strings.ContainsAny(defaultLiteral, ".eE") {
+				if n, err := strconv.ParseFloat(raw, 64); err == nil {
+					return n
+				}
+				return value
+			}
+			if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
+				return n
+			}
+			if n, err := strconv.ParseFloat(raw, 64); err == nil {
+				return n
+			}
+			return value
+		}
+
+		if strings.EqualFold(defaultLiteral, "true") || strings.EqualFold(defaultLiteral, "false") {
+			if b, err := strconv.ParseBool(raw); err == nil {
+				return b
+			}
+			return value
+		}
+	}
+
+	return value
+}
+
+func isSQLNumericLiteral(s string) bool {
+	if s == "" {
+		return false
+	}
+	if _, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return true
+	}
+	if _, err := strconv.ParseFloat(s, 64); err == nil {
+		return true
+	}
+	return false
+}
+
+func decodeJSONStringLiteral(s string) (string, bool) {
+	if !strings.HasPrefix(s, "\"") || !strings.HasSuffix(s, "\"") {
+		return "", false
+	}
+	var decoded string
+	if err := json.Unmarshal([]byte(s), &decoded); err != nil {
+		return "", false
+	}
+	return decoded, true
 }
 
 func RowsToJSON(rows *sql.Rows) ([]byte, error) {
@@ -2450,7 +2637,10 @@ func processWhereBlock(sqlText string, params map[string]interface{}) string {
 	// 外側ブロック内の内容を抽出
 	blockContent := sqlText[beginIdx+len("/*BEGIN*/") : endIdx]
 	// ブロック内のIFブロックを処理する（normalize も必要に応じて行う）
-	processedBlock := processCommentConditionals(blockContent, params)
+	processedBlock, hasConditional, includedConditional := processCommentConditionalsWithState(blockContent, params)
+	if hasConditional && !includedConditional {
+		processedBlock = ""
+	}
 	// 外側ブロック全体を置き換える
 	result := sqlText[:beginIdx] + processedBlock + sqlText[endIdx+len("/*END*/"):]
 	return result
@@ -2458,9 +2648,17 @@ func processWhereBlock(sqlText string, params map[string]interface{}) string {
 
 // processCommentConditionals は、IFブロック（/*IF ...*/ ... /*END*/）を処理します。
 func processCommentConditionals(block string, params map[string]interface{}) string {
+	processed, _, _ := processCommentConditionalsWithState(block, params)
+	return processed
+}
+
+func processCommentConditionalsWithState(block string, params map[string]interface{}) (string, bool, bool) {
 	// 正規表現で非貪欲にIFブロックをマッチさせる
 	re := regexp.MustCompile(`(?s)/\*IF\s+(.*?)\*/(.*?)\s*/\*END\*/`)
+	hasConditional := false
+	includedConditional := false
 	processed := re.ReplaceAllStringFunc(block, func(match string) string {
+		hasConditional = true
 		submatches := re.FindStringSubmatch(match)
 		if len(submatches) < 3 {
 			return ""
@@ -2469,11 +2667,12 @@ func processCommentConditionals(block string, params map[string]interface{}) str
 		content := strings.TrimSpace(submatches[2])
 		// 特別条件 "BEGIN" なら無条件に出力
 		if strings.ToUpper(cond) == "BEGIN" || evaluateCondition(cond, params) {
+			includedConditional = true
 			return content
 		}
 		return ""
 	})
-	return processed
+	return processed, hasConditional, includedConditional
 }
 
 // 余分な空白文字（改行、タブ、連続するスペース）を1つのスペースに正規化する関数

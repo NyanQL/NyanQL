@@ -1,4 +1,32 @@
 {
+  "hoge": {
+    "sql": ["./sql/magicadb/hoge.sql"],
+    "description": "MagicaDBのテーブルhogeの一覧を表示します。"
+  },
+  "hogebyid": {
+    "sql": ["./sql/magicadb/hogebyid.sql"],
+    "description": "MagicaDBのテーブルhogeのIDが一致するものを表示します。"
+  },
+  "hogeif": {
+    "sql": ["./sql/magicadb/hogeif.sql"],
+    "description": "IFコメントのサンプル。MagicaDBのテーブルhogeのIDが一致するものを表示します。"
+  },
+  "hogebyname": {
+    "sql": ["./sql/magicadb/hogebyname.sql"],
+    "description": "MagicaDBのテーブルhogeのNAMEが一致するものを表示します。"
+  },
+  "addhoge": {
+    "sql": ["./sql/magicadb/addhoge.sql"],
+    "description": "MagicaDBのテーブルhogeに追加します。"
+  },
+  "addhogename": {
+    "sql": ["./sql/magicadb/addhogename.sql"],
+    "description": "MagicaDBのテーブルhogeにid=17で追加します。"
+  },
+  "addhogejson": {
+    "sql": ["./sql/magicadb/addhogejson.sql"],
+    "description": "MagicaDBのテーブルhogeにフリー形式で追加します。"
+  },
   "list": {
     "sql": ["./sql/sqlite/list.sql"],
     "description": "当月の一覧を表示します。"
