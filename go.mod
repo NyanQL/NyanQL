@@ -68,4 +68,4 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 )
 
-replace github.com/genjidb/genji => ../MagicaDB
+replace github.com/genjidb/genji => github.com/ahabu/MagicaDB v0.0.0-20260524200203-ea13a5f98857
