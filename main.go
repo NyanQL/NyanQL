@@ -592,10 +592,12 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 			continue
 		}
 		val := values[0]
-		if strings.HasPrefix(val, "[") && strings.HasSuffix(val, "]") {
-			var arr []interface{}
-			if err := json.Unmarshal([]byte(val), &arr); err == nil {
-				params[key] = arr
+		trimmedVal := strings.TrimSpace(val)
+		if (strings.HasPrefix(trimmedVal, "{") && strings.HasSuffix(trimmedVal, "}")) ||
+			(strings.HasPrefix(trimmedVal, "[") && strings.HasSuffix(trimmedVal, "]")) {
+			var parsed interface{}
+			if err := json.Unmarshal([]byte(trimmedVal), &parsed); err == nil {
+				params[key] = parsed
 				continue
 			}
 		}
@@ -1463,59 +1465,69 @@ func isSelectQuery(query string) bool {
 }
 
 func prepareQueryWithParams(query string, params map[string]interface{}) (string, []interface{}) {
-	re := regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
-
 	var args []interface{}
 	placeholderCounter := 1
+	var builder strings.Builder
 
-	replacedQuery := re.ReplaceAllStringFunc(query, func(match string) string {
-		groups := re.FindStringSubmatch(match)
-		paramName := strings.TrimSpace(groups[1])
+	for i := 0; i < len(query); {
+		start := strings.Index(query[i:], "/*")
+		if start == -1 {
+			builder.WriteString(query[i:])
+			break
+		}
+		start += i
+		commentEnd := strings.Index(query[start+2:], "*/")
+		if commentEnd == -1 {
+			builder.WriteString(query[i:])
+			break
+		}
+		commentEnd += start + 2
+		paramName := strings.TrimSpace(query[start+2 : commentEnd])
+		if paramName == "" || strings.ContainsAny(paramName, "*/") || strings.HasPrefix(strings.ToUpper(paramName), "IF ") || strings.EqualFold(paramName, "END") || strings.EqualFold(paramName, "BEGIN") {
+			builder.WriteString(query[i : commentEnd+2])
+			i = commentEnd + 2
+			continue
+		}
 
-		// パラメータ取得
+		_, defaultEnd := findPlaceholderDefault(query, commentEnd+2)
+		if defaultEnd == -1 {
+			builder.WriteString(query[i : commentEnd+2])
+			i = commentEnd + 2
+			continue
+		}
+		builder.WriteString(query[i:start])
+
 		value, ok := params[paramName]
 		if !ok {
 			args = append(args, nil)
-			if dbType == "postgres" {
-				place := fmt.Sprintf("$%d", placeholderCounter)
-				placeholderCounter++
-				return place
-			}
-			return "?"
+			builder.WriteString(nextPlaceholder(&placeholderCounter))
+			i = defaultEnd
+			continue
 		}
 
 		rv := reflect.ValueOf(value)
 		if !rv.IsValid() {
 			args = append(args, nil)
-			if dbType == "postgres" {
-				place := fmt.Sprintf("$%d", placeholderCounter)
-				placeholderCounter++
-				return place
-			}
-			return "?"
+			builder.WriteString(nextPlaceholder(&placeholderCounter))
+			i = defaultEnd
+			continue
 		}
 
 		// --- JSONB/文字列系の特別扱い ---
 		// []byte は 1つの値として扱う
 		if b, ok := value.([]byte); ok {
 			args = append(args, string(b))
-			place := "?"
-			if dbType == "postgres" {
-				place = fmt.Sprintf("$%d", placeholderCounter)
-			}
-			placeholderCounter++
-			return place
+			builder.WriteString(nextPlaceholder(&placeholderCounter))
+			i = defaultEnd
+			continue
 		}
 
 		// json.RawMessage も 1つの値として扱う
 		if jm, ok := value.(json.RawMessage); ok {
 			args = append(args, string(jm))
-			place := "?"
-			if dbType == "postgres" {
-				place = fmt.Sprintf("$%d", placeholderCounter)
-			}
-			placeholderCounter++
-			return place
+			builder.WriteString(nextPlaceholder(&placeholderCounter))
+			i = defaultEnd
+			continue
 		}
 
 		// map や struct は JSON に変換して 1値として扱う
@@ -1527,46 +1539,123 @@ func prepareQueryWithParams(query string, params map[string]interface{}) (string
 			} else {
 				args = append(args, string(jb))
 			}
-			place := "?"
-			if dbType == "postgres" {
-				place = fmt.Sprintf("$%d", placeholderCounter)
-			}
-			placeholderCounter++
-			return place
+			builder.WriteString(nextPlaceholder(&placeholderCounter))
+			i = defaultEnd
+			continue
 		}
 
 		// --- 通常のスライスは IN (...) 展開 ---
 		if kind == reflect.Slice {
 			n := rv.Len()
 			if n == 0 {
-				return "NULL"
+				builder.WriteString("NULL")
+				i = defaultEnd
+				continue
 			}
 			placeholders := make([]string, 0, n)
 			for i := 0; i < n; i++ {
 				args = append(args, rv.Index(i).Interface())
-				var p string
-				if dbType == "postgres" {
-					p = fmt.Sprintf("$%d", placeholderCounter)
-				} else {
-					p = "?"
-				}
-				placeholders = append(placeholders, p)
-				placeholderCounter++
+				placeholders = append(placeholders, nextPlaceholder(&placeholderCounter))
 			}
-			return strings.Join(placeholders, ",")
+			builder.WriteString(strings.Join(placeholders, ","))
+			i = defaultEnd
+			continue
 		}
 
 		// --- 通常の単一値 ---
 		args = append(args, value)
-		place := "?"
-		if dbType == "postgres" {
-			place = fmt.Sprintf("$%d", placeholderCounter)
-		}
-		placeholderCounter++
-		return place
-	})
+		builder.WriteString(nextPlaceholder(&placeholderCounter))
+		i = defaultEnd
+	}
 
-	return replacedQuery, args
+	return builder.String(), args
+}
+
+func nextPlaceholder(counter *int) string {
+	if dbType == "postgres" {
+		place := fmt.Sprintf("$%d", *counter)
+		*counter = *counter + 1
+		return place
+	}
+	*counter = *counter + 1
+	return "?"
+}
+
+func findPlaceholderDefault(query string, offset int) (int, int) {
+	i := offset
+	for i < len(query) && (query[i] == ' ' || query[i] == '\t' || query[i] == '\r' || query[i] == '\n') {
+		i++
+	}
+	if i >= len(query) {
+		return i, -1
+	}
+	switch query[i] {
+	case '\'', '"':
+		end := scanQuotedSQLValue(query, i)
+		return i, end
+	case '{':
+		end := scanBalancedSQLValue(query, i, '{', '}')
+		return i, end
+	case '[':
+		end := scanBalancedSQLValue(query, i, '[', ']')
+		return i, end
+	default:
+		j := i
+		for j < len(query) && !strings.ContainsRune(" \t\r\n,;)", rune(query[j])) {
+			j++
+		}
+		if j == i {
+			return i, -1
+		}
+		return i, j
+	}
+}
+
+func scanQuotedSQLValue(s string, start int) int {
+	quote := s[start]
+	for i := start + 1; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+			continue
+		}
+		if s[i] == quote {
+			return i + 1
+		}
+	}
+	return len(s)
+}
+
+func scanBalancedSQLValue(s string, start int, open byte, close byte) int {
+	depth := 0
+	inQuote := byte(0)
+	for i := start; i < len(s); i++ {
+		ch := s[i]
+		if inQuote != 0 {
+			if ch == '\\' {
+				i++
+				continue
+			}
+			if ch == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			inQuote = ch
+			continue
+		}
+		if ch == open {
+			depth++
+			continue
+		}
+		if ch == close {
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return len(s)
 }
 
 func RowsToJSON(rows *sql.Rows) ([]byte, error) {
@@ -2442,9 +2531,22 @@ func processWhereBlock(sqlText string, params map[string]interface{}) string {
 	blockContent := sqlText[beginIdx+len("/*BEGIN*/") : endIdx]
 	// ブロック内のIFブロックを処理する（normalize も必要に応じて行う）
 	processedBlock := processCommentConditionals(blockContent, params)
+	if isEmptyConditionalSQLBlock(processedBlock) {
+		processedBlock = ""
+	}
 	// 外側ブロック全体を置き換える
 	result := sqlText[:beginIdx] + processedBlock + sqlText[endIdx+len("/*END*/"):]
 	return result
+}
+
+func isEmptyConditionalSQLBlock(block string) bool {
+	trimmed := strings.TrimSpace(block)
+	if trimmed == "" {
+		return true
+	}
+	re := regexp.MustCompile(`(?i)\b(WHERE|AND|OR)\b`)
+	withoutConnectors := re.ReplaceAllString(trimmed, "")
+	return strings.TrimSpace(withoutConnectors) == ""
 }
 
 // processCommentConditionals は、IFブロック（/*IF ...*/ ... /*END*/）を処理します。
