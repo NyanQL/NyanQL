@@ -117,18 +117,40 @@ go build -o nyanql
 
 ### 2. 設定ファイルを用意する
 
-NyanQLの実行ファイルと同じ場所に、少なくとも次の2つのファイルを置きます。
+少なくとも次の2つのファイルを用意します。
 
 - `config.json`
 - `api.json`
 
 SQLファイルやJavaScriptファイルも、`api.json` から参照できる場所に置いてください。
 
+デフォルトでは、NyanQLは実行ファイルと同じ場所にある `config.json` と `api.json` を読み込みます。別の場所に置きたい場合は、起動時オプションまたは環境変数で指定できます。
+
 ### 3. 起動する
 
 ```bash
 ./nyanql
 ```
+
+`config.json` と `api.json` を任意の場所から読み込む場合は、次のように指定します。
+
+```bash
+./nyanql --config /path/to/config.json --api /path/to/api.json
+```
+
+環境変数でも指定できます。
+
+```bash
+NYAN_CONFIG_PATH=/path/to/config.json \
+NYAN_API_PATH=/path/to/api.json \
+./nyanql
+```
+
+設定ファイルの場所は、次の優先順位で決まります。
+
+1. 起動時オプション `--config`、`--api`
+2. 環境変数 `NYAN_CONFIG_PATH`、`NYAN_API_PATH`
+3. 実行ファイルと同じ場所にある `config.json`、`api.json`
 
 Windowsでは、ビルド済みの実行ファイルをダブルクリックして起動することもできます。ただし、動作確認やエラー確認をしやすくするため、最初はターミナルから起動することをおすすめします。
 
@@ -187,13 +209,15 @@ Windowsでは、ビルド済みの実行ファイルをダブルクリックし�
 | `BasicAuth` | API呼び出し時のBasic認証ユーザ名とパスワードです。 |
 | `javascript_include` | `check` や `script` の実行前に読み込む共通JavaScriptです。 |
 
-SQLiteとDuckDBでは、`DBName` に相対パスを書いた場合、実行ファイルがある場所を基準にして扱われます。
+`config.json` 内の相対パスは、`config.json` がある場所を基準にして扱われます。対象は `CertPath`、`KeyPath`、SQLite/DuckDB の `DBName`、`log.Filename`、`javascript_include` です。
 
 ---
 
 ## api.json
 
 `api.json` には、API名と、実行するSQLまたはJavaScriptの対応を書きます。
+
+`api.json` 内の相対パスは、`api.json` がある場所を基準にして扱われます。対象は `sql`、`script`、`paramCheck`、`outCheck`、public API の `path` です。
 
 ### SQLを実行するAPI
 
@@ -238,7 +262,7 @@ SQLiteとDuckDBでは、`DBName` に相対パスを書いた場合、実行フ�
 
 ### publicフォルダを公開するAPI
 
-`type: "public"` を指定すると、`path` のフォルダ配下にあるファイルをそのまま配信します。`path` は実行ファイルがある場所からの相対パス、または絶対パスで指定できます。
+`type: "public"` を指定すると、`path` のフォルダ配下にあるファイルをそのまま配信します。`path` は `api.json` がある場所からの相対パス、または絶対パスで指定できます。
 
 ```json
 {
