@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -198,7 +199,17 @@ var config Config
 var db *sql.DB
 var sqlFiles map[string]APIConfig
 var dbType string
-var buildVersion = "v0.0.18"
+var buildVersion = "v0.0.20"
+
+type serviceFilePath struct {
+	Path   string
+	Source string
+}
+
+type serviceFilePaths struct {
+	API    serviceFilePath
+	Config serviceFilePath
+}
 
 const (
 	apiTypeAPI      = "api"
@@ -218,6 +229,61 @@ var upgrader = websocket.Upgrader{
 
 var hub *Hub
 
+func resolveServiceFilePaths(execDir string, args []string) (serviceFilePaths, error) {
+	flags := flag.NewFlagSet("NyanQL", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	apiFlag := flags.String("api", "", "path to api.json")
+	configFlag := flags.String("config", "", "path to config.json")
+	if err := flags.Parse(args); err != nil {
+		return serviceFilePaths{}, err
+	}
+
+	apiPath, apiSource := chooseServiceFilePath(*apiFlag, "NYAN_API_PATH", filepath.Join(execDir, "api.json"), "--api")
+	configPath, configSource := chooseServiceFilePath(*configFlag, "NYAN_CONFIG_PATH", filepath.Join(execDir, "config.json"), "--config")
+
+	resolvedAPIPath, err := resolveExistingServiceFilePath(apiPath, "api", apiSource)
+	if err != nil {
+		return serviceFilePaths{}, err
+	}
+	resolvedConfigPath, err := resolveExistingServiceFilePath(configPath, "config", configSource)
+	if err != nil {
+		return serviceFilePaths{}, err
+	}
+
+	return serviceFilePaths{
+		API:    serviceFilePath{Path: resolvedAPIPath, Source: apiSource},
+		Config: serviceFilePath{Path: resolvedConfigPath, Source: configSource},
+	}, nil
+}
+
+func chooseServiceFilePath(cliValue, envName, defaultPath, cliSource string) (string, string) {
+	if strings.TrimSpace(cliValue) != "" {
+		return cliValue, cliSource
+	}
+	if envValue := strings.TrimSpace(os.Getenv(envName)); envValue != "" {
+		return envValue, envName
+	}
+	return defaultPath, "default"
+}
+
+func resolveExistingServiceFilePath(pathValue, label, source string) (string, error) {
+	resolvedPath, err := filepath.Abs(pathValue)
+	if err != nil {
+		return "", fmt.Errorf("%s file path could not be resolved: %s (source: %s): %w", label, pathValue, source, err)
+	}
+	info, err := os.Stat(resolvedPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("%s file not found: %s (source: %s)", label, resolvedPath, source)
+		}
+		return "", fmt.Errorf("%s file cannot be accessed: %s (source: %s): %w", label, resolvedPath, source, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("%s file is a directory: %s (source: %s)", label, resolvedPath, source)
+	}
+	return resolvedPath, nil
+}
+
 // main
 func main() {
 	execDir, err := os.Executable()
@@ -226,8 +292,12 @@ func main() {
 	}
 	execDir = filepath.Dir(execDir)
 
-	configFilePath := filepath.Join(execDir, "config.json")
-	configFile, err := os.Open(configFilePath)
+	paths, err := resolveServiceFilePaths(execDir, os.Args[1:])
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	configFile, err := os.Open(paths.Config.Path)
 	if err != nil {
 		log.Fatalf("Failed to open config file: %v", err)
 	}
@@ -235,21 +305,25 @@ func main() {
 	if err = json.NewDecoder(configFile).Decode(&config); err != nil {
 		log.Fatalf("Failed to decode config JSON: %v", err)
 	}
-	adjustPaths(execDir, &config)
-	setupLogger(execDir)
+	configBaseDir := filepath.Dir(paths.Config.Path)
+	apiBaseDir := filepath.Dir(paths.API.Path)
+	adjustPaths(configBaseDir, &config)
+	setupLogger(configBaseDir)
 	log.Printf("Binary version: %s", buildVersion)
 	log.Printf("Go runtime version: %s", runtime.Version())
+	log.Printf("Config file: %s (source: %s)", paths.Config.Path, paths.Config.Source)
+	log.Printf("API file: %s (source: %s)", paths.API.Path, paths.API.Source)
 	log.Printf("Config version: %s", config.Version)
 
 	db, err = connectDB(config)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
-	loadSQLFiles(execDir)
-	if err := startWebSocketClients(execDir); err != nil {
+	loadSQLFiles(paths.API.Path, apiBaseDir)
+	if err := startWebSocketClients(apiBaseDir); err != nil {
 		log.Printf("Failed to start WebSocket clients: %v", err)
 	}
-	if err := startScheduleJobs(execDir); err != nil {
+	if err := startScheduleJobs(apiBaseDir); err != nil {
 		log.Printf("Failed to start schedule jobs: %v", err)
 	}
 
@@ -388,8 +462,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func loadSQLFiles(execDir string) {
-	apiFilePath := filepath.Join(execDir, "api.json")
+func loadSQLFiles(apiFilePath, apiBaseDir string) {
 	data, err := os.ReadFile(apiFilePath)
 	if err != nil {
 		log.Fatalf("Failed to read SQL files config: %v", err)
@@ -406,14 +479,24 @@ func loadSQLFiles(execDir string) {
 	for apiKey, apiConfig := range sqlFiles {
 		for i, sqlPath := range apiConfig.SQL {
 			if !filepath.IsAbs(sqlPath) {
-				sqlFiles[apiKey].SQL[i] = filepath.Join(execDir, sqlPath)
+				sqlFiles[apiKey].SQL[i] = filepath.Join(apiBaseDir, sqlPath)
 			}
 		}
+		apiConfig.Script = resolvePathFromBase(apiBaseDir, apiConfig.Script)
+		apiConfig.ParamCheck = resolvePathFromBase(apiBaseDir, apiConfig.ParamCheck)
+		apiConfig.OutCheck = resolvePathFromBase(apiBaseDir, apiConfig.OutCheck)
 		if apiConfig.Path != "" && !filepath.IsAbs(apiConfig.Path) {
-			apiConfig.Path = filepath.Join(execDir, apiConfig.Path)
-			sqlFiles[apiKey] = apiConfig
+			apiConfig.Path = filepath.Join(apiBaseDir, apiConfig.Path)
 		}
+		sqlFiles[apiKey] = apiConfig
 	}
+}
+
+func resolvePathFromBase(baseDir, pathValue string) string {
+	if strings.TrimSpace(pathValue) == "" || filepath.IsAbs(pathValue) {
+		return pathValue
+	}
+	return filepath.Join(baseDir, pathValue)
 }
 
 func getAPIType(apiConfig APIConfig) string {
@@ -509,10 +592,12 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 			continue
 		}
 		val := values[0]
-		if strings.HasPrefix(val, "[") && strings.HasSuffix(val, "]") {
-			var arr []interface{}
-			if err := json.Unmarshal([]byte(val), &arr); err == nil {
-				params[key] = arr
+		trimmedVal := strings.TrimSpace(val)
+		if (strings.HasPrefix(trimmedVal, "{") && strings.HasSuffix(trimmedVal, "}")) ||
+			(strings.HasPrefix(trimmedVal, "[") && strings.HasSuffix(trimmedVal, "]")) {
+			var parsed interface{}
+			if err := json.Unmarshal([]byte(trimmedVal), &parsed); err == nil {
+				params[key] = parsed
 				continue
 			}
 		}
@@ -1043,8 +1128,8 @@ func websocketMessageTypeLabel(t int) string {
 	}
 }
 
-func setupLogger(execDir string) {
-	logFilePath := filepath.Join(execDir, config.Log.Filename)
+func setupLogger(configBaseDir string) {
+	logFilePath := resolvePathFromBase(configBaseDir, config.Log.Filename)
 	if config.Log.EnableLogging {
 		log.SetOutput(&lumberjack.Logger{
 			Filename:   logFilePath,
@@ -1380,59 +1465,69 @@ func isSelectQuery(query string) bool {
 }
 
 func prepareQueryWithParams(query string, params map[string]interface{}) (string, []interface{}) {
-	re := regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
-
 	var args []interface{}
 	placeholderCounter := 1
+	var builder strings.Builder
 
-	replacedQuery := re.ReplaceAllStringFunc(query, func(match string) string {
-		groups := re.FindStringSubmatch(match)
-		paramName := strings.TrimSpace(groups[1])
+	for i := 0; i < len(query); {
+		start := strings.Index(query[i:], "/*")
+		if start == -1 {
+			builder.WriteString(query[i:])
+			break
+		}
+		start += i
+		commentEnd := strings.Index(query[start+2:], "*/")
+		if commentEnd == -1 {
+			builder.WriteString(query[i:])
+			break
+		}
+		commentEnd += start + 2
+		paramName := strings.TrimSpace(query[start+2 : commentEnd])
+		if paramName == "" || strings.ContainsAny(paramName, "*/") || strings.HasPrefix(strings.ToUpper(paramName), "IF ") || strings.EqualFold(paramName, "END") || strings.EqualFold(paramName, "BEGIN") {
+			builder.WriteString(query[i : commentEnd+2])
+			i = commentEnd + 2
+			continue
+		}
 
-		// パラメータ取得
+		_, defaultEnd := findPlaceholderDefault(query, commentEnd+2)
+		if defaultEnd == -1 {
+			builder.WriteString(query[i : commentEnd+2])
+			i = commentEnd + 2
+			continue
+		}
+		builder.WriteString(query[i:start])
+
 		value, ok := params[paramName]
 		if !ok {
 			args = append(args, nil)
-			if dbType == "postgres" {
-				place := fmt.Sprintf("$%d", placeholderCounter)
-				placeholderCounter++
-				return place
-			}
-			return "?"
+			builder.WriteString(nextPlaceholder(&placeholderCounter))
+			i = defaultEnd
+			continue
 		}
 
 		rv := reflect.ValueOf(value)
 		if !rv.IsValid() {
 			args = append(args, nil)
-			if dbType == "postgres" {
-				place := fmt.Sprintf("$%d", placeholderCounter)
-				placeholderCounter++
-				return place
-			}
-			return "?"
+			builder.WriteString(nextPlaceholder(&placeholderCounter))
+			i = defaultEnd
+			continue
 		}
 
 		// --- JSONB/文字列系の特別扱い ---
 		// []byte は 1つの値として扱う
 		if b, ok := value.([]byte); ok {
 			args = append(args, string(b))
-			place := "?"
-			if dbType == "postgres" {
-				place = fmt.Sprintf("$%d", placeholderCounter)
-			}
-			placeholderCounter++
-			return place
+			builder.WriteString(nextPlaceholder(&placeholderCounter))
+			i = defaultEnd
+			continue
 		}
 
 		// json.RawMessage も 1つの値として扱う
 		if jm, ok := value.(json.RawMessage); ok {
 			args = append(args, string(jm))
-			place := "?"
-			if dbType == "postgres" {
-				place = fmt.Sprintf("$%d", placeholderCounter)
-			}
-			placeholderCounter++
-			return place
+			builder.WriteString(nextPlaceholder(&placeholderCounter))
+			i = defaultEnd
+			continue
 		}
 
 		// map や struct は JSON に変換して 1値として扱う
@@ -1444,46 +1539,123 @@ func prepareQueryWithParams(query string, params map[string]interface{}) (string
 			} else {
 				args = append(args, string(jb))
 			}
-			place := "?"
-			if dbType == "postgres" {
-				place = fmt.Sprintf("$%d", placeholderCounter)
-			}
-			placeholderCounter++
-			return place
+			builder.WriteString(nextPlaceholder(&placeholderCounter))
+			i = defaultEnd
+			continue
 		}
 
 		// --- 通常のスライスは IN (...) 展開 ---
 		if kind == reflect.Slice {
 			n := rv.Len()
 			if n == 0 {
-				return "NULL"
+				builder.WriteString("NULL")
+				i = defaultEnd
+				continue
 			}
 			placeholders := make([]string, 0, n)
 			for i := 0; i < n; i++ {
 				args = append(args, rv.Index(i).Interface())
-				var p string
-				if dbType == "postgres" {
-					p = fmt.Sprintf("$%d", placeholderCounter)
-				} else {
-					p = "?"
-				}
-				placeholders = append(placeholders, p)
-				placeholderCounter++
+				placeholders = append(placeholders, nextPlaceholder(&placeholderCounter))
 			}
-			return strings.Join(placeholders, ",")
+			builder.WriteString(strings.Join(placeholders, ","))
+			i = defaultEnd
+			continue
 		}
 
 		// --- 通常の単一値 ---
 		args = append(args, value)
-		place := "?"
-		if dbType == "postgres" {
-			place = fmt.Sprintf("$%d", placeholderCounter)
-		}
-		placeholderCounter++
-		return place
-	})
+		builder.WriteString(nextPlaceholder(&placeholderCounter))
+		i = defaultEnd
+	}
 
-	return replacedQuery, args
+	return builder.String(), args
+}
+
+func nextPlaceholder(counter *int) string {
+	if dbType == "postgres" {
+		place := fmt.Sprintf("$%d", *counter)
+		*counter = *counter + 1
+		return place
+	}
+	*counter = *counter + 1
+	return "?"
+}
+
+func findPlaceholderDefault(query string, offset int) (int, int) {
+	i := offset
+	for i < len(query) && (query[i] == ' ' || query[i] == '\t' || query[i] == '\r' || query[i] == '\n') {
+		i++
+	}
+	if i >= len(query) {
+		return i, -1
+	}
+	switch query[i] {
+	case '\'', '"':
+		end := scanQuotedSQLValue(query, i)
+		return i, end
+	case '{':
+		end := scanBalancedSQLValue(query, i, '{', '}')
+		return i, end
+	case '[':
+		end := scanBalancedSQLValue(query, i, '[', ']')
+		return i, end
+	default:
+		j := i
+		for j < len(query) && !strings.ContainsRune(" \t\r\n,;)", rune(query[j])) {
+			j++
+		}
+		if j == i {
+			return i, -1
+		}
+		return i, j
+	}
+}
+
+func scanQuotedSQLValue(s string, start int) int {
+	quote := s[start]
+	for i := start + 1; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+			continue
+		}
+		if s[i] == quote {
+			return i + 1
+		}
+	}
+	return len(s)
+}
+
+func scanBalancedSQLValue(s string, start int, open byte, close byte) int {
+	depth := 0
+	inQuote := byte(0)
+	for i := start; i < len(s); i++ {
+		ch := s[i]
+		if inQuote != 0 {
+			if ch == '\\' {
+				i++
+				continue
+			}
+			if ch == inQuote {
+				inQuote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			inQuote = ch
+			continue
+		}
+		if ch == open {
+			depth++
+			continue
+		}
+		if ch == close {
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return len(s)
 }
 
 func RowsToJSON(rows *sql.Rows) ([]byte, error) {
@@ -2359,9 +2531,22 @@ func processWhereBlock(sqlText string, params map[string]interface{}) string {
 	blockContent := sqlText[beginIdx+len("/*BEGIN*/") : endIdx]
 	// ブロック内のIFブロックを処理する（normalize も必要に応じて行う）
 	processedBlock := processCommentConditionals(blockContent, params)
+	if isEmptyConditionalSQLBlock(processedBlock) {
+		processedBlock = ""
+	}
 	// 外側ブロック全体を置き換える
 	result := sqlText[:beginIdx] + processedBlock + sqlText[endIdx+len("/*END*/"):]
 	return result
+}
+
+func isEmptyConditionalSQLBlock(block string) bool {
+	trimmed := strings.TrimSpace(block)
+	if trimmed == "" {
+		return true
+	}
+	re := regexp.MustCompile(`(?i)\b(WHERE|AND|OR)\b`)
+	withoutConnectors := re.ReplaceAllString(trimmed, "")
+	return strings.TrimSpace(withoutConnectors) == ""
 }
 
 // processCommentConditionals は、IFブロック（/*IF ...*/ ... /*END*/）を処理します。
@@ -2512,16 +2697,19 @@ func nyanHostExecWrapper(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	return vm.ToValue(out)
 }
 
-func adjustPaths(execDir string, config *Config) {
+func adjustPaths(configBaseDir string, config *Config) {
 	if config.CertPath != "" && !filepath.IsAbs(config.CertPath) {
-		config.CertPath = filepath.Join(execDir, config.CertPath)
+		config.CertPath = filepath.Join(configBaseDir, config.CertPath)
 	}
 	if config.KeyPath != "" && !filepath.IsAbs(config.KeyPath) {
-		config.KeyPath = filepath.Join(execDir, config.KeyPath)
+		config.KeyPath = filepath.Join(configBaseDir, config.KeyPath)
 	}
 	// sqlite と duckdb の場合、DBName が相対パスなら絶対パスに変換
 	if (config.DatabaseType == "sqlite" || config.DatabaseType == "duckdb") && config.DBName != "" && !filepath.IsAbs(config.DBName) {
-		config.DBName = filepath.Join(execDir, config.DBName)
+		config.DBName = filepath.Join(configBaseDir, config.DBName)
+	}
+	for i, includePath := range config.JavascriptInclude {
+		config.JavascriptInclude[i] = resolvePathFromBase(configBaseDir, includePath)
 	}
 }
 
