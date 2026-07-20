@@ -297,13 +297,40 @@ func TestParseAPIHotReloadInterval(t *testing.T) {
 	}
 }
 
-func TestConfigUnmarshalAPIHotReload(t *testing.T) {
-	var got Config
-	if err := json.Unmarshal([]byte(`{"APIHotReload":{"Enabled":true,"Interval":"2s"}}`), &got); err != nil {
-		t.Fatalf("json.Unmarshal() error = %v", err)
+func TestConfigAPIHotReloadDefaultsAndOverrides(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want APIHotReloadConfig
+	}{
+		{
+			name: "omitted",
+			data: `{}`,
+			want: APIHotReloadConfig{Enabled: true, Interval: "1s"},
+		},
+		{
+			name: "explicitly disabled",
+			data: `{"APIHotReload":{"Enabled":false}}`,
+			want: APIHotReloadConfig{Enabled: false, Interval: "1s"},
+		},
+		{
+			name: "custom interval",
+			data: `{"APIHotReload":{"Enabled":true,"Interval":"2s"}}`,
+			want: APIHotReloadConfig{Enabled: true, Interval: "2s"},
+		},
 	}
-	if !got.APIHotReload.Enabled || got.APIHotReload.Interval != "2s" {
-		t.Fatalf("APIHotReload = %#v, want enabled with 2s interval", got.APIHotReload)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got Config
+			applyConfigDefaults(&got)
+			if err := json.Unmarshal([]byte(tt.data), &got); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+			if got.APIHotReload != tt.want {
+				t.Fatalf("APIHotReload = %#v, want %#v", got.APIHotReload, tt.want)
+			}
+		})
 	}
 }
 

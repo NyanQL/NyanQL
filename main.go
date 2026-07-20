@@ -310,6 +310,7 @@ func main() {
 		log.Fatalf("Failed to open config file: %v", err)
 	}
 	defer configFile.Close()
+	applyConfigDefaults(&config)
 	if err = json.NewDecoder(configFile).Decode(&config); err != nil {
 		log.Fatalf("Failed to decode config JSON: %v", err)
 	}
@@ -497,6 +498,11 @@ func parseAPIHotReloadInterval(value string) (time.Duration, error) {
 		return 0, fmt.Errorf("must be greater than zero")
 	}
 	return interval, nil
+}
+
+func applyConfigDefaults(target *Config) {
+	target.APIHotReload.Enabled = true
+	target.APIHotReload.Interval = defaultAPIHotReloadCheckInterval.String()
 }
 
 func readSQLFiles(apiFilePath, apiBaseDir string) (map[string]APIConfig, [sha256.Size]byte, error) {
