@@ -181,6 +181,10 @@ Windowsでは、ビルド済みの実行ファイルをダブルクリックし�
     "Username": "admin",
     "Password": "secret"
   },
+  "APIHotReload": {
+    "Enabled": false,
+    "Interval": "1s"
+  },
   "log": {
     "Filename": "./logs/nyanql.log",
     "MaxSize": 5,
@@ -207,9 +211,31 @@ Windowsでは、ビルド済みの実行ファイルをダブルクリックし�
 | `DBType` | `mysql`、`postgres`、`sqlite`、`duckdb` のいずれかを指定します。 |
 | `DBName` | データベース名、またはSQLite/DuckDBのファイルパスです。 |
 | `BasicAuth` | API呼び出し時のBasic認証ユーザ名とパスワードです。 |
+| `APIHotReload` | `api.json` の定期的な変更確認を設定します。初期状態は無効です。 |
 | `javascript_include` | `check` や `script` の実行前に読み込む共通JavaScriptです。 |
 
 `config.json` 内の相対パスは、`config.json` がある場所を基準にして扱われます。対象は `CertPath`、`KeyPath`、SQLite/DuckDB の `DBName`、`log.Filename`、`javascript_include` です。
+
+### api.jsonのホットリロード
+
+`APIHotReload.Enabled` を `true` にすると、NyanQLは `api.json` の変更を定期的に確認します。外部のファイル監視ライブラリは使わず、Go標準ライブラリによる定期確認を行います。
+
+```json
+{
+  "APIHotReload": {
+    "Enabled": true,
+    "Interval": "1s"
+  }
+}
+```
+
+`Interval` はリロードの実行間隔ではなく、変更の確認間隔です。`1s`、`500ms` など、Goのduration形式で0より大きい値を指定します。省略時は `1s` です。
+
+確認のたびにファイル内容のSHA-256を比較し、内容が変わった場合だけJSONの解析と定義の交換を試みます。不正なJSONや設定エラーがある場合はログへ記録し、現在稼働中の正常なAPI定義を維持します。同じ不正内容について、確認間隔ごとに同じエラーを繰り返し記録することはありません。ファイルを修正すると、次の変更確認時に再度読み込みます。
+
+通常API、public API、`/nyan/`、JSON-RPCなどが参照する定義は更新されます。`schedule` または `ws_client` の定義に追加・変更・削除がある場合は、実行中のgoroutineや接続との不一致を避けるため `api.json` 全体の更新を拒否し、再起動が必要であることをログへ記録します。
+
+`config.json`、SQL、JavaScript、public配下のファイル自体は監視しません。
 
 ---
 

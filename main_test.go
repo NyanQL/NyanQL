@@ -2,13 +2,16 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestGetParamCheckScriptPath(t *testing.T) {
@@ -234,12 +237,16 @@ func TestLoadSQLFilesResolvesAPIPathsFromAPIFileDirectory(t *testing.T) {
 			"outCheck": "./javascript/out_check.js"
 		}
 	}`)
-	setSQLFiles(t, nil)
+	setTestSQLFiles(t, nil)
 
-	loadSQLFiles(apiPath, apiDir)
+	files, _, err := readSQLFiles(apiPath, apiDir)
+	if err != nil {
+		t.Fatalf("readSQLFiles() error = %v", err)
+	}
+	setSQLFiles(files)
 
-	apiConfig := sqlFiles["list"]
-	scriptConfig := sqlFiles["scripted"]
+	apiConfig := currentSQLFiles()["list"]
+	scriptConfig := currentSQLFiles()["scripted"]
 	if apiConfig.SQL[0] != filepath.Join(apiDir, "sql/list.sql") {
 		t.Fatalf("SQL path = %q, want api-relative path", apiConfig.SQL[0])
 	}
@@ -257,8 +264,181 @@ func TestLoadSQLFilesResolvesAPIPathsFromAPIFileDirectory(t *testing.T) {
 	}
 }
 
+func TestParseAPIHotReloadInterval(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "default", value: "", want: time.Second},
+		{name: "duration", value: "250ms", want: 250 * time.Millisecond},
+		{name: "invalid", value: "later", wantErr: true},
+		{name: "zero", value: "0s", wantErr: true},
+		{name: "negative", value: "-1s", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseAPIHotReloadInterval(tt.value)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseAPIHotReloadInterval(%q) error = nil, want error", tt.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseAPIHotReloadInterval(%q) error = %v", tt.value, err)
+			}
+			if got != tt.want {
+				t.Fatalf("parseAPIHotReloadInterval(%q) = %s, want %s", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfigUnmarshalAPIHotReload(t *testing.T) {
+	var got Config
+	if err := json.Unmarshal([]byte(`{"APIHotReload":{"Enabled":true,"Interval":"2s"}}`), &got); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if !got.APIHotReload.Enabled || got.APIHotReload.Interval != "2s" {
+		t.Fatalf("APIHotReload = %#v, want enabled with 2s interval", got.APIHotReload)
+	}
+}
+
+func TestReloadSQLFilesIfChangedAppliesHTTPChanges(t *testing.T) {
+	apiDir := t.TempDir()
+	apiPath := filepath.Join(apiDir, "api.json")
+	writeTestFile(t, apiPath, `{"old":{"description":"old"}}`)
+
+	initialFiles, initialHash, err := readSQLFiles(apiPath, apiDir)
+	if err != nil {
+		t.Fatalf("readSQLFiles() error = %v", err)
+	}
+	setTestSQLFiles(t, initialFiles)
+	writeTestFile(t, apiPath, `{"new":{"description":"new"}}`)
+
+	observedHash, reloaded, err := reloadSQLFilesIfChanged(apiPath, apiDir, initialHash)
+	if err != nil {
+		t.Fatalf("reloadSQLFilesIfChanged() error = %v", err)
+	}
+	if !reloaded {
+		t.Fatal("reloadSQLFilesIfChanged() reloaded = false, want true")
+	}
+	if observedHash == initialHash {
+		t.Fatal("observed hash was not updated")
+	}
+	files := currentSQLFiles()
+	if _, exists := files["old"]; exists {
+		t.Fatal("old API remains after reload")
+	}
+	if files["new"].Description != "new" {
+		t.Fatalf("new API = %#v, want updated definition", files["new"])
+	}
+}
+
+func TestReloadSQLFilesIfChangedKeepsCurrentDefinitionOnInvalidJSON(t *testing.T) {
+	apiDir := t.TempDir()
+	apiPath := filepath.Join(apiDir, "api.json")
+	writeTestFile(t, apiPath, `{"current":{"description":"active"}}`)
+
+	initialFiles, initialHash, err := readSQLFiles(apiPath, apiDir)
+	if err != nil {
+		t.Fatalf("readSQLFiles() error = %v", err)
+	}
+	setTestSQLFiles(t, initialFiles)
+	writeTestFile(t, apiPath, `{"broken":`)
+
+	observedHash, reloaded, err := reloadSQLFilesIfChanged(apiPath, apiDir, initialHash)
+	if err == nil {
+		t.Fatal("reloadSQLFilesIfChanged() error = nil, want JSON error")
+	}
+	if reloaded {
+		t.Fatal("reloadSQLFilesIfChanged() reloaded = true, want false")
+	}
+	if observedHash == initialHash {
+		t.Fatal("invalid content was not recorded as observed")
+	}
+	if currentSQLFiles()["current"].Description != "active" {
+		t.Fatal("current API definition changed after invalid JSON")
+	}
+
+	secondHash, reloaded, err := reloadSQLFilesIfChanged(apiPath, apiDir, observedHash)
+	if err != nil {
+		t.Fatalf("unchanged invalid content was parsed again: %v", err)
+	}
+	if reloaded || secondHash != observedHash {
+		t.Fatal("unchanged invalid content should be skipped")
+	}
+}
+
+func TestReloadSQLFilesIfChangedRejectsBackgroundChanges(t *testing.T) {
+	tests := []struct {
+		name    string
+		initial string
+		changed string
+	}{
+		{
+			name:    "schedule",
+			initial: `{"job":{"type":"schedule","script":"./job.js","trigger":{"type":"cron","value":"0 10 * * *"}},"api":{"description":"old"}}`,
+			changed: `{"job":{"type":"schedule","script":"./job.js","trigger":{"type":"cron","value":"0 11 * * *"}},"api":{"description":"new"}}`,
+		},
+		{
+			name:    "ws_client",
+			initial: `{"client":{"type":"ws_client","script":"./client.js","connectURL":"ws://localhost:8080/old"},"api":{"description":"old"}}`,
+			changed: `{"client":{"type":"ws_client","script":"./client.js","connectURL":"ws://localhost:8080/new"},"api":{"description":"new"}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apiDir := t.TempDir()
+			apiPath := filepath.Join(apiDir, "api.json")
+			writeTestFile(t, apiPath, tt.initial)
+			initialFiles, initialHash, err := readSQLFiles(apiPath, apiDir)
+			if err != nil {
+				t.Fatalf("readSQLFiles() error = %v", err)
+			}
+			setTestSQLFiles(t, initialFiles)
+			writeTestFile(t, apiPath, tt.changed)
+
+			_, reloaded, err := reloadSQLFilesIfChanged(apiPath, apiDir, initialHash)
+			if err == nil || !strings.Contains(err.Error(), "restart is required") {
+				t.Fatalf("reloadSQLFilesIfChanged() error = %v, want restart-required error", err)
+			}
+			if reloaded {
+				t.Fatal("reloadSQLFilesIfChanged() reloaded = true, want false")
+			}
+			if currentSQLFiles()["api"].Description != "old" {
+				t.Fatal("HTTP API change was partially applied with background change")
+			}
+		})
+	}
+}
+
+func TestSQLFilesConcurrentReadAndReplace(t *testing.T) {
+	setTestSQLFiles(t, map[string]APIConfig{"api": {Description: "initial"}})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				files := currentSQLFiles()
+				_ = files["api"].Description
+			}
+		}()
+	}
+	for i := 0; i < 1000; i++ {
+		setSQLFiles(map[string]APIConfig{"api": {Description: fmt.Sprintf("updated-%d", i)}})
+	}
+	wg.Wait()
+}
+
 func TestFindPublicAPIForPath(t *testing.T) {
-	setSQLFiles(t, map[string]APIConfig{
+	setTestSQLFiles(t, map[string]APIConfig{
 		"public":        {Type: apiTypePublic, Path: "./public"},
 		"public/assets": {Type: apiTypePublic, Path: "./assets"},
 		"api":           {SQL: []string{"./sql/list.sql"}},
@@ -282,7 +462,7 @@ func TestUnifiedHandlerServesPublicFileWithoutBasicAuth(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(publicDir, "test.txt"), []byte("hello public"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	setSQLFiles(t, map[string]APIConfig{
+	setTestSQLFiles(t, map[string]APIConfig{
 		"assets": {Type: apiTypePublic, Path: publicDir},
 	})
 
@@ -303,7 +483,7 @@ func TestPublicEndpointCheckOnlyWithoutParamCheck(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(publicDir, "test.txt"), []byte("file content"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	setSQLFiles(t, map[string]APIConfig{
+	setTestSQLFiles(t, map[string]APIConfig{
 		"assets": {Type: apiTypePublic, Path: publicDir},
 	})
 
@@ -331,7 +511,7 @@ func TestPublicEndpointOutCheckBlocksFile(t *testing.T) {
 	outCheckScript := writeTestScript(t, `
 ({ success: false, status: 409, result: { message: "blocked", body: nyanAllParams.nyan_output_body } });
 `)
-	setSQLFiles(t, map[string]APIConfig{
+	setTestSQLFiles(t, map[string]APIConfig{
 		"assets": {Type: apiTypePublic, Path: publicDir, OutCheck: outCheckScript},
 	})
 
@@ -502,11 +682,11 @@ func writeTestFile(t *testing.T, path string, content string) {
 	}
 }
 
-func setSQLFiles(t *testing.T, files map[string]APIConfig) {
+func setTestSQLFiles(t *testing.T, files map[string]APIConfig) {
 	t.Helper()
-	oldFiles := sqlFiles
-	sqlFiles = files
+	oldFiles := currentSQLFiles()
+	setSQLFiles(files)
 	t.Cleanup(func() {
-		sqlFiles = oldFiles
+		setSQLFiles(oldFiles)
 	})
 }

@@ -35,24 +35,30 @@ import (
 )
 
 type Config struct {
-	Name                   string          `json:"name"`
-	Profile                string          `json:"profile"`
-	Version                string          `json:"version"`
-	Port                   int             `json:"Port"`
-	CertPath               string          `json:"CertPath"`
-	KeyPath                string          `json:"KeyPath"`
-	DatabaseType           string          `json:"DBType"`
-	DBUsername             string          `json:"DBUser"`
-	DBPassword             string          `json:"DBPassword"`
-	DBName                 string          `json:"DBName"`
-	DBHost                 string          `json:"DBHost"`
-	DBPort                 string          `json:"DBPort"`
-	MaxOpenConnections     int             `json:"MaxOpenConnections"`
-	MaxIdleConnections     int             `json:"MaxIdleConnections"`
-	ConnMaxLifetimeSeconds int             `json:"ConnMaxLifetimeSeconds"`
-	BasicAuth              BasicAuthConfig `json:"BasicAuth"`
-	Log                    LogConfig       `json:"log"`
-	JavascriptInclude      []string        `json:"javascript_include,omitempty"`
+	Name                   string             `json:"name"`
+	Profile                string             `json:"profile"`
+	Version                string             `json:"version"`
+	Port                   int                `json:"Port"`
+	CertPath               string             `json:"CertPath"`
+	KeyPath                string             `json:"KeyPath"`
+	DatabaseType           string             `json:"DBType"`
+	DBUsername             string             `json:"DBUser"`
+	DBPassword             string             `json:"DBPassword"`
+	DBName                 string             `json:"DBName"`
+	DBHost                 string             `json:"DBHost"`
+	DBPort                 string             `json:"DBPort"`
+	MaxOpenConnections     int                `json:"MaxOpenConnections"`
+	MaxIdleConnections     int                `json:"MaxIdleConnections"`
+	ConnMaxLifetimeSeconds int                `json:"ConnMaxLifetimeSeconds"`
+	BasicAuth              BasicAuthConfig    `json:"BasicAuth"`
+	Log                    LogConfig          `json:"log"`
+	JavascriptInclude      []string           `json:"javascript_include,omitempty"`
+	APIHotReload           APIHotReloadConfig `json:"APIHotReload"`
+}
+
+type APIHotReloadConfig struct {
+	Enabled  bool   `json:"Enabled"`
+	Interval string `json:"Interval"`
 }
 
 type BasicAuthConfig struct {
@@ -197,6 +203,7 @@ type JSONRPCError struct {
 
 var config Config
 var db *sql.DB
+var sqlFilesMu sync.RWMutex
 var sqlFiles map[string]APIConfig
 var dbType string
 var buildVersion = "v0.0.20"
@@ -212,10 +219,11 @@ type serviceFilePaths struct {
 }
 
 const (
-	apiTypeAPI      = "api"
-	apiTypeWSClient = "ws_client"
-	apiTypePublic   = "public"
-	apiTypeSchedule = "schedule"
+	apiTypeAPI                       = "api"
+	apiTypeWSClient                  = "ws_client"
+	apiTypePublic                    = "public"
+	apiTypeSchedule                  = "schedule"
+	defaultAPIHotReloadCheckInterval = time.Second
 )
 
 // reParams は、/*id*/ のようなプレースホルダーを抽出する正規表現
@@ -305,6 +313,10 @@ func main() {
 	if err = json.NewDecoder(configFile).Decode(&config); err != nil {
 		log.Fatalf("Failed to decode config JSON: %v", err)
 	}
+	apiHotReloadInterval, err := parseAPIHotReloadInterval(config.APIHotReload.Interval)
+	if err != nil {
+		log.Fatalf("Invalid APIHotReload.Interval: %v", err)
+	}
 	configBaseDir := filepath.Dir(paths.Config.Path)
 	apiBaseDir := filepath.Dir(paths.API.Path)
 	adjustPaths(configBaseDir, &config)
@@ -319,12 +331,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
-	loadSQLFiles(paths.API.Path, apiBaseDir)
+	initialSQLFiles, initialAPIHash, err := readSQLFiles(paths.API.Path, apiBaseDir)
+	if err != nil {
+		log.Fatalf("Failed to load API file: %v", err)
+	}
+	setSQLFiles(initialSQLFiles)
 	if err := startWebSocketClients(apiBaseDir); err != nil {
 		log.Printf("Failed to start WebSocket clients: %v", err)
 	}
 	if err := startScheduleJobs(apiBaseDir); err != nil {
 		log.Printf("Failed to start schedule jobs: %v", err)
+	}
+	if config.APIHotReload.Enabled {
+		log.Printf("API hot reload enabled: file=%s check_interval=%s", paths.API.Path, apiHotReloadInterval)
+		go watchAPIFile(paths.API.Path, apiBaseDir, apiHotReloadInterval, initialAPIHash)
+	} else {
+		log.Printf("API hot reload disabled")
 	}
 
 	corsHandler := cors.New(cors.Options{
@@ -401,7 +423,7 @@ func findPublicAPIForPath(requestPath string) (string, string, APIConfig, bool) 
 	var matchedKey string
 	var matchedPath string
 	var matchedConfig APIConfig
-	for apiKey, apiConfig := range sqlFiles {
+	for apiKey, apiConfig := range currentSQLFiles() {
 		if getAPIType(apiConfig) != apiTypePublic {
 			continue
 		}
@@ -462,24 +484,51 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func loadSQLFiles(apiFilePath, apiBaseDir string) {
+func parseAPIHotReloadInterval(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return defaultAPIHotReloadCheckInterval, nil
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, err
+	}
+	if interval <= 0 {
+		return 0, fmt.Errorf("must be greater than zero")
+	}
+	return interval, nil
+}
+
+func readSQLFiles(apiFilePath, apiBaseDir string) (map[string]APIConfig, [sha256.Size]byte, error) {
 	data, err := os.ReadFile(apiFilePath)
 	if err != nil {
-		log.Fatalf("Failed to read SQL files config: %v", err)
+		return nil, [sha256.Size]byte{}, fmt.Errorf("read api file: %w", err)
 	}
-	if err := json.Unmarshal(data, &sqlFiles); err != nil {
-		log.Fatalf("Failed to decode SQL files JSON: %v", err)
+	files, err := decodeSQLFiles(data, apiBaseDir)
+	if err != nil {
+		return nil, sha256.Sum256(data), err
 	}
-	for apiKey, apiConfig := range sqlFiles {
+	return files, sha256.Sum256(data), nil
+}
+
+func decodeSQLFiles(data []byte, apiBaseDir string) (map[string]APIConfig, error) {
+	var files map[string]APIConfig
+	if err := json.Unmarshal(data, &files); err != nil {
+		return nil, fmt.Errorf("decode api JSON: %w", err)
+	}
+	if files == nil {
+		return nil, fmt.Errorf("decode api JSON: top-level value must be an object")
+	}
+	for apiKey, apiConfig := range files {
 		if len(apiConfig.Script) > 0 && len(apiConfig.SQL) > 0 {
-			log.Fatalf("Configuration error in api.json for API '%s': If 'script' is set, 'sql' cannot be specified.", apiKey)
+			return nil, fmt.Errorf("configuration error for API %q: if script is set, sql cannot be specified", apiKey)
 		}
 	}
 
-	for apiKey, apiConfig := range sqlFiles {
+	for apiKey, apiConfig := range files {
 		for i, sqlPath := range apiConfig.SQL {
 			if !filepath.IsAbs(sqlPath) {
-				sqlFiles[apiKey].SQL[i] = filepath.Join(apiBaseDir, sqlPath)
+				apiConfig.SQL[i] = filepath.Join(apiBaseDir, sqlPath)
 			}
 		}
 		apiConfig.Script = resolvePathFromBase(apiBaseDir, apiConfig.Script)
@@ -488,7 +537,81 @@ func loadSQLFiles(apiFilePath, apiBaseDir string) {
 		if apiConfig.Path != "" && !filepath.IsAbs(apiConfig.Path) {
 			apiConfig.Path = filepath.Join(apiBaseDir, apiConfig.Path)
 		}
-		sqlFiles[apiKey] = apiConfig
+		files[apiKey] = apiConfig
+	}
+	return files, nil
+}
+
+func currentSQLFiles() map[string]APIConfig {
+	sqlFilesMu.RLock()
+	files := sqlFiles
+	sqlFilesMu.RUnlock()
+	return files
+}
+
+func setSQLFiles(files map[string]APIConfig) {
+	sqlFilesMu.Lock()
+	sqlFiles = files
+	sqlFilesMu.Unlock()
+}
+
+func backgroundSQLFiles(files map[string]APIConfig) map[string]APIConfig {
+	background := make(map[string]APIConfig)
+	for name, apiConfig := range files {
+		switch getAPIType(apiConfig) {
+		case apiTypeSchedule, apiTypeWSClient:
+			background[name] = apiConfig
+		}
+	}
+	return background
+}
+
+func reloadSQLFilesIfChanged(apiFilePath, apiBaseDir string, lastObservedHash [sha256.Size]byte) ([sha256.Size]byte, bool, error) {
+	data, err := os.ReadFile(apiFilePath)
+	if err != nil {
+		return lastObservedHash, false, fmt.Errorf("read api file: %w", err)
+	}
+	observedHash := sha256.Sum256(data)
+	if observedHash == lastObservedHash {
+		return lastObservedHash, false, nil
+	}
+
+	candidate, err := decodeSQLFiles(data, apiBaseDir)
+	if err != nil {
+		return observedHash, false, err
+	}
+	current := currentSQLFiles()
+	if !reflect.DeepEqual(backgroundSQLFiles(current), backgroundSQLFiles(candidate)) {
+		return observedHash, false, fmt.Errorf("schedule or ws_client definitions changed; restart is required")
+	}
+	if reflect.DeepEqual(current, candidate) {
+		return observedHash, false, nil
+	}
+
+	setSQLFiles(candidate)
+	return observedHash, true, nil
+}
+
+func watchAPIFile(apiFilePath, apiBaseDir string, interval time.Duration, initialHash [sha256.Size]byte) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	lastObservedHash := initialHash
+	lastReloadError := ""
+	for range ticker.C {
+		observedHash, reloaded, err := reloadSQLFilesIfChanged(apiFilePath, apiBaseDir, lastObservedHash)
+		lastObservedHash = observedHash
+		if err != nil {
+			if err.Error() != lastReloadError {
+				log.Printf("API hot reload failed: %v; current API configuration remains active", err)
+			}
+			lastReloadError = err.Error()
+			continue
+		}
+		lastReloadError = ""
+		if reloaded {
+			log.Printf("API hot reload succeeded: api_count=%d", len(currentSQLFiles()))
+		}
 	}
 }
 
@@ -896,7 +1019,7 @@ func (s cronSchedule) matches(t time.Time) bool {
 
 func startScheduleJobs(execDir string) error {
 	var firstErr error
-	for name, apiConfig := range sqlFiles {
+	for name, apiConfig := range currentSQLFiles() {
 		if getAPIType(apiConfig) != apiTypeSchedule {
 			continue
 		}
@@ -981,7 +1104,7 @@ func runScheduleJob(cfg scheduleJobConfig) {
 // startWebSocketClients は api.json に定義された ws_client を起動する。
 func startWebSocketClients(execDir string) error {
 	var firstErr error
-	for name, apiConfig := range sqlFiles {
+	for name, apiConfig := range currentSQLFiles() {
 		if getAPIType(apiConfig) != apiTypeWSClient {
 			continue
 		}
@@ -1232,7 +1355,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		sendJSONError(w, "API key is required and must be a string", http.StatusBadRequest)
 		return
 	}
-	apiConfig, exists := sqlFiles[apiKey]
+	apiConfig, exists := currentSQLFiles()[apiKey]
 	if !exists {
 		sendJSONError(w, "SQL files not found", http.StatusNotFound)
 		return
@@ -1721,9 +1844,9 @@ func checkPassword(user, pass string, config Config) bool {
 
 // handleNyan は、サーバ情報と各 API のキーと説明のみを返します。
 func handleNyan(w http.ResponseWriter, r *http.Request) {
-	// sqlFiles は map[string]APIConfig になっているので、必要な情報のみ抽出します。
+	// API定義から必要な情報のみ抽出します。
 	filteredApis := make(map[string]APIDetails)
-	for key, apiConf := range sqlFiles {
+	for key, apiConf := range currentSQLFiles() {
 		if getAPIType(apiConf) != apiTypeAPI {
 			continue
 		}
@@ -1766,7 +1889,7 @@ func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
 		sendJSONError(w, "API name is required", http.StatusBadRequest)
 		return
 	}
-	apiConfig, exists := sqlFiles[apiName]
+	apiConfig, exists := currentSQLFiles()[apiName]
 	if !exists {
 		sendJSONError(w, "API not found", http.StatusNotFound)
 		return
@@ -2272,7 +2395,7 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string
 		return "", fmt.Errorf("api name is required")
 	}
 
-	apiConfig, exists := sqlFiles[apiName]
+	apiConfig, exists := currentSQLFiles()[apiName]
 	if !exists {
 		return "", fmt.Errorf("API config not found: %s", apiName)
 	}
@@ -2874,7 +2997,7 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	apiConfig, exists := sqlFiles[apiKey]
+	apiConfig, exists := currentSQLFiles()[apiKey]
 	fmt.Print(apiConfig)
 	if !exists {
 		respondJSONRPCError(w, rpcReq.ID, -32601, "SQL files not found", nil)
@@ -3061,7 +3184,7 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 
 func performPush(apiConfig APIConfig, allParams map[string]interface{}) {
 	if apiConfig.Push != "" {
-		pushConfig, exists := sqlFiles[apiConfig.Push]
+		pushConfig, exists := currentSQLFiles()[apiConfig.Push]
 		if exists {
 			var pushResult []byte
 			var err error
