@@ -29,5 +29,9 @@
   "javascript_include": [
     "./javascript/lib/nyanRequestCheck.js",
     "./javascript/base.js"
-  ]
+  ],
+  "APIHotReload": {
+    "Enabled": true,
+    "Interval": "1s"
+  }
 }
