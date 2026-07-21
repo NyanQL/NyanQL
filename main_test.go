@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestGetParamCheckScriptPath(t *testing.T) {
@@ -400,7 +402,7 @@ func TestReloadSQLFilesIfChangedKeepsCurrentDefinitionOnInvalidJSON(t *testing.T
 	}
 }
 
-func TestReloadSQLFilesIfChangedRejectsBackgroundChanges(t *testing.T) {
+func TestReloadSQLFilesIfChangedAppliesBackgroundChanges(t *testing.T) {
 	tests := []struct {
 		name    string
 		initial string
@@ -431,17 +433,170 @@ func TestReloadSQLFilesIfChangedRejectsBackgroundChanges(t *testing.T) {
 			writeTestFile(t, apiPath, tt.changed)
 
 			_, reloaded, err := reloadSQLFilesIfChanged(apiPath, apiDir, initialHash)
-			if err == nil || !strings.Contains(err.Error(), "restart is required") {
-				t.Fatalf("reloadSQLFilesIfChanged() error = %v, want restart-required error", err)
+			if err != nil {
+				t.Fatalf("reloadSQLFilesIfChanged() error = %v", err)
+			}
+			if !reloaded {
+				t.Fatal("reloadSQLFilesIfChanged() reloaded = false, want true")
+			}
+			if currentSQLFiles()["api"].Description != "new" {
+				t.Fatal("HTTP API change was not applied with background change")
+			}
+		})
+	}
+}
+
+func TestReloadSQLFilesIfChangedRejectsInvalidBackgroundConfig(t *testing.T) {
+	tests := []struct {
+		name      string
+		candidate string
+	}{
+		{
+			name:      "schedule without script",
+			candidate: `{"job":{"type":"schedule","trigger":{"type":"cron","value":"0 10 * * *"}}}`,
+		},
+		{
+			name:      "ws_client without connectURL",
+			candidate: `{"client":{"type":"ws_client","script":"./client.js"}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apiDir := t.TempDir()
+			apiPath := filepath.Join(apiDir, "api.json")
+			writeTestFile(t, apiPath, `{"current":{"description":"active"}}`)
+			initialFiles, initialHash, err := readSQLFiles(apiPath, apiDir)
+			if err != nil {
+				t.Fatalf("readSQLFiles() error = %v", err)
+			}
+			setTestSQLFiles(t, initialFiles)
+			writeTestFile(t, apiPath, tt.candidate)
+
+			_, reloaded, err := reloadSQLFilesIfChanged(apiPath, apiDir, initialHash)
+			if err == nil {
+				t.Fatal("reloadSQLFilesIfChanged() error = nil, want validation error")
 			}
 			if reloaded {
 				t.Fatal("reloadSQLFilesIfChanged() reloaded = true, want false")
 			}
-			if currentSQLFiles()["api"].Description != "old" {
-				t.Fatal("HTTP API change was partially applied with background change")
+			if currentSQLFiles()["current"].Description != "active" {
+				t.Fatal("current API definition changed after invalid background config")
 			}
 		})
 	}
+}
+
+func TestBackgroundRuntimeManagerUpdatesAndStopsSchedule(t *testing.T) {
+	manager := newBackgroundRuntimeManager()
+	firstSchedule, err := parseCronSchedule("0 0 1 1 *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := scheduleJobConfig{
+		name:       "job",
+		scriptPath: "/tmp/job-v1.js",
+		trigger:    TriggerConfig{Type: "cron", Value: "0 0 1 1 *"},
+		schedule:   firstSchedule,
+	}
+	manager.reconcile(map[string]scheduleJobConfig{"job": first}, nil)
+
+	manager.mu.Lock()
+	runtime := manager.schedules["job"]
+	manager.mu.Unlock()
+	if runtime == nil {
+		t.Fatal("schedule runtime was not started")
+	}
+
+	secondSchedule, err := parseCronSchedule("0 0 2 1 *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := scheduleJobConfig{
+		name:       "job",
+		scriptPath: "/tmp/job-v2.js",
+		trigger:    TriggerConfig{Type: "cron", Value: "0 0 2 1 *"},
+		schedule:   secondSchedule,
+	}
+	manager.reconcile(map[string]scheduleJobConfig{"job": second}, nil)
+
+	manager.mu.Lock()
+	updatedRuntime := manager.schedules["job"]
+	manager.mu.Unlock()
+	if updatedRuntime != runtime {
+		t.Fatal("schedule update created a second runtime")
+	}
+	got, active := runtime.currentConfig()
+	if !active || got.scriptPath != second.scriptPath || got.trigger != second.trigger {
+		t.Fatalf("schedule runtime config = %#v, want %#v", got, second)
+	}
+
+	manager.reconcile(nil, nil)
+	waitForSignal(t, runtime.done, "schedule runtime stop")
+	waitForCondition(t, "schedule runtime cleanup", func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		_, exists := manager.schedules["job"]
+		return !exists
+	})
+}
+
+func TestBackgroundRuntimeManagerUpdatesWebSocketClient(t *testing.T) {
+	firstURL, firstConnected, firstDisconnected := newWebSocketRuntimeTestServer(t)
+	secondURL, secondConnected, secondDisconnected := newWebSocketRuntimeTestServer(t)
+	manager := newBackgroundRuntimeManager()
+	first := wsClientConfig{
+		name:        "client",
+		scriptPath:  "/tmp/client-v1.js",
+		connectURL:  firstURL,
+		description: "first",
+	}
+	manager.reconcile(nil, map[string]wsClientConfig{"client": first})
+	waitForSignal(t, firstConnected, "first WebSocket connection")
+
+	manager.mu.Lock()
+	runtime := manager.wsClients["client"]
+	manager.mu.Unlock()
+	if runtime == nil {
+		t.Fatal("ws_client runtime was not started")
+	}
+
+	softUpdate := first
+	softUpdate.scriptPath = "/tmp/client-v2.js"
+	softUpdate.description = "second"
+	manager.reconcile(nil, map[string]wsClientConfig{"client": softUpdate})
+	select {
+	case <-firstDisconnected:
+		t.Fatal("script/description update unexpectedly closed the WebSocket connection")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	manager.mu.Lock()
+	updatedRuntime := manager.wsClients["client"]
+	manager.mu.Unlock()
+	if updatedRuntime != runtime {
+		t.Fatal("ws_client update created a second runtime")
+	}
+	got, active := runtime.currentConfig()
+	if !active || got.scriptPath != softUpdate.scriptPath || got.description != softUpdate.description {
+		t.Fatalf("ws_client runtime config = %#v, want %#v", got, softUpdate)
+	}
+
+	reconnectUpdate := softUpdate
+	reconnectUpdate.connectURL = secondURL
+	manager.reconcile(nil, map[string]wsClientConfig{"client": reconnectUpdate})
+	waitForSignal(t, firstDisconnected, "old WebSocket disconnection")
+	waitForSignal(t, secondConnected, "new WebSocket connection")
+
+	manager.reconcile(nil, nil)
+	waitForSignal(t, secondDisconnected, "new WebSocket disconnection")
+	waitForSignal(t, runtime.done, "ws_client runtime stop")
+	waitForCondition(t, "ws_client runtime cleanup", func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		_, exists := manager.wsClients["client"]
+		return !exists
+	})
 }
 
 func TestSQLFilesConcurrentReadAndReplace(t *testing.T) {
@@ -707,6 +862,52 @@ func writeTestFile(t *testing.T, path string, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func newWebSocketRuntimeTestServer(t *testing.T) (string, <-chan struct{}, <-chan struct{}) {
+	t.Helper()
+	connected := make(chan struct{}, 4)
+	disconnected := make(chan struct{}, 4)
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		connected <- struct{}{}
+		defer func() {
+			_ = conn.Close()
+			disconnected <- struct{}{}
+		}()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+	return "ws" + strings.TrimPrefix(server.URL, "http"), connected, disconnected
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, label string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for %s", label)
+	}
+}
+
+func waitForCondition(t *testing.T, label string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", label)
 }
 
 func setTestSQLFiles(t *testing.T, files map[string]APIConfig) {

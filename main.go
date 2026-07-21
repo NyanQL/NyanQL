@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"crypto/sha256"
 	"database/sql"
@@ -205,6 +206,7 @@ var config Config
 var db *sql.DB
 var sqlFilesMu sync.RWMutex
 var sqlFiles map[string]APIConfig
+var backgroundRuntimes *backgroundRuntimeManager
 var dbType string
 var buildVersion = "v0.0.20"
 
@@ -337,11 +339,9 @@ func main() {
 		log.Fatalf("Failed to load API file: %v", err)
 	}
 	setSQLFiles(initialSQLFiles)
-	if err := startWebSocketClients(apiBaseDir); err != nil {
-		log.Printf("Failed to start WebSocket clients: %v", err)
-	}
-	if err := startScheduleJobs(apiBaseDir); err != nil {
-		log.Printf("Failed to start schedule jobs: %v", err)
+	backgroundRuntimes = newBackgroundRuntimeManager()
+	if err := backgroundRuntimes.start(initialSQLFiles, apiBaseDir); err != nil {
+		log.Printf("Failed to start one or more background runtimes: %v", err)
 	}
 	if config.APIHotReload.Enabled {
 		log.Printf("API hot reload enabled: file=%s check_interval=%s", paths.API.Path, apiHotReloadInterval)
@@ -561,17 +561,6 @@ func setSQLFiles(files map[string]APIConfig) {
 	sqlFilesMu.Unlock()
 }
 
-func backgroundSQLFiles(files map[string]APIConfig) map[string]APIConfig {
-	background := make(map[string]APIConfig)
-	for name, apiConfig := range files {
-		switch getAPIType(apiConfig) {
-		case apiTypeSchedule, apiTypeWSClient:
-			background[name] = apiConfig
-		}
-	}
-	return background
-}
-
 func reloadSQLFilesIfChanged(apiFilePath, apiBaseDir string, lastObservedHash [sha256.Size]byte) ([sha256.Size]byte, bool, error) {
 	data, err := os.ReadFile(apiFilePath)
 	if err != nil {
@@ -587,14 +576,22 @@ func reloadSQLFilesIfChanged(apiFilePath, apiBaseDir string, lastObservedHash [s
 		return observedHash, false, err
 	}
 	current := currentSQLFiles()
-	if !reflect.DeepEqual(backgroundSQLFiles(current), backgroundSQLFiles(candidate)) {
-		return observedHash, false, fmt.Errorf("schedule or ws_client definitions changed; restart is required")
-	}
 	if reflect.DeepEqual(current, candidate) {
 		return observedHash, false, nil
 	}
+	schedules, scheduleErr := buildScheduleJobConfigs(candidate, apiBaseDir)
+	wsClients, wsClientErr := buildWSClientConfigs(candidate, apiBaseDir)
+	if scheduleErr != nil {
+		return observedHash, false, scheduleErr
+	}
+	if wsClientErr != nil {
+		return observedHash, false, wsClientErr
+	}
 
 	setSQLFiles(candidate)
+	if backgroundRuntimes != nil {
+		backgroundRuntimes.reconcile(schedules, wsClients)
+	}
 	return observedHash, true, nil
 }
 
@@ -868,6 +865,121 @@ type scheduleJobConfig struct {
 	schedule    cronSchedule
 }
 
+type backgroundRuntimeManager struct {
+	mu        sync.Mutex
+	schedules map[string]*scheduleRuntime
+	wsClients map[string]*wsClientRuntime
+}
+
+type scheduleRuntime struct {
+	mu      sync.Mutex
+	desired *scheduleJobConfig
+	wake    chan struct{}
+	done    chan struct{}
+	stopped bool
+}
+
+type wsClientRuntime struct {
+	mu         sync.Mutex
+	desired    *wsClientConfig
+	wake       chan struct{}
+	done       chan struct{}
+	stopped    bool
+	conn       *websocket.Conn
+	dialCancel context.CancelFunc
+}
+
+func newBackgroundRuntimeManager() *backgroundRuntimeManager {
+	return &backgroundRuntimeManager{
+		schedules: make(map[string]*scheduleRuntime),
+		wsClients: make(map[string]*wsClientRuntime),
+	}
+}
+
+func (manager *backgroundRuntimeManager) start(files map[string]APIConfig, execDir string) error {
+	schedules, scheduleErr := buildScheduleJobConfigs(files, execDir)
+	wsClients, wsClientErr := buildWSClientConfigs(files, execDir)
+	manager.reconcile(schedules, wsClients)
+	if scheduleErr != nil && wsClientErr != nil {
+		return fmt.Errorf("%v; %v", scheduleErr, wsClientErr)
+	}
+	if scheduleErr != nil {
+		return scheduleErr
+	}
+	return wsClientErr
+}
+
+func (manager *backgroundRuntimeManager) reconcile(schedules map[string]scheduleJobConfig, wsClients map[string]wsClientConfig) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	for name, runtime := range manager.schedules {
+		if _, exists := schedules[name]; exists {
+			continue
+		}
+		if _, changed := runtime.update(nil); changed {
+			log.Printf("Stopping schedule job %s", name)
+		}
+	}
+	for name, cfg := range schedules {
+		if runtime, exists := manager.schedules[name]; exists {
+			accepted, changed := runtime.update(&cfg)
+			if accepted {
+				if changed {
+					log.Printf("Updated schedule job %s with cron %q", name, cfg.trigger.Value)
+				}
+				continue
+			}
+		}
+		runtime := newScheduleRuntime(cfg)
+		manager.schedules[name] = runtime
+		log.Printf("Starting schedule job %s with cron %q", name, cfg.trigger.Value)
+		go manager.runSchedule(name, runtime)
+	}
+
+	for name, runtime := range manager.wsClients {
+		if _, exists := wsClients[name]; exists {
+			continue
+		}
+		if _, changed, _ := runtime.update(nil); changed {
+			log.Printf("Stopping WebSocket client %s", name)
+		}
+	}
+	for name, cfg := range wsClients {
+		if runtime, exists := manager.wsClients[name]; exists {
+			accepted, changed, reconnect := runtime.update(&cfg)
+			if accepted {
+				if changed {
+					log.Printf("Updated WebSocket client %s reconnect=%t", name, reconnect)
+				}
+				continue
+			}
+		}
+		runtime := newWSClientRuntime(cfg)
+		manager.wsClients[name] = runtime
+		log.Printf("Starting WebSocket client %s -> %s", name, cfg.connectURL)
+		go manager.runWSClient(name, runtime)
+	}
+}
+
+func (manager *backgroundRuntimeManager) runSchedule(name string, runtime *scheduleRuntime) {
+	runtime.run()
+	manager.mu.Lock()
+	if manager.schedules[name] == runtime {
+		delete(manager.schedules, name)
+	}
+	manager.mu.Unlock()
+}
+
+func (manager *backgroundRuntimeManager) runWSClient(name string, runtime *wsClientRuntime) {
+	runtime.run()
+	manager.mu.Lock()
+	if manager.wsClients[name] == runtime {
+		delete(manager.wsClients, name)
+	}
+	manager.mu.Unlock()
+}
+
 type cronSchedule struct {
 	minutes     cronField
 	hours       cronField
@@ -1023,9 +1135,10 @@ func (s cronSchedule) matches(t time.Time) bool {
 		s.months[int(t.Month())]
 }
 
-func startScheduleJobs(execDir string) error {
+func buildScheduleJobConfigs(files map[string]APIConfig, execDir string) (map[string]scheduleJobConfig, error) {
+	configs := make(map[string]scheduleJobConfig)
 	var firstErr error
-	for name, apiConfig := range currentSQLFiles() {
+	for name, apiConfig := range files {
 		if getAPIType(apiConfig) != apiTypeSchedule {
 			continue
 		}
@@ -1036,7 +1149,6 @@ func startScheduleJobs(execDir string) error {
 
 		if scriptPath == "" {
 			err := fmt.Errorf("schedule %s: script is missing", name)
-			log.Print(err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -1044,7 +1156,6 @@ func startScheduleJobs(execDir string) error {
 		}
 		if triggerType != "cron" {
 			err := fmt.Errorf("schedule %s: unsupported trigger type %q", name, triggerType)
-			log.Print(err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -1053,7 +1164,6 @@ func startScheduleJobs(execDir string) error {
 		schedule, err := parseCronSchedule(triggerValue)
 		if err != nil {
 			err = fmt.Errorf("schedule %s: invalid cron trigger %q: %w", name, triggerValue, err)
-			log.Print(err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -1065,52 +1175,138 @@ func startScheduleJobs(execDir string) error {
 			scriptAbs = filepath.Join(execDir, scriptPath)
 		}
 
-		cfg := scheduleJobConfig{
+		configs[name] = scheduleJobConfig{
 			name:        name,
 			scriptPath:  scriptAbs,
 			trigger:     apiConfig.Trigger,
 			description: apiConfig.Description,
 			schedule:    schedule,
 		}
-
-		log.Printf("Starting schedule job %s with cron %q", cfg.name, cfg.trigger.Value)
-		go runScheduleJob(cfg)
 	}
 
-	return firstErr
+	return configs, firstErr
 }
 
-func runScheduleJob(cfg scheduleJobConfig) {
+func newScheduleRuntime(cfg scheduleJobConfig) *scheduleRuntime {
+	copyOfConfig := cfg
+	return &scheduleRuntime{
+		desired: &copyOfConfig,
+		wake:    make(chan struct{}, 1),
+		done:    make(chan struct{}),
+	}
+}
+
+func sameScheduleJobConfig(a, b scheduleJobConfig) bool {
+	return a.name == b.name &&
+		a.scriptPath == b.scriptPath &&
+		a.trigger == b.trigger
+}
+
+func signalRuntime(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (runtime *scheduleRuntime) update(cfg *scheduleJobConfig) (bool, bool) {
+	runtime.mu.Lock()
+	if runtime.stopped {
+		runtime.mu.Unlock()
+		return false, false
+	}
+	if cfg == nil {
+		if runtime.desired == nil {
+			runtime.mu.Unlock()
+			return true, false
+		}
+		runtime.desired = nil
+		runtime.mu.Unlock()
+		signalRuntime(runtime.wake)
+		return true, true
+	}
+	if runtime.desired != nil && sameScheduleJobConfig(*runtime.desired, *cfg) {
+		runtime.mu.Unlock()
+		return true, false
+	}
+	copyOfConfig := *cfg
+	runtime.desired = &copyOfConfig
+	runtime.mu.Unlock()
+	signalRuntime(runtime.wake)
+	return true, true
+}
+
+func (runtime *scheduleRuntime) currentConfigOrStop() (scheduleJobConfig, bool) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.desired == nil {
+		runtime.stopped = true
+		return scheduleJobConfig{}, false
+	}
+	return *runtime.desired, true
+}
+
+func (runtime *scheduleRuntime) currentConfig() (scheduleJobConfig, bool) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.desired == nil {
+		return scheduleJobConfig{}, false
+	}
+	return *runtime.desired, true
+}
+
+func (runtime *scheduleRuntime) run() {
+	defer close(runtime.done)
 	for {
+		cfg, active := runtime.currentConfigOrStop()
+		if !active {
+			return
+		}
 		next := cfg.schedule.next(time.Now())
 		if next.IsZero() {
 			log.Printf("Schedule job %s has no next run time", cfg.name)
-			return
+			<-runtime.wake
+			continue
 		}
 
 		log.Printf("Schedule job %s next run at %s", cfg.name, next.Format(time.RFC3339))
 		timer := time.NewTimer(time.Until(next))
-		<-timer.C
-
-		params := map[string]interface{}{
-			"nyan_job_name":              cfg.name,
-			"nyan_schedule_trigger_type": cfg.trigger.Type,
-			"nyan_schedule_trigger":      cfg.trigger.Value,
-			"nyan_schedule_time":         next.Format(time.RFC3339),
+		select {
+		case <-runtime.wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			continue
+		case <-timer.C:
 		}
-		result, err := runScript([]string{cfg.scriptPath}, params)
-		if err != nil {
-			log.Printf("Schedule job %s failed: %v", cfg.name, err)
+
+		latest, active := runtime.currentConfig()
+		if !active || !sameScheduleJobConfig(cfg, latest) {
 			continue
 		}
-		log.Printf("Schedule job %s completed: %s", cfg.name, result)
+
+		params := map[string]interface{}{
+			"nyan_job_name":              latest.name,
+			"nyan_schedule_trigger_type": latest.trigger.Type,
+			"nyan_schedule_trigger":      latest.trigger.Value,
+			"nyan_schedule_time":         next.Format(time.RFC3339),
+		}
+		result, err := runScript([]string{latest.scriptPath}, params)
+		if err != nil {
+			log.Printf("Schedule job %s failed: %v", latest.name, err)
+			continue
+		}
+		log.Printf("Schedule job %s completed: %s", latest.name, result)
 	}
 }
 
-// startWebSocketClients は api.json に定義された ws_client を起動する。
-func startWebSocketClients(execDir string) error {
+func buildWSClientConfigs(files map[string]APIConfig, execDir string) (map[string]wsClientConfig, error) {
+	configs := make(map[string]wsClientConfig)
 	var firstErr error
-	for name, apiConfig := range currentSQLFiles() {
+	for name, apiConfig := range files {
 		if getAPIType(apiConfig) != apiTypeWSClient {
 			continue
 		}
@@ -1120,7 +1316,6 @@ func startWebSocketClients(execDir string) error {
 
 		if scriptPath == "" {
 			err := fmt.Errorf("ws_client %s: script is missing", name)
-			log.Print(err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -1128,7 +1323,6 @@ func startWebSocketClients(execDir string) error {
 		}
 		if connectURLRaw == "" {
 			err := fmt.Errorf("ws_client %s: connectURL is missing", name)
-			log.Print(err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -1137,9 +1331,8 @@ func startWebSocketClients(execDir string) error {
 
 		connectURL, err := resolveConnectURL(connectURLRaw)
 		if err != nil {
-			log.Printf("ws_client %s: %v", name, err)
 			if firstErr == nil {
-				firstErr = err
+				firstErr = fmt.Errorf("ws_client %s: %w", name, err)
 			}
 			continue
 		}
@@ -1149,44 +1342,194 @@ func startWebSocketClients(execDir string) error {
 			scriptAbs = filepath.Join(execDir, scriptPath)
 		}
 
-		cfg := wsClientConfig{
+		configs[name] = wsClientConfig{
 			name:        name,
 			scriptPath:  scriptAbs,
 			connectURL:  connectURL,
 			description: apiConfig.Description,
 		}
-
-		log.Printf("Starting WebSocket client %s -> %s", cfg.name, cfg.connectURL)
-		go runWebSocketClient(cfg)
 	}
 
-	return firstErr
+	return configs, firstErr
 }
 
-// 常時接続を維持し、切断時は指数バックオフで再接続する。
-func runWebSocketClient(cfg wsClientConfig) {
+func newWSClientRuntime(cfg wsClientConfig) *wsClientRuntime {
+	copyOfConfig := cfg
+	return &wsClientRuntime{
+		desired: &copyOfConfig,
+		wake:    make(chan struct{}, 1),
+		done:    make(chan struct{}),
+	}
+}
+
+func sameWSClientConfig(a, b wsClientConfig) bool {
+	return a == b
+}
+
+func (runtime *wsClientRuntime) update(cfg *wsClientConfig) (bool, bool, bool) {
+	runtime.mu.Lock()
+	if runtime.stopped {
+		runtime.mu.Unlock()
+		return false, false, false
+	}
+	if cfg == nil {
+		if runtime.desired == nil {
+			runtime.mu.Unlock()
+			return true, false, false
+		}
+		runtime.desired = nil
+		conn := runtime.conn
+		cancel := runtime.dialCancel
+		runtime.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if conn != nil {
+			_ = conn.Close()
+		}
+		signalRuntime(runtime.wake)
+		return true, true, false
+	}
+	if runtime.desired != nil && sameWSClientConfig(*runtime.desired, *cfg) {
+		runtime.mu.Unlock()
+		return true, false, false
+	}
+	reconnect := runtime.desired == nil || runtime.desired.connectURL != cfg.connectURL
+	copyOfConfig := *cfg
+	runtime.desired = &copyOfConfig
+	conn := runtime.conn
+	cancel := runtime.dialCancel
+	runtime.mu.Unlock()
+	if reconnect {
+		if cancel != nil {
+			cancel()
+		}
+		if conn != nil {
+			_ = conn.Close()
+		}
+		signalRuntime(runtime.wake)
+	}
+	return true, true, reconnect
+}
+
+func (runtime *wsClientRuntime) currentConfigOrStop() (wsClientConfig, bool) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.desired == nil {
+		runtime.stopped = true
+		return wsClientConfig{}, false
+	}
+	return *runtime.desired, true
+}
+
+func (runtime *wsClientRuntime) currentConfig() (wsClientConfig, bool) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.desired == nil {
+		return wsClientConfig{}, false
+	}
+	return *runtime.desired, true
+}
+
+func (runtime *wsClientRuntime) beginDial(cfg wsClientConfig) (context.Context, context.CancelFunc, bool) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.stopped || runtime.desired == nil || runtime.desired.connectURL != cfg.connectURL {
+		return nil, nil, false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime.dialCancel = cancel
+	return ctx, cancel, true
+}
+
+func (runtime *wsClientRuntime) finishDial(cancel context.CancelFunc) {
+	runtime.mu.Lock()
+	runtime.dialCancel = nil
+	runtime.mu.Unlock()
+	cancel()
+}
+
+func (runtime *wsClientRuntime) acceptConnection(conn *websocket.Conn, connectURL string) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.stopped || runtime.desired == nil || runtime.desired.connectURL != connectURL {
+		return false
+	}
+	runtime.conn = conn
+	return true
+}
+
+func (runtime *wsClientRuntime) clearConnection(conn *websocket.Conn) {
+	runtime.mu.Lock()
+	if runtime.conn == conn {
+		runtime.conn = nil
+	}
+	runtime.mu.Unlock()
+}
+
+// 常時接続を維持し、設定変更や削除に応じて接続を更新する。
+func (runtime *wsClientRuntime) run() {
+	defer close(runtime.done)
 	backoff := time.Second
 	for {
-		err := connectAndListenWebSocket(cfg)
+		cfg, active := runtime.currentConfigOrStop()
+		if !active {
+			return
+		}
+
+		err := runtime.connectAndListen(cfg)
+		latest, active := runtime.currentConfigOrStop()
+		if !active {
+			return
+		}
+		if latest.connectURL != cfg.connectURL {
+			select {
+			case <-runtime.wake:
+			default:
+			}
+			backoff = time.Second
+			continue
+		}
 		if err != nil {
 			log.Printf("WebSocket client %s disconnected: %v", cfg.name, err)
 		}
 
-		time.Sleep(backoff)
-		if backoff < 30*time.Second {
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
+		timer := time.NewTimer(backoff)
+		select {
+		case <-runtime.wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			backoff = time.Second
+		case <-timer.C:
+			if backoff < 30*time.Second {
+				backoff *= 2
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
 			}
 		}
 	}
 }
 
-func connectAndListenWebSocket(cfg wsClientConfig) error {
-	conn, _, err := websocket.DefaultDialer.Dial(cfg.connectURL, nil)
+func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
+	ctx, cancel, ok := runtime.beginDial(cfg)
+	if !ok {
+		return nil
+	}
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, cfg.connectURL, nil)
+	runtime.finishDial(cancel)
 	if err != nil {
 		return fmt.Errorf("dial failed: %w", err)
 	}
+	if !runtime.acceptConnection(conn, cfg.connectURL) {
+		_ = conn.Close()
+		return nil
+	}
+	defer runtime.clearConnection(conn)
 	defer conn.Close()
 
 	log.Printf("WebSocket client %s connected", cfg.name)
@@ -1203,13 +1546,18 @@ func connectAndListenWebSocket(cfg wsClientConfig) error {
 
 		log.Printf("ws_client %s received %s: %s", cfg.name, websocketMessageTypeLabel(msgType), string(data))
 
+		latest, active := runtime.currentConfig()
+		if !active || latest.connectURL != cfg.connectURL {
+			return nil
+		}
+
 		allParams := map[string]interface{}{
-			"api":             cfg.name,
-			"ws_client":       cfg.name,
+			"api":             latest.name,
+			"ws_client":       latest.name,
 			"ws_message_type": websocketMessageTypeLabel(msgType),
 			"ws_message_text": string(data),
-			"ws_connect_url":  cfg.connectURL,
-			"ws_description":  cfg.description,
+			"ws_connect_url":  latest.connectURL,
+			"ws_description":  latest.description,
 		}
 
 		if msgType == websocket.BinaryMessage {
@@ -1223,9 +1571,9 @@ func connectAndListenWebSocket(cfg wsClientConfig) error {
 			}
 		}
 
-		result, err := runScript([]string{cfg.scriptPath}, allParams)
+		result, err := runScript([]string{latest.scriptPath}, allParams)
 		if err != nil {
-			log.Printf("ws_client %s script error: %v", cfg.name, err)
+			log.Printf("ws_client %s script error: %v", latest.name, err)
 			continue
 		}
 
