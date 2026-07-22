@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -836,6 +837,563 @@ WHERE
 	}
 }
 
+func TestBasicAuthAllowsOnlyConfiguredCredentials(t *testing.T) {
+	cfg := Config{BasicAuth: BasicAuthConfig{Username: "nyan", Password: "secret"}}
+	called := false
+	handler := basicAuth(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	}, cfg)
+
+	tests := []struct {
+		name       string
+		username   string
+		password   string
+		setAuth    bool
+		wantStatus int
+	}{
+		{name: "missing", wantStatus: http.StatusUnauthorized},
+		{name: "wrong password", username: "nyan", password: "wrong", setAuth: true, wantStatus: http.StatusUnauthorized},
+		{name: "accepted", username: "nyan", password: "secret", setAuth: true, wantStatus: http.StatusNoContent},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called = false
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			if tt.setAuth {
+				req.SetBasicAuth(tt.username, tt.password)
+			}
+			rec := httptest.NewRecorder()
+			handler(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%q", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if called != (tt.wantStatus == http.StatusNoContent) {
+				t.Fatalf("next handler called = %t", called)
+			}
+			if tt.wantStatus == http.StatusUnauthorized && rec.Header().Get("WWW-Authenticate") == "" {
+				t.Fatal("WWW-Authenticate header is missing")
+			}
+		})
+	}
+}
+
+func TestRowsToJSONConvertsBlobsAndNulls(t *testing.T) {
+	testDB := setTestSQLiteDB(t)
+	rows, err := testDB.Query(`SELECT CAST('{"ok":true}' AS BLOB) AS document, CAST('plain' AS BLOB) AS text_value, NULL AS empty_value`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	data, err := RowsToJSON(rows)
+	if err != nil {
+		t.Fatalf("RowsToJSON() error = %v", err)
+	}
+	var result []map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("json.Unmarshal(%q) error = %v", data, err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("row count = %d, want 1", len(result))
+	}
+	document, ok := result[0]["document"].(map[string]interface{})
+	if !ok || document["ok"] != true {
+		t.Fatalf("document = %#v, want parsed JSON object", result[0]["document"])
+	}
+	if result[0]["text_value"] != "plain" {
+		t.Fatalf("text_value = %#v, want plain", result[0]["text_value"])
+	}
+	if result[0]["empty_value"] != nil {
+		t.Fatalf("empty_value = %#v, want nil", result[0]["empty_value"])
+	}
+}
+
+func TestHandleRequestExecutesSQLAPI(t *testing.T) {
+	setTestSQLiteDB(t)
+	resetJavascriptInclude(t)
+	sqlPath := filepath.Join(t.TempDir(), "lookup.sql")
+	writeTestFile(t, sqlPath, `SELECT /*id*/0 AS id, CAST('{"source":"http"}' AS BLOB) AS metadata`)
+	setTestSQLFiles(t, map[string]APIConfig{
+		"lookup": {SQL: []string{sqlPath}, Description: "lookup"},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/lookup?id=42", nil)
+	rec := httptest.NewRecorder()
+	handleRequest(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Success bool                     `json:"success"`
+		Status  int                      `json:"status"`
+		Result  []map[string]interface{} `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to decode response %q: %v", rec.Body.String(), err)
+	}
+	if !response.Success || response.Status != http.StatusOK || len(response.Result) != 1 {
+		t.Fatalf("response = %#v", response)
+	}
+	if fmt.Sprint(response.Result[0]["id"]) != "42" {
+		t.Fatalf("id = %#v, want 42", response.Result[0]["id"])
+	}
+	metadata, ok := response.Result[0]["metadata"].(map[string]interface{})
+	if !ok || metadata["source"] != "http" {
+		t.Fatalf("metadata = %#v", response.Result[0]["metadata"])
+	}
+}
+
+func TestHandleJSONRPCExecutesSQLAPI(t *testing.T) {
+	setTestSQLiteDB(t)
+	resetJavascriptInclude(t)
+	sqlPath := filepath.Join(t.TempDir(), "lookup.sql")
+	writeTestFile(t, sqlPath, `SELECT /*id*/0 AS id`)
+	setTestSQLFiles(t, map[string]APIConfig{
+		"lookup": {SQL: []string{sqlPath}},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/nyan-rpc", strings.NewReader(`{"jsonrpc":"2.0","method":"lookup","params":{"id":42},"id":7}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handleJSONRPC(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	var response map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to decode response %q: %v", rec.Body.String(), err)
+	}
+	if response["jsonrpc"] != "2.0" || fmt.Sprint(response["id"]) != "7" {
+		t.Fatalf("JSON-RPC envelope = %#v", response)
+	}
+	result, ok := response["result"].(map[string]interface{})
+	if !ok || result["success"] != true {
+		t.Fatalf("result = %#v", response["result"])
+	}
+	rows, ok := result["result"].([]interface{})
+	if !ok || len(rows) != 1 {
+		t.Fatalf("SQL rows = %#v", result["result"])
+	}
+}
+
+func TestHandleJSONRPCRejectsInvalidJSON(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/nyan-rpc", strings.NewReader(`{"jsonrpc":`))
+	rec := httptest.NewRecorder()
+	handleJSONRPC(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%q", rec.Code, rec.Body.String())
+	}
+	var response JSONRPCResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error == nil || response.Error.Code != -32700 {
+		t.Fatalf("error = %#v, want parse error", response.Error)
+	}
+}
+
+func TestRunScriptUsesParamsAndCommits(t *testing.T) {
+	setTestSQLiteDB(t)
+	resetJavascriptInclude(t)
+	scriptPath := writeTestScript(t, `JSON.stringify({success: true, value: nyanAllParams.value});`)
+
+	result, err := runScript([]string{scriptPath}, map[string]interface{}{"value": "hello"})
+	if err != nil {
+		t.Fatalf("runScript() error = %v", err)
+	}
+	var decoded map[string]interface{}
+	if err := json.Unmarshal([]byte(result), &decoded); err != nil {
+		t.Fatalf("runScript() result = %q: %v", result, err)
+	}
+	if decoded["success"] != true || decoded["value"] != "hello" {
+		t.Fatalf("runScript() result = %#v", decoded)
+	}
+}
+
+func TestCallNyanAPIFromVMExecutesSQL(t *testing.T) {
+	setTestSQLiteDB(t)
+	resetJavascriptInclude(t)
+	sqlPath := filepath.Join(t.TempDir(), "lookup.sql")
+	writeTestFile(t, sqlPath, `SELECT /*name*/'unknown' AS name`)
+	setTestSQLFiles(t, map[string]APIConfig{
+		"lookup": {SQL: []string{sqlPath}},
+	})
+
+	result, err := callNyanAPIFromVM("lookup", map[string]interface{}{"name": "mike"})
+	if err != nil {
+		t.Fatalf("callNyanAPIFromVM() error = %v", err)
+	}
+	var response struct {
+		Success bool                     `json:"success"`
+		Result  []map[string]interface{} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		t.Fatalf("failed to decode %q: %v", result, err)
+	}
+	if !response.Success || len(response.Result) != 1 || response.Result[0]["name"] != "mike" {
+		t.Fatalf("response = %#v", response)
+	}
+}
+
+func TestHubBroadcastsToRequestedChannel(t *testing.T) {
+	oldHub := hub
+	hub = NewHub()
+	t.Cleanup(func() { hub = oldHub })
+
+	server := httptest.NewServer(http.HandlerFunc(handleWebSocket))
+	t.Cleanup(server.Close)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/updates"
+	headers := http.Header{"Origin": []string{"https://example.invalid"}}
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
+	if err != nil {
+		t.Fatalf("WebSocket dial failed: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	waitForCondition(t, "WebSocket client registration", func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return len(hub.clients["updates"]) == 1
+	})
+	hub.Broadcast("updates", []byte("hello"))
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	messageType, message, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("WebSocket read failed: %v", err)
+	}
+	if messageType != websocket.TextMessage || string(message) != "hello" {
+		t.Fatalf("message type=%d body=%q", messageType, message)
+	}
+}
+
+func TestHTTPClientHelpers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			user, pass, ok := r.BasicAuth()
+			if !ok || user != "nyan" || pass != "secret" {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte("get-ok"))
+		case http.MethodPost:
+			if r.Header.Get("X-Nyan-Test") != "yes" {
+				http.Error(w, "missing header", http.StatusBadRequest)
+				return
+			}
+			var body map[string]interface{}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["value"] != "post" {
+				http.Error(w, "invalid body", http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte("post-ok"))
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	getResult, err := getAPI(server.URL, "nyan", "secret")
+	if err != nil || getResult != "get-ok" {
+		t.Fatalf("getAPI() result=%q error=%v", getResult, err)
+	}
+	postResult, err := jsonAPI(server.URL, []byte(`{"value":"post"}`), "", "", map[string]string{"X-Nyan-Test": "yes"})
+	if err != nil || postResult != "post-ok" {
+		t.Fatalf("jsonAPI() result=%q error=%v", postResult, err)
+	}
+}
+
+func TestQueryClassification(t *testing.T) {
+	tests := []struct {
+		query         string
+		wantSelect    bool
+		wantReturning bool
+	}{
+		{query: "SELECT 1", wantSelect: true},
+		{query: "  with values_cte as (select 1) select * from values_cte", wantSelect: true},
+		{query: "UPDATE items SET name = 'x'", wantSelect: false},
+		{query: "WITH updated AS (UPDATE items SET name = 'x' RETURNING id) SELECT id FROM updated", wantReturning: true},
+		{query: "INSERT INTO items(name) VALUES ('x') RETURNING id", wantReturning: true},
+	}
+	for _, tt := range tests {
+		if got := isSelectQuery(tt.query); got != tt.wantSelect {
+			t.Errorf("isSelectQuery(%q) = %t, want %t", tt.query, got, tt.wantSelect)
+		}
+		if got := isReturningQuery(tt.query); got != tt.wantReturning {
+			t.Errorf("isReturningQuery(%q) = %t, want %t", tt.query, got, tt.wantReturning)
+		}
+	}
+}
+
+func TestMetadataParsers(t *testing.T) {
+	sqlPath := filepath.Join(t.TempDir(), "metadata.sql")
+	writeTestFile(t, sqlPath, `SELECT /*count*/'10' AS count, /*ratio*/"1.5" AS ratio, /*name*/'nyan' AS name`)
+	params, err := parseSQLParams([]string{sqlPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if params["count"] != 10 || params["ratio"] != 1.5 || params["name"] != "nyan" {
+		t.Fatalf("params = %#v", params)
+	}
+
+	scriptPath := writeTestScript(t, `
+const nyanAcceptedParams = {"name":"default"};
+const nyanOutputColumns = ["id", "name"];
+`)
+	accepted, columns, err := parseScriptConstants(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted["name"] != "default" || !reflect.DeepEqual(columns, []string{"id", "name"}) {
+		t.Fatalf("accepted=%#v columns=%#v", accepted, columns)
+	}
+}
+
+func TestCronScheduleNext(t *testing.T) {
+	schedule, err := parseCronSchedule("*/15 9-10 * * 1-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := time.Date(2026, time.July, 20, 8, 59, 30, 0, time.UTC)
+	want := time.Date(2026, time.July, 20, 9, 0, 0, 0, time.UTC)
+	if got := schedule.next(after); !got.Equal(want) {
+		t.Fatalf("next() = %s, want %s", got, want)
+	}
+}
+
+func TestHandleNyanListsOnlyHTTPAPIs(t *testing.T) {
+	oldConfig := config
+	config = Config{Name: "NyanQL", Profile: "test", Version: "v-test"}
+	t.Cleanup(func() { config = oldConfig })
+	setTestSQLFiles(t, map[string]APIConfig{
+		"http-api": {Description: "visible"},
+		"job":      {Type: apiTypeSchedule, Description: "hidden"},
+		"client":   {Type: apiTypeWSClient, Description: "hidden"},
+	})
+
+	rec := httptest.NewRecorder()
+	handleNyan(rec, httptest.NewRequest(http.MethodGet, "/nyan/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%q", rec.Code, rec.Body.String())
+	}
+	var response NyanResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Name != "NyanQL" || len(response.Apis) != 1 || response.Apis["http-api"].Description != "visible" {
+		t.Fatalf("response = %#v", response)
+	}
+}
+
+func TestSaveBase64ToFileAndHashes(t *testing.T) {
+	destination := filepath.Join(t.TempDir(), "nested", "message.txt")
+	if err := saveBase64ToFile(destination, "aGVsbG8="); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "hello" {
+		t.Fatalf("content = %q, want hello", content)
+	}
+	if err := saveBase64ToFile(destination, "not-base64"); err == nil {
+		t.Fatal("saveBase64ToFile() error = nil, want invalid base64 error")
+	}
+	if got := sha256Hash("abc"); got != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" {
+		t.Fatalf("sha256Hash(abc) = %q", got)
+	}
+	if got := sha1Hash("abc"); got != "a9993e364706816aba3e25717850c26c9cd0d89d" {
+		t.Fatalf("sha1Hash(abc) = %q", got)
+	}
+}
+
+func TestConnectDBRejectsUnsupportedDatabase(t *testing.T) {
+	if _, err := connectDB(Config{DatabaseType: "unsupported"}); err == nil {
+		t.Fatal("connectDB() error = nil, want unsupported database error")
+	}
+}
+
+func TestRunScriptCommitsAndRollsBackNyanRunSQL(t *testing.T) {
+	testDB := setTestSQLiteDB(t)
+	resetJavascriptInclude(t)
+	if _, err := testDB.Exec(`CREATE TABLE items (name TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	sqlPath := filepath.Join(t.TempDir(), "insert.sql")
+	writeTestFile(t, sqlPath, `INSERT INTO items(name) VALUES (/*name*/'default')`)
+	encodedPath, err := json.Marshal(sqlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	commitScript := writeTestScript(t, fmt.Sprintf(`
+nyanRunSQL(%s, {name: "committed"});
+JSON.stringify({success: true});
+`, encodedPath))
+	if _, err := runScript([]string{commitScript}, nil); err != nil {
+		t.Fatalf("committing script failed: %v", err)
+	}
+
+	rollbackScript := writeTestScript(t, fmt.Sprintf(`
+nyanRunSQL(%s, {name: "rolled-back"});
+throw new Error("stop");
+`, encodedPath))
+	if _, err := runScript([]string{rollbackScript}, nil); err == nil {
+		t.Fatal("failing script error = nil")
+	}
+
+	rows, err := testDB.Query(`SELECT name FROM items ORDER BY name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(names, []string{"committed"}) {
+		t.Fatalf("stored names = %#v, want only committed row", names)
+	}
+}
+
+func TestHandleNyanDetailCombinesSQLAndScriptMetadata(t *testing.T) {
+	sqlPath := filepath.Join(t.TempDir(), "detail.sql")
+	writeTestFile(t, sqlPath, `SELECT /*id*/'1' AS id`)
+	scriptPath := writeTestScript(t, `
+const nyanAcceptedParams = {"name":"default"};
+const nyanOutputColumns = ["id", "name"];
+`)
+	setTestSQLFiles(t, map[string]APIConfig{
+		"detail": {
+			SQL:         []string{sqlPath},
+			Script:      scriptPath,
+			Description: "detail API",
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	handleNyanOrDetail(rec, httptest.NewRequest(http.MethodGet, "/nyan/detail", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%q", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		API                string                 `json:"api"`
+		Description        string                 `json:"description"`
+		NyanAcceptedParams map[string]interface{} `json:"nyanAcceptedParams"`
+		NyanOutputColumns  []string               `json:"nyanOutputColumns"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.API != "detail" || response.Description != "detail API" {
+		t.Fatalf("response = %#v", response)
+	}
+	if fmt.Sprint(response.NyanAcceptedParams["id"]) != "1" || response.NyanAcceptedParams["name"] != "default" {
+		t.Fatalf("accepted params = %#v", response.NyanAcceptedParams)
+	}
+	if !reflect.DeepEqual(response.NyanOutputColumns, []string{"id", "name"}) {
+		t.Fatalf("output columns = %#v", response.NyanOutputColumns)
+	}
+}
+
+func TestExecuteAPIConfigSupportsSQLAndScript(t *testing.T) {
+	setTestSQLiteDB(t)
+	resetJavascriptInclude(t)
+	sqlPath := filepath.Join(t.TempDir(), "select.sql")
+	writeTestFile(t, sqlPath, `SELECT 'sql' AS source`)
+	sqlResult, err := executeAPIConfig(APIConfig{SQL: []string{sqlPath}})
+	if err != nil {
+		t.Fatalf("executeAPIConfig(SQL) error = %v", err)
+	}
+	var rows []map[string]interface{}
+	if err := json.Unmarshal(sqlResult, &rows); err != nil || len(rows) != 1 || rows[0]["source"] != "sql" {
+		t.Fatalf("SQL result = %q, error = %v", sqlResult, err)
+	}
+
+	scriptPath := writeTestScript(t, `JSON.stringify({source: "script"});`)
+	scriptResult, err := executeAPIConfig(APIConfig{Script: scriptPath})
+	if err != nil {
+		t.Fatalf("executeAPIConfig(script) error = %v", err)
+	}
+	if string(scriptResult) != `{"source":"script"}` {
+		t.Fatalf("script result = %q", scriptResult)
+	}
+	if _, err := executeAPIConfig(APIConfig{}); err == nil {
+		t.Fatal("executeAPIConfig(empty) error = nil")
+	}
+}
+
+func TestExecCommandReportsSuccessAndFailure(t *testing.T) {
+	result, err := execCommand("echo nyan")
+	if err != nil {
+		t.Fatalf("execCommand(success) error = %v", err)
+	}
+	if !result.Success || strings.TrimSpace(result.Stdout) != "nyan" || result.ExitCode != 0 {
+		t.Fatalf("success result = %#v", result)
+	}
+
+	result, err = execCommand("exit 7")
+	if err == nil {
+		t.Fatal("execCommand(failure) error = nil")
+	}
+	if result.Success || result.ExitCode != 7 {
+		t.Fatalf("failure result = %#v", result)
+	}
+}
+
+func TestAdjustPathsResolvesRelativeValues(t *testing.T) {
+	baseDir := t.TempDir()
+	cfg := Config{
+		CertPath:          "cert.pem",
+		KeyPath:           "key.pem",
+		DatabaseType:      "sqlite",
+		DBName:            "data.db",
+		JavascriptInclude: []string{"common.js", filepath.Join(baseDir, "absolute.js")},
+	}
+	adjustPaths(baseDir, &cfg)
+	if cfg.CertPath != filepath.Join(baseDir, "cert.pem") || cfg.KeyPath != filepath.Join(baseDir, "key.pem") {
+		t.Fatalf("certificate paths = %q, %q", cfg.CertPath, cfg.KeyPath)
+	}
+	if cfg.DBName != filepath.Join(baseDir, "data.db") {
+		t.Fatalf("DBName = %q", cfg.DBName)
+	}
+	wantIncludes := []string{filepath.Join(baseDir, "common.js"), filepath.Join(baseDir, "absolute.js")}
+	if !reflect.DeepEqual(cfg.JavascriptInclude, wantIncludes) {
+		t.Fatalf("JavascriptInclude = %#v", cfg.JavascriptInclude)
+	}
+}
+
+func TestWebSocketMessageTypeLabels(t *testing.T) {
+	tests := map[int]string{
+		websocket.TextMessage:   "text",
+		websocket.BinaryMessage: "binary",
+		websocket.CloseMessage:  "close",
+		websocket.PingMessage:   "ping",
+		websocket.PongMessage:   "pong",
+		999:                     "unknown(999)",
+	}
+	for messageType, want := range tests {
+		if got := websocketMessageTypeLabel(messageType); got != want {
+			t.Errorf("websocketMessageTypeLabel(%d) = %q, want %q", messageType, got, want)
+		}
+	}
+}
+
 func resetJavascriptInclude(t *testing.T) {
 	t.Helper()
 	oldIncludes := config.JavascriptInclude
@@ -917,4 +1475,27 @@ func setTestSQLFiles(t *testing.T, files map[string]APIConfig) {
 	t.Cleanup(func() {
 		setSQLFiles(oldFiles)
 	})
+}
+
+func setTestSQLiteDB(t *testing.T) *sql.DB {
+	t.Helper()
+	oldDB := db
+	oldDBType := dbType
+	testDB, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testDB.SetMaxOpenConns(1)
+	if err := testDB.Ping(); err != nil {
+		_ = testDB.Close()
+		t.Fatal(err)
+	}
+	db = testDB
+	dbType = "sqlite3"
+	t.Cleanup(func() {
+		_ = testDB.Close()
+		db = oldDB
+		dbType = oldDBType
+	})
+	return testDB
 }
