@@ -208,7 +208,7 @@ var sqlFilesMu sync.RWMutex
 var sqlFiles map[string]APIConfig
 var backgroundRuntimes *backgroundRuntimeManager
 var dbType string
-var buildVersion = "v0.0.20"
+var buildVersion = "v0.0.21"
 
 type serviceFilePath struct {
 	Path   string
