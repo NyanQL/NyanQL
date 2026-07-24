@@ -20,9 +20,11 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dop251/goja"
@@ -165,6 +167,39 @@ type APIDetails struct {
 	Description string `json:"description"`
 }
 
+// APIFileState represents the observed state of a file used to build an API
+// configuration snapshot.
+type APIFileState struct {
+	Path   string
+	Exists bool
+	Hash   [sha256.Size]byte
+	Error  string
+}
+
+// APIConfigSnapshot is an immutable, internally consistent view of the API
+// configuration. Maps and slices reachable from a published snapshot must not
+// be modified.
+type APIConfigSnapshot struct {
+	Definitions map[string]APIConfig
+	APIs        map[string]APIDetails
+	Sources     map[string]string
+	Files       map[string]APIFileState
+	Schedules   map[string]scheduleJobConfig
+	WSClients   map[string]wsClientConfig
+}
+
+type apiConfigLoadResult struct {
+	Snapshot  *APIConfigSnapshot
+	Schedules map[string]scheduleJobConfig
+	WSClients map[string]wsClientConfig
+	Hash      [sha256.Size]byte
+}
+
+type includeDefinition struct {
+	Type string `json:"type"`
+	Path string `json:"path"`
+}
+
 // NyanResponse は /nyan にアクセスしたときに返すサーバ情報です。
 // Apis には、API名をキーとして、各 API の説明のみが含まれます。
 type NyanResponse struct {
@@ -204,8 +239,7 @@ type JSONRPCError struct {
 
 var config Config
 var db *sql.DB
-var sqlFilesMu sync.RWMutex
-var sqlFiles map[string]APIConfig
+var apiSnapshot atomic.Pointer[APIConfigSnapshot]
 var backgroundRuntimes *backgroundRuntimeManager
 var dbType string
 var buildVersion = "v0.0.21"
@@ -222,6 +256,7 @@ type serviceFilePaths struct {
 
 const (
 	apiTypeAPI                       = "api"
+	apiTypeInclude                   = "include"
 	apiTypeWSClient                  = "ws_client"
 	apiTypePublic                    = "public"
 	apiTypeSchedule                  = "schedule"
@@ -321,7 +356,6 @@ func main() {
 		log.Fatalf("Invalid APIHotReload.Interval: %v", err)
 	}
 	configBaseDir := filepath.Dir(paths.Config.Path)
-	apiBaseDir := filepath.Dir(paths.API.Path)
 	adjustPaths(configBaseDir, &config)
 	setupLogger(configBaseDir)
 	log.Printf("Binary version: %s", buildVersion)
@@ -334,18 +368,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
-	initialSQLFiles, initialAPIHash, err := readSQLFiles(paths.API.Path, apiBaseDir)
+	initialLoad, err := loadAPIConfigFile(paths.API.Path)
 	if err != nil {
 		log.Fatalf("Failed to load API file: %v", err)
 	}
-	setSQLFiles(initialSQLFiles)
+	setAPISnapshot(initialLoad.Snapshot)
 	backgroundRuntimes = newBackgroundRuntimeManager()
-	if err := backgroundRuntimes.start(initialSQLFiles, apiBaseDir); err != nil {
-		log.Printf("Failed to start one or more background runtimes: %v", err)
-	}
+	backgroundRuntimes.reconcile(initialLoad.Snapshot.Schedules, initialLoad.Snapshot.WSClients)
 	if config.APIHotReload.Enabled {
 		log.Printf("API hot reload enabled: file=%s check_interval=%s", paths.API.Path, apiHotReloadInterval)
-		go watchAPIFile(paths.API.Path, apiBaseDir, apiHotReloadInterval, initialAPIHash)
+		go watchAPIFile(paths.API.Path, apiHotReloadInterval, initialLoad.Snapshot.Files)
 	} else {
 		log.Printf("API hot reload disabled")
 	}
@@ -405,6 +437,7 @@ func NewHub() *Hub {
 }
 
 func unifiedHandler(w http.ResponseWriter, r *http.Request) {
+	snapshot := currentAPISnapshot()
 	// WebSocketアップグレード要求なら認証後、handleWebSocketに処理を委譲
 	if isWebSocketRequest(r) {
 		// ここで必要ならBasicAuthの認証を実施
@@ -412,19 +445,25 @@ func unifiedHandler(w http.ResponseWriter, r *http.Request) {
 		handleWebSocket(w, r)
 		return
 	}
-	if apiKey, requestedPath, apiConfig, ok := findPublicAPIForPath(r.URL.Path); ok {
-		handlePublicRequest(w, r, apiKey, requestedPath, apiConfig)
+	if apiKey, requestedPath, apiConfig, ok := findPublicAPIForPathInSnapshot(snapshot, r.URL.Path); ok {
+		handlePublicRequestWithSnapshot(snapshot, w, r, apiKey, requestedPath, apiConfig)
 		return
 	}
 	// 通常のHTTPリクエストならBasicAuthを適用して処理
-	basicAuth(handleRequest, config)(w, r)
+	basicAuth(func(w http.ResponseWriter, r *http.Request) {
+		handleRequestWithSnapshot(snapshot, w, r)
+	}, config)(w, r)
 }
 
 func findPublicAPIForPath(requestPath string) (string, string, APIConfig, bool) {
+	return findPublicAPIForPathInSnapshot(currentAPISnapshot(), requestPath)
+}
+
+func findPublicAPIForPathInSnapshot(snapshot *APIConfigSnapshot, requestPath string) (string, string, APIConfig, bool) {
 	var matchedKey string
 	var matchedPath string
 	var matchedConfig APIConfig
-	for apiKey, apiConfig := range currentSQLFiles() {
+	for apiKey, apiConfig := range snapshot.Definitions {
 		if getAPIType(apiConfig) != apiTypePublic {
 			continue
 		}
@@ -458,11 +497,9 @@ func isWebSocketRequest(r *http.Request) bool {
 
 // WebSocketアップグレードと接続管理を行う関数
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// ここでは、例えばURLパスの末尾をチャネル名として利用する例
-	parts := strings.Split(r.URL.Path, "/")
-	channel := "default" // デフォルトチャネル
-	if len(parts) > 1 && parts[len(parts)-1] != "" {
-		channel = parts[len(parts)-1]
+	channel := strings.TrimPrefix(r.URL.Path, "/")
+	if channel == "" {
+		channel = "default"
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -505,110 +542,763 @@ func applyConfigDefaults(target *Config) {
 	target.APIHotReload.Interval = defaultAPIHotReloadCheckInterval.String()
 }
 
-func readSQLFiles(apiFilePath, apiBaseDir string) (map[string]APIConfig, [sha256.Size]byte, error) {
-	data, err := os.ReadFile(apiFilePath)
+func normalizeAPIFilePath(apiFilePath string) (string, error) {
+	absPath, err := filepath.Abs(apiFilePath)
 	if err != nil {
-		return nil, [sha256.Size]byte{}, fmt.Errorf("read api file: %w", err)
+		return "", fmt.Errorf("resolve api file path %q: %w", apiFilePath, err)
 	}
-	files, err := decodeSQLFiles(data, apiBaseDir)
+	return filepath.Clean(absPath), nil
+}
+
+func loadAPIConfigFile(apiFilePath string) (*apiConfigLoadResult, error) {
+	result, _, err := loadAPIConfigFileAttempt(apiFilePath)
+	return result, err
+}
+
+func loadAPIConfigFileAttempt(apiFilePath string) (*apiConfigLoadResult, map[string]APIFileState, error) {
+	normalizedPath, err := normalizeAPIFilePath(apiFilePath)
 	if err != nil {
-		return nil, sha256.Sum256(data), err
+		return nil, nil, err
 	}
-	return files, sha256.Sum256(data), nil
+	identity, state, data, err := inspectAPIFile(normalizedPath)
+	discovered := map[string]APIFileState{identity: state}
+	if err != nil {
+		return nil, discovered, fmt.Errorf("read api file %s: %w", normalizedPath, err)
+	}
+	result, files, err := loadAPIConfigDataAttempt(normalizedPath, data)
+	return result, files, err
+}
+
+func loadAPIConfigData(apiFilePath string, data []byte) (*apiConfigLoadResult, error) {
+	result, _, err := loadAPIConfigDataAttempt(apiFilePath, data)
+	return result, err
+}
+
+func loadAPIConfigDataAttempt(apiFilePath string, data []byte) (*apiConfigLoadResult, map[string]APIFileState, error) {
+	normalizedPath, err := normalizeAPIFilePath(apiFilePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	files, sources, fileStates, err := expandAPIConfigGraph(normalizedPath, data)
+	if err != nil {
+		return nil, fileStates, err
+	}
+	schedules, err := buildScheduleJobConfigs(files, filepath.Dir(normalizedPath))
+	if err != nil {
+		return nil, fileStates, err
+	}
+	wsClients, err := buildWSClientConfigs(files, filepath.Dir(normalizedPath))
+	if err != nil {
+		return nil, fileStates, err
+	}
+	hash := sha256.Sum256(data)
+	snapshot := newLoadedAPIConfigSnapshot(files, sources, fileStates, schedules, wsClients)
+	result := &apiConfigLoadResult{
+		Snapshot:  snapshot,
+		Schedules: snapshot.Schedules,
+		WSClients: snapshot.WSClients,
+		Hash:      hash,
+	}
+	return result, fileStates, nil
+}
+
+func readSQLFiles(apiFilePath, _ string) (map[string]APIConfig, [sha256.Size]byte, error) {
+	result, err := loadAPIConfigFile(apiFilePath)
+	if err != nil {
+		return nil, [sha256.Size]byte{}, err
+	}
+	return result.Snapshot.Definitions, result.Hash, nil
 }
 
 func decodeSQLFiles(data []byte, apiBaseDir string) (map[string]APIConfig, error) {
-	var files map[string]APIConfig
-	if err := json.Unmarshal(data, &files); err != nil {
-		return nil, fmt.Errorf("decode api JSON: %w", err)
+	rawFiles, err := decodeRawAPIDefinitions(data)
+	if err != nil {
+		return nil, err
 	}
-	if files == nil {
-		return nil, fmt.Errorf("decode api JSON: top-level value must be an object")
-	}
-	for apiKey, apiConfig := range files {
-		if len(apiConfig.Script) > 0 && len(apiConfig.SQL) > 0 {
-			return nil, fmt.Errorf("configuration error for API %q: if script is set, sql cannot be specified", apiKey)
+	files := make(map[string]APIConfig, len(rawFiles))
+	for apiKey, rawDefinition := range rawFiles {
+		definitionType, err := rawAPIDefinitionType(rawDefinition)
+		if err != nil {
+			return nil, fmt.Errorf("decode api JSON: definition %q: %w", apiKey, err)
 		}
-	}
-
-	for apiKey, apiConfig := range files {
-		for i, sqlPath := range apiConfig.SQL {
-			if !filepath.IsAbs(sqlPath) {
-				apiConfig.SQL[i] = filepath.Join(apiBaseDir, sqlPath)
-			}
+		if definitionType == apiTypeInclude {
+			return nil, fmt.Errorf("decode api JSON: include definition %q requires an API file path", apiKey)
 		}
-		apiConfig.Script = resolvePathFromBase(apiBaseDir, apiConfig.Script)
-		apiConfig.ParamCheck = resolvePathFromBase(apiBaseDir, apiConfig.ParamCheck)
-		apiConfig.OutCheck = resolvePathFromBase(apiBaseDir, apiConfig.OutCheck)
-		if apiConfig.Path != "" && !filepath.IsAbs(apiConfig.Path) {
-			apiConfig.Path = filepath.Join(apiBaseDir, apiConfig.Path)
+		apiConfig, err := decodeAPIConfigDefinition(apiKey, rawDefinition, apiBaseDir)
+		if err != nil {
+			return nil, err
 		}
 		files[apiKey] = apiConfig
 	}
 	return files, nil
 }
 
+func decodeRawAPIDefinitions(data []byte) (map[string]json.RawMessage, error) {
+	if err := validateNoDuplicateJSONKeys(data); err != nil {
+		return nil, fmt.Errorf("decode api JSON: %w", err)
+	}
+	trimmedData := bytes.TrimSpace(data)
+	if len(trimmedData) == 0 || trimmedData[0] != '{' {
+		return nil, fmt.Errorf("decode api JSON: top-level value must be an object")
+	}
+	var rawFiles map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawFiles); err != nil {
+		return nil, fmt.Errorf("decode api JSON: %w", err)
+	}
+	if rawFiles == nil {
+		return nil, fmt.Errorf("decode api JSON: top-level value must be an object")
+	}
+	for apiKey, rawDefinition := range rawFiles {
+		trimmed := bytes.TrimSpace(rawDefinition)
+		if len(trimmed) == 0 || trimmed[0] != '{' {
+			return nil, fmt.Errorf("decode api JSON: definition %q must be an object", apiKey)
+		}
+	}
+	return rawFiles, nil
+}
+
+func rawAPIDefinitionType(rawDefinition json.RawMessage) (string, error) {
+	var typeOnly struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(rawDefinition, &typeOnly); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(typeOnly.Type), nil
+}
+
+func decodeAPIConfigDefinition(apiKey string, rawDefinition json.RawMessage, apiBaseDir string) (APIConfig, error) {
+	var apiConfig APIConfig
+	if err := json.Unmarshal(rawDefinition, &apiConfig); err != nil {
+		return APIConfig{}, fmt.Errorf("decode api JSON: definition %q: %w", apiKey, err)
+	}
+	if len(apiConfig.Script) > 0 && len(apiConfig.SQL) > 0 {
+		return APIConfig{}, fmt.Errorf("configuration error for API %q: if script is set, sql cannot be specified", apiKey)
+	}
+	for i, sqlPath := range apiConfig.SQL {
+		if !filepath.IsAbs(sqlPath) {
+			apiConfig.SQL[i] = filepath.Join(apiBaseDir, sqlPath)
+		}
+	}
+	apiConfig.Script = resolvePathFromBase(apiBaseDir, apiConfig.Script)
+	apiConfig.ParamCheck = resolvePathFromBase(apiBaseDir, apiConfig.ParamCheck)
+	apiConfig.OutCheck = resolvePathFromBase(apiBaseDir, apiConfig.OutCheck)
+	if apiConfig.Path != "" && !filepath.IsAbs(apiConfig.Path) {
+		apiConfig.Path = filepath.Join(apiBaseDir, apiConfig.Path)
+	}
+	return apiConfig, nil
+}
+
+type apiGraphLoader struct {
+	definitions map[string]APIConfig
+	sources     map[string]string
+	fileStates  map[string]APIFileState
+}
+
+type apiIncludeFrame struct {
+	Path     string
+	Identity string
+}
+
+func expandAPIConfigGraph(rootPath string, rootData []byte) (map[string]APIConfig, map[string]string, map[string]APIFileState, error) {
+	canonicalRoot, err := canonicalExistingAPIFilePath(rootPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	loader := &apiGraphLoader{
+		definitions: make(map[string]APIConfig),
+		sources:     make(map[string]string),
+		fileStates:  make(map[string]APIFileState),
+	}
+	if err := loader.loadFile(rootPath, canonicalRoot, rootData, "", nil); err != nil {
+		return loader.definitions, loader.sources, loader.fileStates, err
+	}
+	return loader.definitions, loader.sources, loader.fileStates, nil
+}
+
+func (loader *apiGraphLoader) loadFile(filePath, identity string, data []byte, mountPrefix string, stack []apiIncludeFrame) error {
+	if cycleStart := includeFrameIndex(stack, identity); cycleStart >= 0 {
+		return includeCycleError(stack, filePath)
+	}
+	stack = append(stack, apiIncludeFrame{Path: filePath, Identity: identity})
+	loader.fileStates[identity] = APIFileState{Path: identity, Exists: true, Hash: sha256.Sum256(data)}
+	rawDefinitions, err := decodeRawAPIDefinitions(data)
+	if err != nil {
+		return fmt.Errorf("API file %s: %w", filePath, err)
+	}
+	definitionTypes, mounts, err := inspectDefinitionTypes(rawDefinitions, filePath)
+	if err != nil {
+		return err
+	}
+	if err := validateMountNamespaceConflicts(rawDefinitions, definitionTypes, mounts, filePath); err != nil {
+		return err
+	}
+	for _, name := range sortedRawDefinitionNames(rawDefinitions) {
+		rawDefinition := rawDefinitions[name]
+		if definitionTypes[name] != apiTypeInclude {
+			fullName := joinAPIName(mountPrefix, name)
+			apiConfig, err := decodeAPIConfigDefinition(fullName, rawDefinition, filepath.Dir(filePath))
+			if err != nil {
+				return err
+			}
+			if err := addExpandedAPIDefinition(loader.definitions, loader.sources, fullName, apiConfig, filePath); err != nil {
+				return err
+			}
+			continue
+		}
+
+		include, err := decodeIncludeDefinition(name, rawDefinition)
+		if err != nil {
+			return fmt.Errorf("API file %s: %w", filePath, err)
+		}
+		resolvedPath, err := resolveIncludePath(filePath, include.Path)
+		if err != nil {
+			return fmt.Errorf("include %q in %s: %w", name, filePath, err)
+		}
+		canonicalPath, state, includeData, err := inspectAPIFile(resolvedPath)
+		loader.fileStates[canonicalPath] = state
+		if err != nil {
+			return fmt.Errorf("include %q in %s: %w", name, filePath, err)
+		}
+		if cycleStart := includeFrameIndex(stack, canonicalPath); cycleStart >= 0 {
+			return includeCycleError(stack, resolvedPath)
+		}
+		if err := loader.loadFile(resolvedPath, canonicalPath, includeData, joinAPIName(mountPrefix, name), stack); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func inspectDefinitionTypes(rawDefinitions map[string]json.RawMessage, filePath string) (map[string]string, map[string]struct{}, error) {
+	definitionTypes := make(map[string]string, len(rawDefinitions))
+	mounts := make(map[string]struct{})
+	for _, name := range sortedRawDefinitionNames(rawDefinitions) {
+		definitionType, err := rawAPIDefinitionType(rawDefinitions[name])
+		if err != nil {
+			return nil, nil, fmt.Errorf("API file %s: definition %q: %w", filePath, name, err)
+		}
+		definitionTypes[name] = definitionType
+		if definitionType == apiTypeInclude {
+			if err := validateMountName(name); err != nil {
+				return nil, nil, fmt.Errorf("API file %s: %w", filePath, err)
+			}
+			mounts[name] = struct{}{}
+		}
+	}
+	return definitionTypes, mounts, nil
+}
+
+func validateMountNamespaceConflicts(rawDefinitions map[string]json.RawMessage, definitionTypes map[string]string, mounts map[string]struct{}, filePath string) error {
+	for _, name := range sortedRawDefinitionNames(rawDefinitions) {
+		if definitionTypes[name] == apiTypeInclude {
+			continue
+		}
+		for _, mountName := range sortedStringSet(mounts) {
+			if name == mountName || strings.HasPrefix(name, mountName+"/") {
+				return fmt.Errorf("API file %s: API name %q conflicts with mount namespace %q", filePath, name, mountName)
+			}
+		}
+	}
+	return nil
+}
+
+func sortedStringSet(values map[string]struct{}) []string {
+	items := make([]string, 0, len(values))
+	for value := range values {
+		items = append(items, value)
+	}
+	sort.Strings(items)
+	return items
+}
+
+func sortedRawDefinitionNames(rawDefinitions map[string]json.RawMessage) []string {
+	names := make([]string, 0, len(rawDefinitions))
+	for name := range rawDefinitions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func joinAPIName(prefix, name string) string {
+	if prefix == "" {
+		return name
+	}
+	return prefix + "/" + name
+}
+
+func includeFrameIndex(stack []apiIncludeFrame, identity string) int {
+	for index, frame := range stack {
+		if frame.Identity == identity {
+			return index
+		}
+	}
+	return -1
+}
+
+func includeCycleError(stack []apiIncludeFrame, repeatedPath string) error {
+	cycle := make([]string, 0, len(stack)+1)
+	for _, frame := range stack {
+		cycle = append(cycle, frame.Path)
+	}
+	cycle = append(cycle, repeatedPath)
+	return fmt.Errorf("include cycle detected:\n%s", strings.Join(cycle, "\n-> "))
+}
+
+func addExpandedAPIDefinition(definitions map[string]APIConfig, sources map[string]string, fullName string, apiConfig APIConfig, sourcePath string) error {
+	if previousSource, exists := sources[fullName]; exists {
+		return fmt.Errorf("duplicate expanded API name %q from %s and %s", fullName, previousSource, sourcePath)
+	}
+	definitions[fullName] = apiConfig
+	sources[fullName] = sourcePath
+	return nil
+}
+
+func validateMountName(name string) error {
+	if name == "" || name != strings.TrimSpace(name) || name == "." || name == ".." || strings.Contains(name, "/") {
+		return fmt.Errorf("invalid include mount name %q", name)
+	}
+	return nil
+}
+
+func decodeIncludeDefinition(mountName string, rawDefinition json.RawMessage) (includeDefinition, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(rawDefinition, &fields); err != nil {
+		return includeDefinition{}, fmt.Errorf("include %q: %w", mountName, err)
+	}
+	for field := range fields {
+		if field != "type" && field != "path" {
+			return includeDefinition{}, fmt.Errorf("include %q: unsupported field %q; only type and path are allowed", mountName, field)
+		}
+	}
+	var include includeDefinition
+	if err := json.Unmarshal(rawDefinition, &include); err != nil {
+		return includeDefinition{}, fmt.Errorf("include %q: %w", mountName, err)
+	}
+	if strings.TrimSpace(include.Type) != apiTypeInclude {
+		return includeDefinition{}, fmt.Errorf("include %q: type must be %q", mountName, apiTypeInclude)
+	}
+	if strings.TrimSpace(include.Path) == "" {
+		return includeDefinition{}, fmt.Errorf("include %q: path is empty", mountName)
+	}
+	return include, nil
+}
+
+func inspectAPIFile(path string) (string, APIFileState, []byte, error) {
+	normalizedPath, err := normalizeAPIFilePath(path)
+	if err != nil {
+		state := APIFileState{Path: path, Error: "invalid_path"}
+		return path, state, nil, err
+	}
+	info, err := os.Stat(normalizedPath)
+	if err != nil {
+		state := APIFileState{Path: normalizedPath}
+		if os.IsNotExist(err) {
+			state.Error = "not_found"
+			return normalizedPath, state, nil, fmt.Errorf("file not found: %s", normalizedPath)
+		}
+		state.Error = "stat_error"
+		return normalizedPath, state, nil, fmt.Errorf("file cannot be accessed: %s: %w", normalizedPath, err)
+	}
+	if !info.Mode().IsRegular() {
+		state := APIFileState{Path: normalizedPath, Exists: true, Error: "not_regular"}
+		return normalizedPath, state, nil, fmt.Errorf("path is not a regular file: %s", normalizedPath)
+	}
+	evaluatedPath, err := filepath.EvalSymlinks(normalizedPath)
+	if err != nil {
+		state := APIFileState{Path: normalizedPath, Exists: true, Error: "symlink_error"}
+		return normalizedPath, state, nil, fmt.Errorf("resolve symlinks for %s: %w", normalizedPath, err)
+	}
+	identity, err := normalizeAPIFilePath(evaluatedPath)
+	if err != nil {
+		state := APIFileState{Path: normalizedPath, Exists: true, Error: "invalid_path"}
+		return normalizedPath, state, nil, err
+	}
+	data, err := os.ReadFile(normalizedPath)
+	if err != nil {
+		state := APIFileState{Path: identity, Exists: true, Error: "read_error"}
+		return identity, state, nil, fmt.Errorf("file cannot be read: %s: %w", normalizedPath, err)
+	}
+	state := APIFileState{Path: identity, Exists: true, Hash: sha256.Sum256(data)}
+	return identity, state, data, nil
+}
+
+func canonicalExistingAPIFilePath(path string) (string, error) {
+	normalizedPath, err := normalizeAPIFilePath(path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(normalizedPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("file not found: %s", normalizedPath)
+		}
+		return "", fmt.Errorf("file cannot be accessed: %s: %w", normalizedPath, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("path is not a regular file: %s", normalizedPath)
+	}
+	evaluatedPath, err := filepath.EvalSymlinks(normalizedPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve symlinks for %s: %w", normalizedPath, err)
+	}
+	return normalizeAPIFilePath(evaluatedPath)
+}
+
+func resolveIncludePath(parentAPIPath, includePath string) (string, error) {
+	resolvedPath := includePath
+	if !filepath.IsAbs(resolvedPath) {
+		resolvedPath = filepath.Join(filepath.Dir(parentAPIPath), resolvedPath)
+	}
+	return normalizeAPIFilePath(resolvedPath)
+}
+
+func validateNoDuplicateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := consumeJSONValue(decoder, "$"); err != nil {
+		return err
+	}
+	if token, err := decoder.Token(); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("unexpected token after top-level value: %v", token)
+	}
+	return nil
+}
+
+func consumeJSONValue(decoder *json.Decoder, path string) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("object key at %s is not a string", path)
+			}
+			if _, exists := seen[key]; exists {
+				return fmt.Errorf("duplicate key %q at %s", key, path)
+			}
+			seen[key] = struct{}{}
+			if err := consumeJSONValue(decoder, path+"["+strconv.Quote(key)+"]"); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim('}') {
+			return fmt.Errorf("object at %s is not closed", path)
+		}
+	case '[':
+		index := 0
+		for decoder.More() {
+			if err := consumeJSONValue(decoder, fmt.Sprintf("%s[%d]", path, index)); err != nil {
+				return err
+			}
+			index++
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if closing != json.Delim(']') {
+			return fmt.Errorf("array at %s is not closed", path)
+		}
+	default:
+		return fmt.Errorf("unexpected delimiter %q at %s", delimiter, path)
+	}
+	return nil
+}
+
+func cloneAPIConfig(apiConfig APIConfig) APIConfig {
+	cloned := apiConfig
+	cloned.SQL = append([]string(nil), apiConfig.SQL...)
+	return cloned
+}
+
+func newAPIConfigSnapshot(files map[string]APIConfig, sourcePath string, sourceHash [sha256.Size]byte) *APIConfigSnapshot {
+	sources := make(map[string]string)
+	for name := range files {
+		if sourcePath != "" {
+			sources[name] = sourcePath
+		}
+	}
+
+	fileStates := make(map[string]APIFileState)
+	if sourcePath != "" {
+		fileStates[sourcePath] = APIFileState{
+			Path:   sourcePath,
+			Exists: true,
+			Hash:   sourceHash,
+		}
+	}
+
+	return newAPIConfigSnapshotFromParts(files, sources, fileStates)
+}
+
+func newAPIConfigSnapshotFromParts(files map[string]APIConfig, sources map[string]string, fileStates map[string]APIFileState) *APIConfigSnapshot {
+	return newLoadedAPIConfigSnapshot(files, sources, fileStates, nil, nil)
+}
+
+func newLoadedAPIConfigSnapshot(files map[string]APIConfig, sources map[string]string, fileStates map[string]APIFileState, schedules map[string]scheduleJobConfig, wsClients map[string]wsClientConfig) *APIConfigSnapshot {
+	definitions := make(map[string]APIConfig, len(files))
+	apis := make(map[string]APIDetails)
+	for name, apiConfig := range files {
+		cloned := cloneAPIConfig(apiConfig)
+		definitions[name] = cloned
+		if getAPIType(cloned) == apiTypeAPI {
+			apis[name] = APIDetails{Description: cloned.Description}
+		}
+	}
+	clonedSources := make(map[string]string, len(sources))
+	for name, sourcePath := range sources {
+		clonedSources[name] = sourcePath
+	}
+	clonedFileStates := make(map[string]APIFileState, len(fileStates))
+	for path, state := range fileStates {
+		clonedFileStates[path] = state
+	}
+	clonedSchedules := make(map[string]scheduleJobConfig, len(schedules))
+	for name, schedule := range schedules {
+		clonedSchedules[name] = cloneScheduleJobConfig(schedule)
+	}
+	clonedWSClients := make(map[string]wsClientConfig, len(wsClients))
+	for name, wsClient := range wsClients {
+		clonedWSClients[name] = wsClient
+	}
+	return &APIConfigSnapshot{
+		Definitions: definitions,
+		APIs:        apis,
+		Sources:     clonedSources,
+		Files:       clonedFileStates,
+		Schedules:   clonedSchedules,
+		WSClients:   clonedWSClients,
+	}
+}
+
+func cloneScheduleJobConfig(config scheduleJobConfig) scheduleJobConfig {
+	cloned := config
+	cloned.schedule.minutes = cloneCronField(config.schedule.minutes)
+	cloned.schedule.hours = cloneCronField(config.schedule.hours)
+	cloned.schedule.days = cloneCronField(config.schedule.days)
+	cloned.schedule.months = cloneCronField(config.schedule.months)
+	cloned.schedule.weekdays = cloneCronField(config.schedule.weekdays)
+	return cloned
+}
+
+func cloneCronField(field cronField) cronField {
+	cloned := make(cronField, len(field))
+	for value, included := range field {
+		cloned[value] = included
+	}
+	return cloned
+}
+
+func currentAPISnapshot() *APIConfigSnapshot {
+	if snapshot := apiSnapshot.Load(); snapshot != nil {
+		return snapshot
+	}
+	return &APIConfigSnapshot{
+		Definitions: map[string]APIConfig{},
+		APIs:        map[string]APIDetails{},
+		Sources:     map[string]string{},
+		Files:       map[string]APIFileState{},
+		Schedules:   map[string]scheduleJobConfig{},
+		WSClients:   map[string]wsClientConfig{},
+	}
+}
+
+func setAPISnapshot(snapshot *APIConfigSnapshot) {
+	if snapshot == nil {
+		snapshot = newAPIConfigSnapshot(nil, "", [sha256.Size]byte{})
+	}
+	apiSnapshot.Store(snapshot)
+}
+
+// currentSQLFiles and setSQLFiles remain as compatibility helpers while the
+// rest of the codebase migrates to snapshots.
 func currentSQLFiles() map[string]APIConfig {
-	sqlFilesMu.RLock()
-	files := sqlFiles
-	sqlFilesMu.RUnlock()
-	return files
+	return currentAPISnapshot().Definitions
 }
 
 func setSQLFiles(files map[string]APIConfig) {
-	sqlFilesMu.Lock()
-	sqlFiles = files
-	sqlFilesMu.Unlock()
+	setAPISnapshot(newAPIConfigSnapshot(files, "", [sha256.Size]byte{}))
 }
 
-func reloadSQLFilesIfChanged(apiFilePath, apiBaseDir string, lastObservedHash [sha256.Size]byte) ([sha256.Size]byte, bool, error) {
-	data, err := os.ReadFile(apiFilePath)
+func cloneAPIFileStates(states map[string]APIFileState) map[string]APIFileState {
+	cloned := make(map[string]APIFileState, len(states))
+	for identity, state := range states {
+		cloned[identity] = state
+	}
+	return cloned
+}
+
+func observeAPIFileStates(files map[string]APIFileState) (map[string]APIFileState, error) {
+	observed := make(map[string]APIFileState, len(files))
+	for identity, expected := range files {
+		path := expected.Path
+		if path == "" {
+			path = identity
+		}
+		_, state, _, _ := inspectAPIFile(path)
+		observed[identity] = state
+	}
+	return observed, nil
+}
+
+func mergeAPIFileStates(stateSets ...map[string]APIFileState) map[string]APIFileState {
+	merged := make(map[string]APIFileState)
+	for _, states := range stateSets {
+		for identity, state := range states {
+			merged[identity] = state
+		}
+	}
+	return merged
+}
+
+func apiFileStatesFingerprint(states map[string]APIFileState) [sha256.Size]byte {
+	identities := make([]string, 0, len(states))
+	for identity := range states {
+		identities = append(identities, identity)
+	}
+	sort.Strings(identities)
+
+	hasher := sha256.New()
+	for _, identity := range identities {
+		state := states[identity]
+		_, _ = io.WriteString(hasher, identity)
+		_, _ = hasher.Write([]byte{0})
+		_, _ = io.WriteString(hasher, state.Path)
+		_, _ = hasher.Write([]byte{0})
+		if state.Exists {
+			_, _ = hasher.Write([]byte{1})
+		} else {
+			_, _ = hasher.Write([]byte{0})
+		}
+		_, _ = hasher.Write(state.Hash[:])
+		_, _ = io.WriteString(hasher, state.Error)
+		_, _ = hasher.Write([]byte{0})
+	}
+	var fingerprint [sha256.Size]byte
+	copy(fingerprint[:], hasher.Sum(nil))
+	return fingerprint
+}
+
+func verifyAPIFileStates(expected map[string]APIFileState) error {
+	observed, err := observeAPIFileStates(expected)
 	if err != nil {
-		return lastObservedHash, false, fmt.Errorf("read api file: %w", err)
+		return err
+	}
+	if !reflect.DeepEqual(observed, expected) {
+		return fmt.Errorf("API files changed while the configuration was being loaded")
+	}
+	return nil
+}
+
+func sameAPIConfigSnapshot(left, right *APIConfigSnapshot) bool {
+	return reflect.DeepEqual(left.Definitions, right.Definitions) &&
+		reflect.DeepEqual(left.APIs, right.APIs) &&
+		reflect.DeepEqual(left.Sources, right.Sources) &&
+		reflect.DeepEqual(left.Files, right.Files) &&
+		reflect.DeepEqual(left.Schedules, right.Schedules) &&
+		reflect.DeepEqual(left.WSClients, right.WSClients)
+}
+
+func loadAndPublishAPIConfig(apiFilePath string) (*apiConfigLoadResult, bool, error) {
+	loadResult, _, reloaded, err := loadAndPublishAPIConfigAttempt(apiFilePath)
+	return loadResult, reloaded, err
+}
+
+func loadAndPublishAPIConfigAttempt(apiFilePath string) (*apiConfigLoadResult, map[string]APIFileState, bool, error) {
+	loadResult, discoveredFiles, err := loadAPIConfigFileAttempt(apiFilePath)
+	if err != nil {
+		return nil, discoveredFiles, false, err
+	}
+	if err := verifyAPIFileStates(loadResult.Snapshot.Files); err != nil {
+		return nil, discoveredFiles, false, err
+	}
+	if sameAPIConfigSnapshot(currentAPISnapshot(), loadResult.Snapshot) {
+		return loadResult, discoveredFiles, false, nil
+	}
+
+	setAPISnapshot(loadResult.Snapshot)
+	if backgroundRuntimes != nil {
+		backgroundRuntimes.reconcile(loadResult.Snapshot.Schedules, loadResult.Snapshot.WSClients)
+	}
+	return loadResult, discoveredFiles, true, nil
+}
+
+func reloadAPIConfigGraphIfChanged(apiFilePath string, lastObserved map[string]APIFileState) (map[string]APIFileState, bool, error) {
+	observed, err := observeAPIFileStates(lastObserved)
+	if err != nil {
+		return cloneAPIFileStates(lastObserved), false, err
+	}
+	if reflect.DeepEqual(observed, lastObserved) {
+		return observed, false, nil
+	}
+
+	loadResult, discoveredFiles, reloaded, err := loadAndPublishAPIConfigAttempt(apiFilePath)
+	if err != nil {
+		watched := mergeAPIFileStates(currentAPISnapshot().Files, discoveredFiles)
+		observedWatched, observeErr := observeAPIFileStates(watched)
+		if observeErr != nil {
+			return cloneAPIFileStates(lastObserved), false, observeErr
+		}
+		return observedWatched, false, err
+	}
+	return cloneAPIFileStates(loadResult.Snapshot.Files), reloaded, nil
+}
+
+func reloadSQLFilesIfChanged(apiFilePath, _ string, lastObservedHash [sha256.Size]byte) ([sha256.Size]byte, bool, error) {
+	normalizedPath, err := normalizeAPIFilePath(apiFilePath)
+	if err != nil {
+		return lastObservedHash, false, err
+	}
+	data, err := os.ReadFile(normalizedPath)
+	if err != nil {
+		return lastObservedHash, false, fmt.Errorf("read api file %s: %w", normalizedPath, err)
 	}
 	observedHash := sha256.Sum256(data)
 	if observedHash == lastObservedHash {
 		return lastObservedHash, false, nil
 	}
 
-	candidate, err := decodeSQLFiles(data, apiBaseDir)
-	if err != nil {
-		return observedHash, false, err
-	}
-	current := currentSQLFiles()
-	if reflect.DeepEqual(current, candidate) {
-		return observedHash, false, nil
-	}
-	schedules, scheduleErr := buildScheduleJobConfigs(candidate, apiBaseDir)
-	wsClients, wsClientErr := buildWSClientConfigs(candidate, apiBaseDir)
-	if scheduleErr != nil {
-		return observedHash, false, scheduleErr
-	}
-	if wsClientErr != nil {
-		return observedHash, false, wsClientErr
-	}
-
-	setSQLFiles(candidate)
-	if backgroundRuntimes != nil {
-		backgroundRuntimes.reconcile(schedules, wsClients)
-	}
-	return observedHash, true, nil
+	_, reloaded, err := loadAndPublishAPIConfig(normalizedPath)
+	return observedHash, reloaded, err
 }
 
-func watchAPIFile(apiFilePath, apiBaseDir string, interval time.Duration, initialHash [sha256.Size]byte) {
+func watchAPIFile(apiFilePath string, interval time.Duration, initialFiles map[string]APIFileState) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	lastObservedHash := initialHash
+	lastObservedFiles := cloneAPIFileStates(initialFiles)
 	lastReloadError := ""
 	for range ticker.C {
-		observedHash, reloaded, err := reloadSQLFilesIfChanged(apiFilePath, apiBaseDir, lastObservedHash)
-		lastObservedHash = observedHash
+		observedFiles, reloaded, err := reloadAPIConfigGraphIfChanged(apiFilePath, lastObservedFiles)
+		lastObservedFiles = observedFiles
 		if err != nil {
-			if err.Error() != lastReloadError {
+			errorKey := fmt.Sprintf("%x:%s", apiFileStatesFingerprint(observedFiles), err.Error())
+			if errorKey != lastReloadError {
 				log.Printf("API hot reload failed: %v; current API configuration remains active", err)
 			}
-			lastReloadError = err.Error()
+			lastReloadError = errorKey
 			continue
 		}
 		lastReloadError = ""
@@ -649,6 +1339,10 @@ func cloneParams(params map[string]interface{}) map[string]interface{} {
 }
 
 func runOutCheckScript(apiConfig APIConfig, params map[string]interface{}, statusCode int, contentType string, body []byte) (bool, int, string, error) {
+	return runOutCheckScriptWithSnapshot(currentAPISnapshot(), apiConfig, params, statusCode, contentType, body)
+}
+
+func runOutCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiConfig APIConfig, params map[string]interface{}, statusCode int, contentType string, body []byte) (bool, int, string, error) {
 	outCheckPath := strings.TrimSpace(apiConfig.OutCheck)
 	if outCheckPath == "" {
 		return false, statusCode, "", nil
@@ -671,7 +1365,7 @@ func runOutCheckScript(apiConfig APIConfig, params map[string]interface{}, statu
 	checkParams["nyan_output_body"] = bodyString
 	checkParams["nyan_output_body_base64"] = bodyBase64
 
-	success, checkStatusCode, _, jsonStr, err := runCheckScript(outCheckPath, checkParams, nil)
+	success, checkStatusCode, _, jsonStr, err := runCheckScriptWithSnapshot(snapshot, outCheckPath, checkParams, nil)
 	if err != nil {
 		return true, http.StatusInternalServerError, "", err
 	}
@@ -741,6 +1435,10 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 }
 
 func handlePublicRequest(w http.ResponseWriter, r *http.Request, apiKey string, requestedPath string, apiConfig APIConfig) {
+	handlePublicRequestWithSnapshot(currentAPISnapshot(), w, r, apiKey, requestedPath, apiConfig)
+}
+
+func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, apiKey string, requestedPath string, apiConfig APIConfig) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -769,7 +1467,7 @@ func handlePublicRequest(w http.ResponseWriter, r *http.Request, apiKey string, 
 		return
 	}
 	if checkScriptPath != "" {
-		success, statusCode, errorObj, jsonStr, err := runCheckScript(checkScriptPath, params, nil)
+		success, statusCode, errorObj, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, nil)
 		if err != nil {
 			log.Printf("Public paramCheck script error: %v", err)
 			sendJSONError(w, err.Error(), statusCode)
@@ -816,7 +1514,7 @@ func handlePublicRequest(w http.ResponseWriter, r *http.Request, apiKey string, 
 		return
 	}
 	contentType := http.DetectContentType(fileContent)
-	if handled, outStatusCode, outJSON, err := runOutCheckScript(apiConfig, params, http.StatusOK, contentType, fileContent); handled {
+	if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, contentType, fileContent); handled {
 		if err != nil {
 			log.Printf("Public outCheck script error: %v", err)
 			sendJSONError(w, err.Error(), outStatusCode)
@@ -894,19 +1592,6 @@ func newBackgroundRuntimeManager() *backgroundRuntimeManager {
 		schedules: make(map[string]*scheduleRuntime),
 		wsClients: make(map[string]*wsClientRuntime),
 	}
-}
-
-func (manager *backgroundRuntimeManager) start(files map[string]APIConfig, execDir string) error {
-	schedules, scheduleErr := buildScheduleJobConfigs(files, execDir)
-	wsClients, wsClientErr := buildWSClientConfigs(files, execDir)
-	manager.reconcile(schedules, wsClients)
-	if scheduleErr != nil && wsClientErr != nil {
-		return fmt.Errorf("%v; %v", scheduleErr, wsClientErr)
-	}
-	if scheduleErr != nil {
-		return scheduleErr
-	}
-	return wsClientErr
 }
 
 func (manager *backgroundRuntimeManager) reconcile(schedules map[string]scheduleJobConfig, wsClients map[string]wsClientConfig) {
@@ -1686,6 +2371,10 @@ func connectDB(config Config) (*sql.DB, error) {
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
+	handleRequestWithSnapshot(currentAPISnapshot(), w, r)
+}
+
+func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/favicon.ico" {
 		http.NotFound(w, r)
 		return
@@ -1709,7 +2398,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		sendJSONError(w, "API key is required and must be a string", http.StatusBadRequest)
 		return
 	}
-	apiConfig, exists := currentSQLFiles()[apiKey]
+	apiConfig, exists := snapshot.Definitions[apiKey]
 	if !exists {
 		sendJSONError(w, "SQL files not found", http.StatusNotFound)
 		return
@@ -1730,7 +2419,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if checkScriptPath != "" {
-		success, statusCode, errorObj, jsonStr, err := runCheckScript(checkScriptPath, params, acceptedKeys)
+		success, statusCode, errorObj, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, acceptedKeys)
 		if err != nil {
 			log.Printf("Check script error: %v", err)
 			sendJSONError(w, err.Error(), statusCode)
@@ -1751,14 +2440,14 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if nyanMode == "checkOnly" {
-			performPush(apiConfig, params)
+			performPush(snapshot, apiConfig, params)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
 			w.Write([]byte(jsonStr))
 			return
 		}
 		if len(apiConfig.SQL) == 0 && apiConfig.Script == "" {
-			performPush(apiConfig, params)
+			performPush(snapshot, apiConfig, params)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
 			w.Write([]byte(jsonStr))
@@ -1767,14 +2456,14 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if apiConfig.Script != "" {
-		scriptResult, err := runScript([]string{apiConfig.Script}, params)
+		scriptResult, err := runScriptWithSnapshot(snapshot, []string{apiConfig.Script}, params)
 		if err != nil {
 			log.Printf("Script execution error: %v", err)
 			sendJSONError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		body := []byte(scriptResult)
-		if handled, outStatusCode, outJSON, err := runOutCheckScript(apiConfig, params, http.StatusOK, "application/json", body); handled {
+		if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", body); handled {
 			if err != nil {
 				log.Printf("outCheck script error: %v", err)
 				sendJSONError(w, err.Error(), outStatusCode)
@@ -1785,7 +2474,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(outJSON))
 			return
 		}
-		performPush(apiConfig, params)
+		performPush(snapshot, apiConfig, params)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write(body)
@@ -1892,7 +2581,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		sendJSONError(w, "Error formatting results", http.StatusInternalServerError)
 		return
 	}
-	if handled, outStatusCode, outJSON, err := runOutCheckScript(apiConfig, params, http.StatusOK, "application/json", body); handled {
+	if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", body); handled {
 		if err != nil {
 			log.Printf("outCheck script error: %v", err)
 			sendJSONError(w, err.Error(), outStatusCode)
@@ -1903,7 +2592,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(outJSON))
 		return
 	}
-	performPush(apiConfig, params)
+	performPush(snapshot, apiConfig, params)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(body)
 }
@@ -2198,22 +2887,15 @@ func checkPassword(user, pass string, config Config) bool {
 
 // handleNyan は、サーバ情報と各 API のキーと説明のみを返します。
 func handleNyan(w http.ResponseWriter, r *http.Request) {
-	// API定義から必要な情報のみ抽出します。
-	filteredApis := make(map[string]APIDetails)
-	for key, apiConf := range currentSQLFiles() {
-		if getAPIType(apiConf) != apiTypeAPI {
-			continue
-		}
-		filteredApis[key] = APIDetails{
-			Description: apiConf.Description,
-		}
-	}
+	handleNyanWithSnapshot(currentAPISnapshot(), w, r)
+}
 
+func handleNyanWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request) {
 	response := NyanResponse{
 		Name:    config.Name,
 		Profile: config.Profile,
 		Version: config.Version,
-		Apis:    filteredApis,
+		Apis:    snapshot.APIs,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
@@ -2223,15 +2905,20 @@ func handleNyan(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleNyanOrDetail(w http.ResponseWriter, r *http.Request) {
+	snapshot := currentAPISnapshot()
 	subPath := strings.TrimPrefix(r.URL.Path, "/nyan")
 	if subPath == "" || subPath == "/" {
-		handleNyan(w, r)
+		handleNyanWithSnapshot(snapshot, w, r)
 	} else {
-		handleNyanDetail(w, r)
+		handleNyanDetailWithSnapshot(snapshot, w, r)
 	}
 }
 
 func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
+	handleNyanDetailWithSnapshot(currentAPISnapshot(), w, r)
+}
+
+func handleNyanDetailWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request) {
 	type detailResponse struct {
 		API                string                 `json:"api"`
 		Description        string                 `json:"description"`
@@ -2243,7 +2930,7 @@ func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
 		sendJSONError(w, "API name is required", http.StatusBadRequest)
 		return
 	}
-	apiConfig, exists := currentSQLFiles()[apiName]
+	apiConfig, exists := snapshot.Definitions[apiName]
 	if !exists {
 		sendJSONError(w, "API not found", http.StatusNotFound)
 		return
@@ -2553,6 +3240,10 @@ func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 }
 
 func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, string, error) {
+	return runCheckScriptWithSnapshot(currentAPISnapshot(), apiCheckScriptPath, params, acceptedParamsKeys)
+}
+
+func runCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, string, error) {
 	var combinedScript strings.Builder
 	for _, includePath := range config.JavascriptInclude {
 		content, err := os.ReadFile(includePath)
@@ -2570,7 +3261,7 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 	combinedScript.WriteString("\n")
 	log.Printf("Combined check script:\n%s", combinedScript.String())
 	vm := goja.New()
-	registerNyanFuncs(vm, params, acceptedParamsKeys)
+	registerNyanFuncs(vm, snapshot, params, acceptedParamsKeys)
 
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
@@ -2681,6 +3372,10 @@ func getAcceptedParamsKeys(sqlPaths []string) ([]string, error) {
 // スクリプト内で複数の nyanRunSQL 呼び出しがあった場合、すべて同一トランザクション下で実行されます。
 // スクリプトの実行が成功すればコミット、エラーがあればロールバックします。
 func runScript(scriptPaths []string, params map[string]interface{}) (string, error) {
+	return runScriptWithSnapshot(currentAPISnapshot(), scriptPaths, params)
+}
+
+func runScriptWithSnapshot(snapshot *APIConfigSnapshot, scriptPaths []string, params map[string]interface{}) (string, error) {
 	// トランザクション開始
 	tx, err := db.Begin()
 	if err != nil {
@@ -2721,7 +3416,7 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 	vm := goja.New()
 
 	// 既存の関数群を登録
-	registerNyanFuncs(vm, params, nil)
+	registerNyanFuncs(vm, snapshot, params, nil)
 
 	// ★重要：トランザクションを VM に渡す（nyanRunSQLHandler がこれを拾って tx で実行する）
 	vm.Set("nyanTx", tx)
@@ -2745,11 +3440,15 @@ func runScript(scriptPaths []string, params map[string]interface{}) (string, err
 
 // callNyanAPIFromVM は、JavaScript VM から api.json の API を check/script/sql 含めて実行します。
 func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string, error) {
+	return callNyanAPIFromVMWithSnapshot(currentAPISnapshot(), apiName, allParams)
+}
+
+func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allParams map[string]interface{}) (string, error) {
 	if strings.TrimSpace(apiName) == "" {
 		return "", fmt.Errorf("api name is required")
 	}
 
-	apiConfig, exists := currentSQLFiles()[apiName]
+	apiConfig, exists := snapshot.Definitions[apiName]
 	if !exists {
 		return "", fmt.Errorf("API config not found: %s", apiName)
 	}
@@ -2775,7 +3474,7 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string
 	}
 
 	if checkScriptPath != "" {
-		success, statusCode, errorObj, jsonStr, err := runCheckScript(checkScriptPath, params, acceptedKeys)
+		success, statusCode, errorObj, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, acceptedKeys)
 		if err != nil {
 			return "", fmt.Errorf("check script error: %v", err)
 		}
@@ -2795,41 +3494,41 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string
 			return string(b), nil
 		}
 		if nyanMode == "checkOnly" {
-			performPush(apiConfig, params)
+			performPush(snapshot, apiConfig, params)
 			return jsonStr, nil
 		}
 		if apiConfig.Script != "" {
-			result, err := runScript([]string{apiConfig.Script}, params)
+			result, err := runScriptWithSnapshot(snapshot, []string{apiConfig.Script}, params)
 			if err != nil {
 				return "", fmt.Errorf("failed to run API %s: %v", apiName, err)
 			}
-			if handled, _, outJSON, err := runOutCheckScript(apiConfig, params, http.StatusOK, "application/json", []byte(result)); handled {
+			if handled, _, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", []byte(result)); handled {
 				if err != nil {
 					return "", fmt.Errorf("outCheck script error: %v", err)
 				}
 				return outJSON, nil
 			}
-			performPush(apiConfig, params)
+			performPush(snapshot, apiConfig, params)
 			return result, nil
 		}
 		if len(apiConfig.SQL) == 0 && apiConfig.Script == "" {
-			performPush(apiConfig, params)
+			performPush(snapshot, apiConfig, params)
 			return jsonStr, nil
 		}
 	}
 
 	if apiConfig.Script != "" {
-		result, err := runScript([]string{apiConfig.Script}, params)
+		result, err := runScriptWithSnapshot(snapshot, []string{apiConfig.Script}, params)
 		if err != nil {
 			return "", fmt.Errorf("failed to run API %s: %v", apiName, err)
 		}
-		if handled, _, outJSON, err := runOutCheckScript(apiConfig, params, http.StatusOK, "application/json", []byte(result)); handled {
+		if handled, _, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", []byte(result)); handled {
 			if err != nil {
 				return "", fmt.Errorf("outCheck script error: %v", err)
 			}
 			return outJSON, nil
 		}
-		performPush(apiConfig, params)
+		performPush(snapshot, apiConfig, params)
 		return result, nil
 	}
 
@@ -2913,13 +3612,13 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal SQL response for API %s: %v", apiName, err)
 	}
-	if handled, _, outJSON, err := runOutCheckScript(apiConfig, params, http.StatusOK, "application/json", b); handled {
+	if handled, _, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", b); handled {
 		if err != nil {
 			return "", fmt.Errorf("outCheck script error: %v", err)
 		}
 		return outJSON, nil
 	}
-	performPush(apiConfig, params)
+	performPush(snapshot, apiConfig, params)
 	return string(b), nil
 }
 
@@ -3069,6 +3768,10 @@ func normalizeSQL(sqlText string) string {
 }
 
 func executeAPIConfig(apiConfig APIConfig) ([]byte, error) {
+	return executeAPIConfigWithSnapshot(currentAPISnapshot(), apiConfig)
+}
+
+func executeAPIConfigWithSnapshot(snapshot *APIConfigSnapshot, apiConfig APIConfig) ([]byte, error) {
 	// ここでは、SQLが設定されている場合、最初のSQLファイルを実行する例です
 	if len(apiConfig.SQL) > 0 {
 		query, err := os.ReadFile(apiConfig.SQL[0])
@@ -3085,7 +3788,7 @@ func executeAPIConfig(apiConfig APIConfig) ([]byte, error) {
 	}
 	// Scriptが設定されている場合は runScript を使う例
 	if apiConfig.Script != "" {
-		result, err := runScript([]string{apiConfig.Script}, make(map[string]interface{}))
+		result, err := runScriptWithSnapshot(snapshot, []string{apiConfig.Script}, make(map[string]interface{}))
 		if err != nil {
 			return nil, err
 		}
@@ -3312,6 +4015,10 @@ func respondJSONRPCResultJSON(w http.ResponseWriter, id interface{}, statusCode 
 }
 
 func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
+	handleJSONRPCWithSnapshot(currentAPISnapshot(), w, r)
+}
+
+func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request) {
 	// 1) リクエストボディを読み込み、JSONRPCRequestにパースする
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -3351,7 +4058,7 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	apiConfig, exists := currentSQLFiles()[apiKey]
+	apiConfig, exists := snapshot.Definitions[apiKey]
 	fmt.Print(apiConfig)
 	if !exists {
 		respondJSONRPCError(w, rpcReq.ID, -32601, "SQL files not found", nil)
@@ -3371,7 +4078,7 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 	}
 	checkScriptPath := getParamCheckScriptPath(apiConfig)
 	if checkScriptPath != "" {
-		success, statusCode, errorObj, jsonStr, err := runCheckScript(checkScriptPath, allParams, acceptedKeys)
+		success, statusCode, errorObj, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, allParams, acceptedKeys)
 		if err != nil {
 			respondJSONRPCError(w, rpcReq.ID, -32603, "Check script error", err.Error())
 			return
@@ -3408,7 +4115,7 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 	var finalResult map[string]interface{}
 	var finalBody []byte
 	if apiConfig.Script != "" {
-		scriptResult, err := runScript([]string{apiConfig.Script}, allParams)
+		scriptResult, err := runScriptWithSnapshot(snapshot, []string{apiConfig.Script}, allParams)
 		if err != nil {
 			respondJSONRPCError(w, rpcReq.ID, -32603, "Script execution error", err.Error())
 			return
@@ -3505,7 +4212,7 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 	} else if st, ok := finalResult["status"].(int); ok {
 		statusCode = st
 	}
-	if handled, outStatusCode, outJSON, err := runOutCheckScript(apiConfig, allParams, statusCode, "application/json", finalBody); handled {
+	if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, allParams, statusCode, "application/json", finalBody); handled {
 		if err != nil {
 			respondJSONRPCError(w, rpcReq.ID, -32603, "outCheck script error", err.Error())
 			return
@@ -3515,7 +4222,7 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 6) Push処理（必要な場合）
-	performPush(apiConfig, allParams)
+	performPush(snapshot, apiConfig, allParams)
 
 	// 7) 最終レスポンスの返却
 	if st, ok := finalResult["status"].(float64); ok {
@@ -3536,21 +4243,21 @@ func handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func performPush(apiConfig APIConfig, allParams map[string]interface{}) {
+func performPush(snapshot *APIConfigSnapshot, apiConfig APIConfig, allParams map[string]interface{}) {
 	if apiConfig.Push != "" {
-		pushConfig, exists := currentSQLFiles()[apiConfig.Push]
+		pushConfig, exists := snapshot.Definitions[apiConfig.Push]
 		if exists {
 			var pushResult []byte
 			var err error
 			if pushConfig.Script != "" {
-				s, err := runScript([]string{pushConfig.Script}, allParams)
+				s, err := runScriptWithSnapshot(snapshot, []string{pushConfig.Script}, allParams)
 				if err != nil {
 					log.Printf("Push script error: %v", err)
 				} else {
 					pushResult = []byte(s)
 				}
 			} else {
-				pushResult, err = executeAPIConfig(pushConfig)
+				pushResult, err = executeAPIConfigWithSnapshot(snapshot, pushConfig)
 				if err != nil {
 					log.Printf("Push API execution error: %v", err)
 				} else {
@@ -3601,7 +4308,7 @@ func saveBase64ToFile(destPath, b64 string) error {
 	return os.WriteFile(destPath, data, 0o644)
 }
 
-func registerNyanFuncs(vm *goja.Runtime, params map[string]interface{}, acceptedParamsKeys []string) {
+func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map[string]interface{}, acceptedParamsKeys []string) {
 	vm.Set("nyanAllParams", params)
 	vm.Set("nyanAcceptedParamsKeys", acceptedParamsKeys)
 	vm.Set("console", map[string]interface{}{
@@ -3726,7 +4433,7 @@ func registerNyanFuncs(vm *goja.Runtime, params map[string]interface{}, accepted
 		apiName = strings.TrimSpace(apiName)
 		params["api"] = apiName
 
-		result, err := callNyanAPIFromVM(apiName, params)
+		result, err := callNyanAPIFromVMWithSnapshot(snapshot, apiName, params)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}

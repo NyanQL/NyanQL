@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -242,7 +243,7 @@ func TestLoadSQLFilesResolvesAPIPathsFromAPIFileDirectory(t *testing.T) {
 	}`)
 	setTestSQLFiles(t, nil)
 
-	files, _, err := readSQLFiles(apiPath, apiDir)
+	files, _, err := readSQLFiles(apiPath, t.TempDir())
 	if err != nil {
 		t.Fatalf("readSQLFiles() error = %v", err)
 	}
@@ -264,6 +265,623 @@ func TestLoadSQLFilesResolvesAPIPathsFromAPIFileDirectory(t *testing.T) {
 	}
 	if apiConfig.Path != filepath.Join(apiDir, "public") {
 		t.Fatalf("Public path = %q, want api-relative path", apiConfig.Path)
+	}
+}
+
+func TestDecodeSQLFilesRejectsDuplicateKeysAtEveryObjectLevel(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     string
+		wantPath string
+	}{
+		{
+			name:     "top level",
+			data:     `{"api":{},"api":{}}`,
+			wantPath: `$`,
+		},
+		{
+			name:     "API definition",
+			data:     `{"api":{"description":"first","description":"second"}}`,
+			wantPath: `$["api"]`,
+		},
+		{
+			name:     "nested trigger",
+			data:     `{"job":{"type":"schedule","script":"job.js","trigger":{"type":"cron","type":"other","value":"* * * * *"}}}`,
+			wantPath: `$["job"]["trigger"]`,
+		},
+		{
+			name:     "object in array",
+			data:     `{"api":{"unknown":[{"value":1,"value":2}]}}`,
+			wantPath: `$["api"]["unknown"][0]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := decodeSQLFiles([]byte(tt.data), t.TempDir())
+			if err == nil {
+				t.Fatal("decodeSQLFiles() error = nil, want duplicate-key error")
+			}
+			if !strings.Contains(err.Error(), "duplicate key") || !strings.Contains(err.Error(), tt.wantPath) {
+				t.Fatalf("decodeSQLFiles() error = %q, want duplicate key at %s", err, tt.wantPath)
+			}
+		})
+	}
+}
+
+func TestDecodeSQLFilesAllowsSameKeyInDifferentObjects(t *testing.T) {
+	files, err := decodeSQLFiles([]byte(`{
+		"first":{"description":"one"},
+		"second":{"description":"two"}
+	}`), t.TempDir())
+	if err != nil {
+		t.Fatalf("decodeSQLFiles() error = %v", err)
+	}
+	if files["first"].Description != "one" || files["second"].Description != "two" {
+		t.Fatalf("decoded files = %#v", files)
+	}
+}
+
+func TestDecodeSQLFilesRequiresObjectDefinitions(t *testing.T) {
+	for _, data := range []string{
+		`{"api":null}`,
+		`{"api":"invalid"}`,
+		`{"api":[]}`,
+	} {
+		_, err := decodeSQLFiles([]byte(data), t.TempDir())
+		if err == nil || !strings.Contains(err.Error(), `definition "api" must be an object`) {
+			t.Fatalf("decodeSQLFiles(%s) error = %v, want object-definition error", data, err)
+		}
+	}
+}
+
+func TestLoadAPIConfigFileValidatesAllDefinitionsBeforePublishing(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{
+			name: "API with script and SQL",
+			data: `{"api":{"script":"api.js","sql":["api.sql"]}}`,
+			want: "if script is set, sql cannot be specified",
+		},
+		{
+			name: "schedule without script",
+			data: `{"job":{"type":"schedule","trigger":{"type":"cron","value":"* * * * *"}}}`,
+			want: "script is missing",
+		},
+		{
+			name: "schedule with invalid cron",
+			data: `{"job":{"type":"schedule","script":"job.js","trigger":{"type":"cron","value":"invalid"}}}`,
+			want: "invalid cron trigger",
+		},
+		{
+			name: "ws_client without connectURL",
+			data: `{"client":{"type":"ws_client","script":"client.js"}}`,
+			want: "connectURL is missing",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apiPath := filepath.Join(t.TempDir(), "api.json")
+			writeTestFile(t, apiPath, tt.data)
+			result, err := loadAPIConfigFile(apiPath)
+			if err == nil {
+				t.Fatalf("loadAPIConfigFile() result = %#v, want validation error", result)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("loadAPIConfigFile() error = %q, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadAPIConfigFileKeepsUnknownTypeCompatibility(t *testing.T) {
+	apiPath := filepath.Join(t.TempDir(), "api.json")
+	writeTestFile(t, apiPath, `{"custom":{"type":"future_type","description":"kept"}}`)
+
+	result, err := loadAPIConfigFile(apiPath)
+	if err != nil {
+		t.Fatalf("loadAPIConfigFile() error = %v", err)
+	}
+	if got := result.Snapshot.Definitions["custom"]; got.Type != "future_type" || got.Description != "kept" {
+		t.Fatalf("custom definition = %#v", got)
+	}
+}
+
+func TestLoadAPIConfigFileBuildsValidatedBackgroundConfigs(t *testing.T) {
+	apiDir := t.TempDir()
+	apiPath := filepath.Join(apiDir, "api.json")
+	writeTestFile(t, apiPath, `{
+		"job":{"type":"schedule","script":"./job.js","trigger":{"type":"cron","value":"0 10 * * *"}},
+		"client":{"type":"ws_client","script":"./client.js","connectURL":"ws://localhost:8080/events"}
+	}`)
+
+	result, err := loadAPIConfigFile(apiPath)
+	if err != nil {
+		t.Fatalf("loadAPIConfigFile() error = %v", err)
+	}
+	if got := result.Schedules["job"].scriptPath; got != filepath.Join(apiDir, "job.js") {
+		t.Fatalf("schedule script path = %q, want API-relative path", got)
+	}
+	if got := result.WSClients["client"].scriptPath; got != filepath.Join(apiDir, "client.js") {
+		t.Fatalf("ws_client script path = %q, want API-relative path", got)
+	}
+}
+
+func TestLoadAPIConfigFileExpandsOneLevelInclude(t *testing.T) {
+	rootDir := t.TempDir()
+	childDir := filepath.Join(rootDir, "sub")
+	rootPath := filepath.Join(rootDir, "api.json")
+	childPath := filepath.Join(childDir, "api.json")
+	writeTestFile(t, rootPath, `{
+		"health":{"sql":["./sql/health.sql"],"description":"root"},
+		"sub":{"type":"include","path":"./sub/api.json"}
+	}`)
+	writeTestFile(t, childPath, `{
+		"getItem":{"sql":["./sql/get_item.sql"],"paramCheck":"./check.js","outCheck":"./out.js","description":"child"},
+		"assets":{"type":"public","path":"./public"},
+		"job":{"type":"schedule","script":"./job.js","trigger":{"type":"cron","value":"0 10 * * *"}},
+		"client":{"type":"ws_client","script":"./client.js","connectURL":"ws://localhost:8080/events"}
+	}`)
+
+	result, err := loadAPIConfigFile(rootPath)
+	if err != nil {
+		t.Fatalf("loadAPIConfigFile() error = %v", err)
+	}
+	definitions := result.Snapshot.Definitions
+	if _, exists := definitions["sub"]; exists {
+		t.Fatal("include definition was published as an executable API")
+	}
+	if got := definitions["health"].SQL[0]; got != filepath.Join(rootDir, "sql/health.sql") {
+		t.Fatalf("root SQL path = %q, want root-relative path", got)
+	}
+	if got := definitions["sub/getItem"].SQL[0]; got != filepath.Join(childDir, "sql/get_item.sql") {
+		t.Fatalf("included SQL path = %q, want child-relative path", got)
+	}
+	if got := definitions["sub/getItem"].ParamCheck; got != filepath.Join(childDir, "check.js") {
+		t.Fatalf("included paramCheck path = %q, want child-relative path", got)
+	}
+	if got := definitions["sub/getItem"].OutCheck; got != filepath.Join(childDir, "out.js") {
+		t.Fatalf("included outCheck path = %q, want child-relative path", got)
+	}
+	if got := definitions["sub/assets"].Path; got != filepath.Join(childDir, "public") {
+		t.Fatalf("included public path = %q, want child-relative path", got)
+	}
+	if got := result.Schedules["sub/job"].scriptPath; got != filepath.Join(childDir, "job.js") {
+		t.Fatalf("included schedule path = %q, want child-relative path", got)
+	}
+	if got := result.WSClients["sub/client"].scriptPath; got != filepath.Join(childDir, "client.js") {
+		t.Fatalf("included ws_client path = %q, want child-relative path", got)
+	}
+	if got := result.Snapshot.Sources["health"]; got != rootPath {
+		t.Fatalf("root source = %q, want %q", got, rootPath)
+	}
+	if got := result.Snapshot.Sources["sub/getItem"]; got != childPath {
+		t.Fatalf("included source = %q, want %q", got, childPath)
+	}
+	if len(result.Snapshot.Files) != 2 {
+		t.Fatalf("snapshot file count = %d, want 2", len(result.Snapshot.Files))
+	}
+	for _, path := range []string{rootPath, childPath} {
+		identity, err := canonicalExistingAPIFilePath(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state, exists := result.Snapshot.Files[identity]
+		if !exists || !state.Exists || state.Path != identity {
+			t.Fatalf("file state for %s = %#v, exists=%t", identity, state, exists)
+		}
+	}
+}
+
+func TestOneLevelIncludedAPICallForms(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	rootDir := t.TempDir()
+	rootPath := filepath.Join(rootDir, "api.json")
+	childPath := filepath.Join(rootDir, "sub", "api.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"./sub/api.json"}}`)
+	writeTestFile(t, childPath, `{"getItem":{"script":"./get_item.js","description":"included"}}`)
+	writeTestFile(t, filepath.Join(rootDir, "sub", "get_item.js"), `JSON.stringify({api:nyanAllParams.api})`)
+
+	result, err := loadAPIConfigFile(rootPath)
+	if err != nil {
+		t.Fatalf("loadAPIConfigFile() error = %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		request *http.Request
+	}{
+		{name: "URL path", request: httptest.NewRequest(http.MethodGet, "/sub/getItem", nil)},
+		{name: "query parameter", request: httptest.NewRequest(http.MethodGet, "/?api=sub/getItem", nil)},
+		{name: "POST JSON", request: httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"api":"sub/getItem"}`))},
+	}
+	tests[2].request.Header.Set("Content-Type", "application/json")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handleRequestWithSnapshot(result.Snapshot, recorder, tt.request)
+			if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"api":"sub/getItem"`) {
+				t.Fatalf("response = status %d body %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+
+	rpcRecorder := httptest.NewRecorder()
+	rpcRequest := httptest.NewRequest(http.MethodPost, "/nyan-rpc", strings.NewReader(`{"jsonrpc":"2.0","method":"sub/getItem","params":{},"id":1}`))
+	handleJSONRPCWithSnapshot(result.Snapshot, rpcRecorder, rpcRequest)
+	if rpcRecorder.Code != http.StatusOK || !strings.Contains(rpcRecorder.Body.String(), `"api":"sub/getItem"`) {
+		t.Fatalf("JSON-RPC response = status %d body %s", rpcRecorder.Code, rpcRecorder.Body.String())
+	}
+
+	detailRecorder := httptest.NewRecorder()
+	handleNyanDetailWithSnapshot(result.Snapshot, detailRecorder, httptest.NewRequest(http.MethodGet, "/nyan/sub/getItem", nil))
+	if detailRecorder.Code != http.StatusOK || !strings.Contains(detailRecorder.Body.String(), `"api":"sub/getItem"`) {
+		t.Fatalf("detail response = status %d body %s", detailRecorder.Code, detailRecorder.Body.String())
+	}
+
+	listRecorder := httptest.NewRecorder()
+	handleNyanWithSnapshot(result.Snapshot, listRecorder, httptest.NewRequest(http.MethodGet, "/nyan/", nil))
+	if listRecorder.Code != http.StatusOK || !strings.Contains(listRecorder.Body.String(), `"sub/getItem"`) {
+		t.Fatalf("API list response = status %d body %s", listRecorder.Code, listRecorder.Body.String())
+	}
+}
+
+func TestOneLevelIncludedPublicAPIUsesFullMountPath(t *testing.T) {
+	rootDir := t.TempDir()
+	rootPath := filepath.Join(rootDir, "api.json")
+	childPath := filepath.Join(rootDir, "sub", "api.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"./sub/api.json"}}`)
+	writeTestFile(t, childPath, `{"assets":{"type":"public","path":"./public"}}`)
+
+	result, err := loadAPIConfigFile(rootPath)
+	if err != nil {
+		t.Fatalf("loadAPIConfigFile() error = %v", err)
+	}
+	apiKey, requestedPath, _, ok := findPublicAPIForPathInSnapshot(result.Snapshot, "/sub/assets/app.js")
+	if !ok || apiKey != "sub/assets" || requestedPath != "app.js" {
+		t.Fatalf("public match = key %q path %q ok=%t", apiKey, requestedPath, ok)
+	}
+}
+
+func TestOneLevelIncludeDefinitionValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{name: "missing path", data: `{"sub":{"type":"include"}}`, want: "path is empty"},
+		{name: "empty path", data: `{"sub":{"type":"include","path":"  "}}`, want: "path is empty"},
+		{name: "non-string path", data: `{"sub":{"type":"include","path":1}}`, want: "cannot unmarshal number"},
+		{name: "SQL mixed in", data: `{"sub":{"type":"include","path":"child.json","sql":["query.sql"]}}`, want: `unsupported field "sql"`},
+		{name: "description mixed in", data: `{"sub":{"type":"include","path":"child.json","description":"ambiguous"}}`, want: `unsupported field "description"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rootPath := filepath.Join(t.TempDir(), "api.json")
+			writeTestFile(t, rootPath, tt.data)
+			_, err := loadAPIConfigFile(rootPath)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("loadAPIConfigFile() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestOneLevelIncludeRejectsInvalidMountNames(t *testing.T) {
+	for _, mountName := range []string{"", ".", "..", "sub/admin", " sub", "sub "} {
+		t.Run(fmt.Sprintf("mount_%q", mountName), func(t *testing.T) {
+			rootDir := t.TempDir()
+			rootPath := filepath.Join(rootDir, "api.json")
+			writeTestFile(t, filepath.Join(rootDir, "child.json"), `{}`)
+			writeTestFile(t, rootPath, fmt.Sprintf(`{%q:{"type":"include","path":"child.json"}}`, mountName))
+			_, err := loadAPIConfigFile(rootPath)
+			if err == nil || !strings.Contains(err.Error(), "invalid include mount name") {
+				t.Fatalf("loadAPIConfigFile() error = %v, want invalid mount error", err)
+			}
+		})
+	}
+}
+
+func TestOneLevelIncludeFileValidation(t *testing.T) {
+	tests := []struct {
+		name       string
+		childSetup func(t *testing.T, path string)
+		want       string
+	}{
+		{name: "missing file", want: "file not found"},
+		{
+			name: "directory",
+			childSetup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.MkdirAll(path, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "not a regular file",
+		},
+		{
+			name: "invalid JSON",
+			childSetup: func(t *testing.T, path string) {
+				writeTestFile(t, path, `{"broken":`)
+			},
+			want: "decode api JSON",
+		},
+		{
+			name: "non-object JSON",
+			childSetup: func(t *testing.T, path string) {
+				writeTestFile(t, path, `[]`)
+			},
+			want: "top-level value must be an object",
+		},
+		{
+			name: "duplicate child key",
+			childSetup: func(t *testing.T, path string) {
+				writeTestFile(t, path, `{"item":{"description":"first"},"item":{"description":"second"}}`)
+			},
+			want: "duplicate key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rootDir := t.TempDir()
+			rootPath := filepath.Join(rootDir, "api.json")
+			childPath := filepath.Join(rootDir, "child.json")
+			writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+			if tt.childSetup != nil {
+				tt.childSetup(t, childPath)
+			}
+			_, err := loadAPIConfigFile(rootPath)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("loadAPIConfigFile() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestIncludeRejectsMountNamespaceCollision(t *testing.T) {
+	rootDir := t.TempDir()
+	rootPath := filepath.Join(rootDir, "api.json")
+	writeTestFile(t, rootPath, `{
+		"sub/item":{"description":"direct"},
+		"sub":{"type":"include","path":"child.json"}
+	}`)
+	writeTestFile(t, filepath.Join(rootDir, "child.json"), `{"item":{"description":"included"}}`)
+
+	_, err := loadAPIConfigFile(rootPath)
+	if err == nil || !strings.Contains(err.Error(), `API name "sub/item" conflicts with mount namespace "sub"`) {
+		t.Fatalf("loadAPIConfigFile() error = %v, want mount namespace collision", err)
+	}
+}
+
+func TestOneLevelIncludeAllowsSameFileAtDifferentMounts(t *testing.T) {
+	rootDir := t.TempDir()
+	rootPath := filepath.Join(rootDir, "api.json")
+	childPath := filepath.Join(rootDir, "child.json")
+	writeTestFile(t, rootPath, `{
+		"first":{"type":"include","path":"child.json"},
+		"second":{"type":"include","path":"./child.json"}
+	}`)
+	writeTestFile(t, childPath, `{"item":{"description":"shared"}}`)
+
+	result, err := loadAPIConfigFile(rootPath)
+	if err != nil {
+		t.Fatalf("loadAPIConfigFile() error = %v", err)
+	}
+	for _, name := range []string{"first/item", "second/item"} {
+		if result.Snapshot.Definitions[name].Description != "shared" {
+			t.Fatalf("definition %q was not expanded", name)
+		}
+	}
+	if len(result.Snapshot.Files) != 2 {
+		t.Fatalf("physical file count = %d, want root and deduplicated child", len(result.Snapshot.Files))
+	}
+}
+
+func TestLoadAPIConfigFileExpandsMultiLevelInclude(t *testing.T) {
+	rootDir := t.TempDir()
+	subDir := filepath.Join(rootDir, "sub")
+	adminDir := filepath.Join(subDir, "admin")
+	rootPath := filepath.Join(rootDir, "api.json")
+	subPath := filepath.Join(subDir, "api.json")
+	adminPath := filepath.Join(adminDir, "api.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"./sub/api.json"}}`)
+	writeTestFile(t, subPath, `{
+		"getItem":{"sql":["./sql/get_item.sql"]},
+		"admin":{"type":"include","path":"./admin/api.json"}
+	}`)
+	writeTestFile(t, adminPath, `{
+		"getUser":{"script":"./get_user.js","description":"nested"},
+		"job":{"type":"schedule","script":"./job.js","trigger":{"type":"cron","value":"0 10 * * *"}}
+	}`)
+
+	result, err := loadAPIConfigFile(rootPath)
+	if err != nil {
+		t.Fatalf("loadAPIConfigFile() error = %v", err)
+	}
+	if got := result.Snapshot.Definitions["sub/getItem"].SQL[0]; got != filepath.Join(subDir, "sql/get_item.sql") {
+		t.Fatalf("second-level SQL path = %q, want sub-file-relative path", got)
+	}
+	if got := result.Snapshot.Definitions["sub/admin/getUser"].Script; got != filepath.Join(adminDir, "get_user.js") {
+		t.Fatalf("third-level script path = %q, want admin-file-relative path", got)
+	}
+	if got := result.Snapshot.Sources["sub/admin/getUser"]; got != adminPath {
+		t.Fatalf("nested source = %q, want %q", got, adminPath)
+	}
+	if got := result.Schedules["sub/admin/job"].scriptPath; got != filepath.Join(adminDir, "job.js") {
+		t.Fatalf("nested schedule path = %q, want admin-file-relative path", got)
+	}
+	if len(result.Snapshot.Files) != 3 {
+		t.Fatalf("physical file count = %d, want 3", len(result.Snapshot.Files))
+	}
+}
+
+func TestNyanListsIncludedAPIsAsFlatCompleteNames(t *testing.T) {
+	rootDir := t.TempDir()
+	rootPath := filepath.Join(rootDir, "api.json")
+	subPath := filepath.Join(rootDir, "sub", "api.json")
+	adminPath := filepath.Join(rootDir, "sub", "admin", "api.json")
+	writeTestFile(t, rootPath, `{
+		"health":{"description":"root"},
+		"legacy/path":{"description":"legacy"},
+		"sub":{"type":"include","path":"./sub/api.json"}
+	}`)
+	writeTestFile(t, subPath, `{
+		"getItem":{"description":"item"},
+		"assets":{"type":"public","path":"./public"},
+		"admin":{"type":"include","path":"./admin/api.json"}
+	}`)
+	writeTestFile(t, adminPath, `{
+		"getUser":{"description":"user"},
+		"job":{"type":"schedule","script":"./job.js","trigger":{"type":"cron","value":"0 10 * * *"}}
+	}`)
+
+	result, err := loadAPIConfigFile(rootPath)
+	if err != nil {
+		t.Fatalf("loadAPIConfigFile() error = %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	handleNyanWithSnapshot(result.Snapshot, recorder, httptest.NewRequest(http.MethodGet, "/nyan/", nil))
+
+	var response NyanResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]APIDetails{
+		"health":            {Description: "root"},
+		"legacy/path":       {Description: "legacy"},
+		"sub/getItem":       {Description: "item"},
+		"sub/admin/getUser": {Description: "user"},
+	}
+	if !reflect.DeepEqual(response.Apis, want) {
+		t.Fatalf("apis = %#v, want %#v", response.Apis, want)
+	}
+	var rawResponse map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &rawResponse); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := rawResponse["apiTree"]; exists {
+		t.Fatalf("response unexpectedly contains apiTree: %s", recorder.Body.String())
+	}
+}
+
+func TestMultiLevelIncludedAPIPathCalls(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	rootDir := t.TempDir()
+	rootPath := filepath.Join(rootDir, "api.json")
+	subPath := filepath.Join(rootDir, "sub", "api.json")
+	adminPath := filepath.Join(rootDir, "sub", "admin", "api.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"./sub/api.json"}}`)
+	writeTestFile(t, subPath, `{"admin":{"type":"include","path":"./admin/api.json"}}`)
+	writeTestFile(t, adminPath, `{"getUser":{"script":"./get_user.js"}}`)
+	writeTestFile(t, filepath.Join(rootDir, "sub", "admin", "get_user.js"), `JSON.stringify({api:nyanAllParams.api})`)
+
+	result, err := loadAPIConfigFile(rootPath)
+	if err != nil {
+		t.Fatalf("loadAPIConfigFile() error = %v", err)
+	}
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/sub/admin/getUser", nil),
+		httptest.NewRequest(http.MethodGet, "/?api=sub/admin/getUser", nil),
+	} {
+		recorder := httptest.NewRecorder()
+		handleRequestWithSnapshot(result.Snapshot, recorder, request)
+		if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"api":"sub/admin/getUser"`) {
+			t.Fatalf("response = status %d body %s", recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func TestIncludeCycleDetection(t *testing.T) {
+	t.Run("direct", func(t *testing.T) {
+		rootPath := filepath.Join(t.TempDir(), "api.json")
+		writeTestFile(t, rootPath, `{"self":{"type":"include","path":"./api.json"}}`)
+		_, err := loadAPIConfigFile(rootPath)
+		if err == nil || !strings.Contains(err.Error(), "include cycle detected:") || strings.Count(err.Error(), rootPath) != 2 {
+			t.Fatalf("loadAPIConfigFile() error = %v, want direct cycle path", err)
+		}
+	})
+
+	t.Run("indirect", func(t *testing.T) {
+		rootDir := t.TempDir()
+		rootPath := filepath.Join(rootDir, "api.json")
+		subPath := filepath.Join(rootDir, "sub", "api.json")
+		adminPath := filepath.Join(rootDir, "sub", "admin", "api.json")
+		writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"./sub/api.json"}}`)
+		writeTestFile(t, subPath, `{"admin":{"type":"include","path":"./admin/api.json"}}`)
+		writeTestFile(t, adminPath, `{"root":{"type":"include","path":"../../api.json"}}`)
+
+		_, err := loadAPIConfigFile(rootPath)
+		if err == nil || !strings.Contains(err.Error(), "include cycle detected:") {
+			t.Fatalf("loadAPIConfigFile() error = %v, want indirect cycle", err)
+		}
+		for _, path := range []string{rootPath, subPath, adminPath} {
+			if !strings.Contains(err.Error(), path) {
+				t.Fatalf("cycle error = %q, want path %s", err, path)
+			}
+		}
+		if strings.Count(err.Error(), rootPath) != 2 {
+			t.Fatalf("cycle error = %q, want repeated root path", err)
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		rootDir := t.TempDir()
+		rootPath := filepath.Join(rootDir, "api.json")
+		aliasPath := filepath.Join(rootDir, "alias.json")
+		writeTestFile(t, rootPath, `{"alias":{"type":"include","path":"./alias.json"}}`)
+		if err := os.Symlink(rootPath, aliasPath); err != nil {
+			t.Skipf("symlink is unavailable: %v", err)
+		}
+		_, err := loadAPIConfigFile(rootPath)
+		if err == nil || !strings.Contains(err.Error(), "include cycle detected:") || !strings.Contains(err.Error(), aliasPath) {
+			t.Fatalf("loadAPIConfigFile() error = %v, want symlink cycle", err)
+		}
+	})
+}
+
+func TestNestedMountNamespaceCollision(t *testing.T) {
+	rootDir := t.TempDir()
+	rootPath := filepath.Join(rootDir, "api.json")
+	childPath := filepath.Join(rootDir, "child.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+	writeTestFile(t, childPath, `{
+		"admin/getUser":{"description":"direct"},
+		"admin":{"type":"include","path":"admin.json"}
+	}`)
+	writeTestFile(t, filepath.Join(rootDir, "admin.json"), `{}`)
+
+	_, err := loadAPIConfigFile(rootPath)
+	if err == nil || !strings.Contains(err.Error(), `API name "admin/getUser" conflicts with mount namespace "admin"`) {
+		t.Fatalf("loadAPIConfigFile() error = %v, want nested namespace collision", err)
+	}
+}
+
+func TestMountNamespaceDoesNotBlockOtherSlashNames(t *testing.T) {
+	rootDir := t.TempDir()
+	rootPath := filepath.Join(rootDir, "api.json")
+	writeTestFile(t, rootPath, `{
+		"legacy/path":{"description":"legacy"},
+		"submarine/item":{"description":"separate prefix"},
+		"sub":{"type":"include","path":"child.json"}
+	}`)
+	writeTestFile(t, filepath.Join(rootDir, "child.json"), `{"item":{"description":"included"}}`)
+
+	result, err := loadAPIConfigFile(rootPath)
+	if err != nil {
+		t.Fatalf("loadAPIConfigFile() error = %v", err)
+	}
+	for _, name := range []string{"legacy/path", "submarine/item", "sub/item"} {
+		if _, exists := result.Snapshot.Definitions[name]; !exists {
+			t.Fatalf("definition %q is missing", name)
+		}
 	}
 }
 
@@ -403,6 +1021,35 @@ func TestReloadSQLFilesIfChangedKeepsCurrentDefinitionOnInvalidJSON(t *testing.T
 	}
 }
 
+func TestReloadSQLFilesIfChangedRejectsDuplicateKeys(t *testing.T) {
+	apiDir := t.TempDir()
+	apiPath := filepath.Join(apiDir, "api.json")
+	writeTestFile(t, apiPath, `{"current":{"description":"active"}}`)
+
+	initialFiles, initialHash, err := readSQLFiles(apiPath, apiDir)
+	if err != nil {
+		t.Fatalf("readSQLFiles() error = %v", err)
+	}
+	setTestSQLFiles(t, initialFiles)
+	writeTestFile(t, apiPath, `{"replacement":{"description":"first"},"replacement":{"description":"second"}}`)
+
+	observedHash, reloaded, err := reloadSQLFilesIfChanged(apiPath, apiDir, initialHash)
+	if err == nil || !strings.Contains(err.Error(), "duplicate key") {
+		t.Fatalf("reloadSQLFilesIfChanged() error = %v, want duplicate-key error", err)
+	}
+	if reloaded {
+		t.Fatal("reloadSQLFilesIfChanged() reloaded = true, want false")
+	}
+	if currentSQLFiles()["current"].Description != "active" {
+		t.Fatal("current API definition changed after duplicate-key error")
+	}
+
+	secondHash, reloaded, err := reloadSQLFilesIfChanged(apiPath, apiDir, observedHash)
+	if err != nil || reloaded || secondHash != observedHash {
+		t.Fatalf("unchanged duplicate content should be skipped: hash=%x reloaded=%t err=%v", secondHash, reloaded, err)
+	}
+}
+
 func TestReloadSQLFilesIfChangedAppliesBackgroundChanges(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -485,6 +1132,478 @@ func TestReloadSQLFilesIfChangedRejectsInvalidBackgroundConfig(t *testing.T) {
 				t.Fatal("current API definition changed after invalid background config")
 			}
 		})
+	}
+}
+
+func TestReloadAPIConfigGraphDetectsNestedIncludeChanges(t *testing.T) {
+	apiDir := t.TempDir()
+	rootPath := filepath.Join(apiDir, "api.json")
+	childPath := filepath.Join(apiDir, "child.json")
+	grandchildPath := filepath.Join(apiDir, "grandchild.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+	writeTestFile(t, childPath, `{"local":{"description":"old child"},"admin":{"type":"include","path":"grandchild.json"}}`)
+	writeTestFile(t, grandchildPath, `{"user":{"description":"old grandchild"}}`)
+
+	initial := loadTestAPIConfig(t, rootPath)
+	setTestAPISnapshot(t, initial.Snapshot)
+	writeTestFile(t, childPath, `{"local":{"description":"new child"},"admin":{"type":"include","path":"grandchild.json"}}`)
+	writeTestFile(t, grandchildPath, `{"user":{"description":"new grandchild"}}`)
+
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, initial.Snapshot.Files)
+	if err != nil {
+		t.Fatalf("reloadAPIConfigGraphIfChanged() error = %v", err)
+	}
+	if !reloaded {
+		t.Fatal("reloadAPIConfigGraphIfChanged() reloaded = false, want true")
+	}
+	if len(observed) != 3 {
+		t.Fatalf("observed file count = %d, want 3", len(observed))
+	}
+	if got := currentSQLFiles()["sub/local"].Description; got != "new child" {
+		t.Fatalf("sub/local description = %q, want new child", got)
+	}
+	if got := currentSQLFiles()["sub/admin/user"].Description; got != "new grandchild" {
+		t.Fatalf("sub/admin/user description = %q, want new grandchild", got)
+	}
+}
+
+func TestReloadAPIConfigGraphUpdatesWatchedFilesAfterIncludeAddAndRemove(t *testing.T) {
+	apiDir := t.TempDir()
+	rootPath := filepath.Join(apiDir, "api.json")
+	childPath := filepath.Join(apiDir, "child.json")
+	writeTestFile(t, rootPath, `{"health":{"description":"ok"}}`)
+	writeTestFile(t, childPath, `{"item":{"description":"included"}}`)
+
+	initial := loadTestAPIConfig(t, rootPath)
+	setTestAPISnapshot(t, initial.Snapshot)
+	writeTestFile(t, rootPath, `{"health":{"description":"ok"},"sub":{"type":"include","path":"child.json"}}`)
+
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, initial.Snapshot.Files)
+	if err != nil || !reloaded {
+		t.Fatalf("add include reload: reloaded=%t err=%v", reloaded, err)
+	}
+	if len(observed) != 2 {
+		t.Fatalf("file count after add = %d, want 2", len(observed))
+	}
+	if _, exists := currentSQLFiles()["sub/item"]; !exists {
+		t.Fatal("included API was not published")
+	}
+
+	writeTestFile(t, rootPath, `{"health":{"description":"ok"}}`)
+	observed, reloaded, err = reloadAPIConfigGraphIfChanged(rootPath, observed)
+	if err != nil || !reloaded {
+		t.Fatalf("remove include reload: reloaded=%t err=%v", reloaded, err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("file count after remove = %d, want 1", len(observed))
+	}
+	if _, exists := currentSQLFiles()["sub/item"]; exists {
+		t.Fatal("removed included API remains published")
+	}
+}
+
+func TestReloadAPIConfigGraphUpdatesWatchedFilesFromNestedInclude(t *testing.T) {
+	apiDir := t.TempDir()
+	rootPath := filepath.Join(apiDir, "api.json")
+	childPath := filepath.Join(apiDir, "child.json")
+	grandchildPath := filepath.Join(apiDir, "grandchild.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+	writeTestFile(t, childPath, `{"local":{"description":"local"}}`)
+	writeTestFile(t, grandchildPath, `{"user":{"description":"nested"}}`)
+
+	initial := loadTestAPIConfig(t, rootPath)
+	setTestAPISnapshot(t, initial.Snapshot)
+	writeTestFile(t, childPath, `{"local":{"description":"local"},"admin":{"type":"include","path":"grandchild.json"}}`)
+
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, initial.Snapshot.Files)
+	if err != nil || !reloaded {
+		t.Fatalf("nested include add reload: reloaded=%t err=%v", reloaded, err)
+	}
+	if len(observed) != 3 {
+		t.Fatalf("file count after nested add = %d, want 3", len(observed))
+	}
+	if _, exists := currentSQLFiles()["sub/admin/user"]; !exists {
+		t.Fatal("nested included API was not published")
+	}
+
+	writeTestFile(t, childPath, `{"local":{"description":"local"}}`)
+	observed, reloaded, err = reloadAPIConfigGraphIfChanged(rootPath, observed)
+	if err != nil || !reloaded {
+		t.Fatalf("nested include remove reload: reloaded=%t err=%v", reloaded, err)
+	}
+	if len(observed) != 2 {
+		t.Fatalf("file count after nested remove = %d, want 2", len(observed))
+	}
+	if _, exists := currentSQLFiles()["sub/admin/user"]; exists {
+		t.Fatal("removed nested API remains published")
+	}
+}
+
+func TestReloadAPIConfigGraphPublishesChangedSourceWithSameDefinitions(t *testing.T) {
+	apiDir := t.TempDir()
+	rootPath := filepath.Join(apiDir, "api.json")
+	firstPath := filepath.Join(apiDir, "first.json")
+	secondPath := filepath.Join(apiDir, "second.json")
+	definition := `{"item":{"description":"same"}}`
+	writeTestFile(t, firstPath, definition)
+	writeTestFile(t, secondPath, definition)
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"first.json"}}`)
+
+	initial := loadTestAPIConfig(t, rootPath)
+	setTestAPISnapshot(t, initial.Snapshot)
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"second.json"}}`)
+
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, initial.Snapshot.Files)
+	if err != nil {
+		t.Fatalf("reloadAPIConfigGraphIfChanged() error = %v", err)
+	}
+	if !reloaded {
+		t.Fatal("source-only change was not published")
+	}
+	if got := currentAPISnapshot().Sources["sub/item"]; got != secondPath {
+		t.Fatalf("source = %q, want %q", got, secondPath)
+	}
+	canonicalSecond, err := canonicalExistingAPIFilePath(secondPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := observed[canonicalSecond]; !exists {
+		t.Fatal("new include file is not in the watched set")
+	}
+}
+
+func TestVerifyAPIFileStatesRejectsChangesAfterLoad(t *testing.T) {
+	apiDir := t.TempDir()
+	rootPath := filepath.Join(apiDir, "api.json")
+	childPath := filepath.Join(apiDir, "child.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+	writeTestFile(t, childPath, `{"item":{"description":"old"}}`)
+
+	loaded := loadTestAPIConfig(t, rootPath)
+	writeTestFile(t, childPath, `{"item":{"description":"new"}}`)
+	if err := verifyAPIFileStates(loaded.Snapshot.Files); err == nil {
+		t.Fatal("verifyAPIFileStates() error = nil, want concurrent-change error")
+	}
+}
+
+func TestReloadAPIConfigGraphWatchesMissingCandidateIncludeUntilCreated(t *testing.T) {
+	apiDir := t.TempDir()
+	rootPath := filepath.Join(apiDir, "api.json")
+	childPath := filepath.Join(apiDir, "child.json")
+	writeTestFile(t, rootPath, `{"health":{"description":"active"}}`)
+
+	initial := loadTestAPIConfig(t, rootPath)
+	setTestAPISnapshot(t, initial.Snapshot)
+	writeTestFile(t, rootPath, `{"health":{"description":"candidate"},"sub":{"type":"include","path":"child.json"}}`)
+
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, initial.Snapshot.Files)
+	if err == nil || !strings.Contains(err.Error(), "file not found") {
+		t.Fatalf("missing include error = %v, want file-not-found error", err)
+	}
+	if reloaded {
+		t.Fatal("invalid candidate was published")
+	}
+	if got := currentSQLFiles()["health"].Description; got != "active" {
+		t.Fatalf("active snapshot changed to %q", got)
+	}
+	missingState, exists := observed[childPath]
+	if !exists || missingState.Exists || missingState.Error != "not_found" {
+		t.Fatalf("missing include state = %#v, exists=%t", missingState, exists)
+	}
+
+	unchanged, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, observed)
+	if err != nil || reloaded {
+		t.Fatalf("unchanged failed candidate was retried: reloaded=%t err=%v", reloaded, err)
+	}
+	if !reflect.DeepEqual(unchanged, observed) {
+		t.Fatal("unchanged failed candidate altered the watched state")
+	}
+
+	writeTestFile(t, childPath, `{"item":{"description":"created"}}`)
+	observed, reloaded, err = reloadAPIConfigGraphIfChanged(rootPath, observed)
+	if err != nil || !reloaded {
+		t.Fatalf("created include reload: reloaded=%t err=%v", reloaded, err)
+	}
+	if got := currentSQLFiles()["sub/item"].Description; got != "created" {
+		t.Fatalf("created include description = %q", got)
+	}
+	if len(observed) != 2 {
+		t.Fatalf("successful watched file count = %d, want 2", len(observed))
+	}
+}
+
+func TestReloadAPIConfigGraphWatchesMissingNestedCandidateInclude(t *testing.T) {
+	apiDir := t.TempDir()
+	rootPath := filepath.Join(apiDir, "api.json")
+	childPath := filepath.Join(apiDir, "child.json")
+	grandchildPath := filepath.Join(apiDir, "grandchild.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+	writeTestFile(t, childPath, `{"local":{"description":"active"}}`)
+
+	initial := loadTestAPIConfig(t, rootPath)
+	setTestAPISnapshot(t, initial.Snapshot)
+	writeTestFile(t, childPath, `{"local":{"description":"candidate"},"admin":{"type":"include","path":"grandchild.json"}}`)
+
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, initial.Snapshot.Files)
+	if err == nil || reloaded {
+		t.Fatalf("missing nested include: reloaded=%t err=%v", reloaded, err)
+	}
+	if _, exists := observed[grandchildPath]; !exists {
+		t.Fatal("missing nested include was not retained in watched files")
+	}
+	if got := currentSQLFiles()["sub/local"].Description; got != "active" {
+		t.Fatalf("active nested definition changed to %q", got)
+	}
+
+	writeTestFile(t, grandchildPath, `{"user":{"description":"created"}}`)
+	observed, reloaded, err = reloadAPIConfigGraphIfChanged(rootPath, observed)
+	if err != nil || !reloaded {
+		t.Fatalf("created nested include reload: reloaded=%t err=%v", reloaded, err)
+	}
+	if len(observed) != 3 {
+		t.Fatalf("successful watched file count = %d, want 3", len(observed))
+	}
+	if _, exists := currentSQLFiles()["sub/admin/user"]; !exists {
+		t.Fatal("created nested API was not published")
+	}
+}
+
+func TestReloadAPIConfigGraphWatchesInvalidCandidateIncludeUntilCorrected(t *testing.T) {
+	apiDir := t.TempDir()
+	rootPath := filepath.Join(apiDir, "api.json")
+	childPath := filepath.Join(apiDir, "child.json")
+	writeTestFile(t, rootPath, `{"health":{"description":"active"}}`)
+
+	initial := loadTestAPIConfig(t, rootPath)
+	setTestAPISnapshot(t, initial.Snapshot)
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+	writeTestFile(t, childPath, `{"broken":`)
+
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, initial.Snapshot.Files)
+	if err == nil || reloaded {
+		t.Fatalf("invalid include reload: reloaded=%t err=%v", reloaded, err)
+	}
+	canonicalChild, canonicalErr := canonicalExistingAPIFilePath(childPath)
+	if canonicalErr != nil {
+		t.Fatal(canonicalErr)
+	}
+	invalidState, exists := observed[canonicalChild]
+	if !exists || !invalidState.Exists || invalidState.Hash == ([sha256.Size]byte{}) {
+		t.Fatalf("invalid include state = %#v, exists=%t", invalidState, exists)
+	}
+	if _, exists := currentSQLFiles()["health"]; !exists {
+		t.Fatal("active snapshot was replaced after invalid include JSON")
+	}
+
+	writeTestFile(t, childPath, `{"item":{"description":"corrected"}}`)
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(rootPath, observed)
+	if err != nil || !reloaded {
+		t.Fatalf("corrected include reload: reloaded=%t err=%v", reloaded, err)
+	}
+	if got := currentSQLFiles()["sub/item"].Description; got != "corrected" {
+		t.Fatalf("corrected description = %q", got)
+	}
+}
+
+func TestReloadAPIConfigGraphKeepsDeletedActiveIncludeWatched(t *testing.T) {
+	apiDir := t.TempDir()
+	rootPath := filepath.Join(apiDir, "api.json")
+	childPath := filepath.Join(apiDir, "child.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+	writeTestFile(t, childPath, `{"item":{"description":"active"}}`)
+
+	initial := loadTestAPIConfig(t, rootPath)
+	setTestAPISnapshot(t, initial.Snapshot)
+	if err := os.Remove(childPath); err != nil {
+		t.Fatal(err)
+	}
+
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, initial.Snapshot.Files)
+	if err == nil || reloaded {
+		t.Fatalf("deleted include reload: reloaded=%t err=%v", reloaded, err)
+	}
+	if _, exists := currentSQLFiles()["sub/item"]; !exists {
+		t.Fatal("active API was removed after include deletion")
+	}
+	missingState, exists := observed[childPath]
+	if !exists || missingState.Exists || missingState.Error != "not_found" {
+		t.Fatalf("deleted include state = %#v, exists=%t", missingState, exists)
+	}
+
+	writeTestFile(t, childPath, `{"item":{"description":"restored"}}`)
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(rootPath, observed)
+	if err != nil || !reloaded {
+		t.Fatalf("restored include reload: reloaded=%t err=%v", reloaded, err)
+	}
+	if got := currentSQLFiles()["sub/item"].Description; got != "restored" {
+		t.Fatalf("restored description = %q", got)
+	}
+}
+
+func TestAPIFileStatesFingerprintIsDeterministicAndStateSensitive(t *testing.T) {
+	first := map[string]APIFileState{
+		"/b.json": {Path: "/b.json", Exists: false, Error: "not_found"},
+		"/a.json": {Path: "/a.json", Exists: true, Hash: [sha256.Size]byte{1}},
+	}
+	second := map[string]APIFileState{
+		"/a.json": {Path: "/a.json", Exists: true, Hash: [sha256.Size]byte{1}},
+		"/b.json": {Path: "/b.json", Exists: false, Error: "not_found"},
+	}
+	if apiFileStatesFingerprint(first) != apiFileStatesFingerprint(second) {
+		t.Fatal("fingerprint depends on map iteration order")
+	}
+	changed := cloneAPIFileStates(second)
+	changed["/b.json"] = APIFileState{Path: "/b.json", Exists: true, Hash: [sha256.Size]byte{2}}
+	if apiFileStatesFingerprint(first) == apiFileStatesFingerprint(changed) {
+		t.Fatal("fingerprint did not change with file state")
+	}
+}
+
+func TestIncludedScheduleHotReloadUpdatesAndStopsWithMount(t *testing.T) {
+	apiDir := t.TempDir()
+	rootPath := filepath.Join(apiDir, "api.json")
+	childPath := filepath.Join(apiDir, "child.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+	writeTestFile(t, childPath, `{"job":{"type":"schedule","script":"job-v1.js","trigger":{"type":"cron","value":"0 0 1 1 *"}}}`)
+
+	initial := loadTestAPIConfig(t, rootPath)
+	oldSnapshot := currentAPISnapshot()
+	oldBackgroundRuntimes := backgroundRuntimes
+	manager := newBackgroundRuntimeManager()
+	setAPISnapshot(initial.Snapshot)
+	backgroundRuntimes = manager
+	manager.reconcile(initial.Snapshot.Schedules, initial.Snapshot.WSClients)
+	t.Cleanup(func() {
+		manager.reconcile(nil, nil)
+		backgroundRuntimes = oldBackgroundRuntimes
+		setAPISnapshot(oldSnapshot)
+	})
+
+	manager.mu.Lock()
+	runtime := manager.schedules["sub/job"]
+	manager.mu.Unlock()
+	if runtime == nil {
+		t.Fatal("included schedule was not started with its full name")
+	}
+
+	writeTestFile(t, childPath, `{"job":{"type":"schedule","script":"job-v2.js","trigger":{"type":"cron","value":"0 0 2 1 *"}}}`)
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, initial.Snapshot.Files)
+	if err != nil || !reloaded {
+		t.Fatalf("schedule update reload: reloaded=%t err=%v", reloaded, err)
+	}
+	manager.mu.Lock()
+	updatedRuntime := manager.schedules["sub/job"]
+	manager.mu.Unlock()
+	if updatedRuntime != runtime {
+		t.Fatal("included schedule update created a second runtime")
+	}
+	updated, active := runtime.currentConfig()
+	if !active || updated.scriptPath != filepath.Join(apiDir, "job-v2.js") || updated.trigger.Value != "0 0 2 1 *" {
+		t.Fatalf("updated schedule = %#v, active=%t", updated, active)
+	}
+	if got := currentAPISnapshot().Schedules["sub/job"].scriptPath; got != updated.scriptPath {
+		t.Fatalf("snapshot schedule path = %q, want %q", got, updated.scriptPath)
+	}
+
+	writeTestFile(t, rootPath, `{}`)
+	observed, reloaded, err = reloadAPIConfigGraphIfChanged(rootPath, observed)
+	if err != nil || !reloaded {
+		t.Fatalf("schedule mount removal reload: reloaded=%t err=%v", reloaded, err)
+	}
+	waitForSignal(t, runtime.done, "included schedule stop")
+	if _, exists := currentAPISnapshot().Schedules["sub/job"]; exists {
+		t.Fatal("removed included schedule remains in snapshot")
+	}
+	if len(observed) != 1 {
+		t.Fatalf("watched file count after mount removal = %d, want 1", len(observed))
+	}
+}
+
+func TestIncludedWSClientHotReloadReconnectsAndStopsWithMount(t *testing.T) {
+	firstURL, firstConnected, firstDisconnected := newWebSocketRuntimeTestServer(t)
+	secondURL, secondConnected, secondDisconnected := newWebSocketRuntimeTestServer(t)
+	apiDir := t.TempDir()
+	rootPath := filepath.Join(apiDir, "api.json")
+	childPath := filepath.Join(apiDir, "child.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+	writeTestFile(t, childPath, fmt.Sprintf(`{"client":{"type":"ws_client","script":"client-v1.js","connectURL":%q}}`, firstURL))
+
+	initial := loadTestAPIConfig(t, rootPath)
+	oldSnapshot := currentAPISnapshot()
+	oldBackgroundRuntimes := backgroundRuntimes
+	manager := newBackgroundRuntimeManager()
+	setAPISnapshot(initial.Snapshot)
+	backgroundRuntimes = manager
+	manager.reconcile(initial.Snapshot.Schedules, initial.Snapshot.WSClients)
+	t.Cleanup(func() {
+		manager.reconcile(nil, nil)
+		backgroundRuntimes = oldBackgroundRuntimes
+		setAPISnapshot(oldSnapshot)
+	})
+	waitForSignal(t, firstConnected, "included WebSocket connection")
+
+	manager.mu.Lock()
+	runtime := manager.wsClients["sub/client"]
+	manager.mu.Unlock()
+	if runtime == nil {
+		t.Fatal("included ws_client was not started with its full name")
+	}
+
+	writeTestFile(t, childPath, fmt.Sprintf(`{"client":{"type":"ws_client","script":"client-v2.js","connectURL":%q}}`, secondURL))
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, initial.Snapshot.Files)
+	if err != nil || !reloaded {
+		t.Fatalf("ws_client update reload: reloaded=%t err=%v", reloaded, err)
+	}
+	waitForSignal(t, firstDisconnected, "old included WebSocket disconnection")
+	waitForSignal(t, secondConnected, "updated included WebSocket connection")
+	updated, active := runtime.currentConfig()
+	if !active || updated.connectURL != secondURL || updated.scriptPath != filepath.Join(apiDir, "client-v2.js") {
+		t.Fatalf("updated ws_client = %#v, active=%t", updated, active)
+	}
+	if got := currentAPISnapshot().WSClients["sub/client"].connectURL; got != secondURL {
+		t.Fatalf("snapshot ws_client URL = %q, want %q", got, secondURL)
+	}
+
+	writeTestFile(t, rootPath, `{}`)
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(rootPath, observed)
+	if err != nil || !reloaded {
+		t.Fatalf("ws_client mount removal reload: reloaded=%t err=%v", reloaded, err)
+	}
+	waitForSignal(t, secondDisconnected, "included WebSocket mount removal")
+	waitForSignal(t, runtime.done, "included ws_client stop")
+	if _, exists := currentAPISnapshot().WSClients["sub/client"]; exists {
+		t.Fatal("removed included ws_client remains in snapshot")
+	}
+}
+
+func TestIncludedPublicAPIHotReloadUsesNewCompletePath(t *testing.T) {
+	apiDir := t.TempDir()
+	rootPath := filepath.Join(apiDir, "api.json")
+	childPath := filepath.Join(apiDir, "child.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+	writeTestFile(t, childPath, `{"assets":{"type":"public","path":"public-v1"}}`)
+
+	initial := loadTestAPIConfig(t, rootPath)
+	setTestAPISnapshot(t, initial.Snapshot)
+	writeTestFile(t, childPath, `{"static":{"type":"public","path":"public-v2"}}`)
+
+	_, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, initial.Snapshot.Files)
+	if err != nil || !reloaded {
+		t.Fatalf("public update reload: reloaded=%t err=%v", reloaded, err)
+	}
+	snapshot := currentAPISnapshot()
+	if _, _, _, ok := findPublicAPIForPathInSnapshot(snapshot, "/sub/assets/app.js"); ok {
+		t.Fatal("removed included public path still matches")
+	}
+	apiName, requestedPath, config, ok := findPublicAPIForPathInSnapshot(snapshot, "/sub/static/app.js")
+	if !ok || apiName != "sub/static" || requestedPath != "app.js" {
+		t.Fatalf("new public match = name %q path %q ok=%t", apiName, requestedPath, ok)
+	}
+	if config.Path != filepath.Join(apiDir, "public-v2") {
+		t.Fatalf("new public filesystem path = %q", config.Path)
+	}
+	if _, exists := snapshot.APIs["sub/static"]; exists {
+		t.Fatal("public definition was included in HTTP API list")
 	}
 }
 
@@ -618,6 +1737,117 @@ func TestSQLFilesConcurrentReadAndReplace(t *testing.T) {
 		setSQLFiles(map[string]APIConfig{"api": {Description: fmt.Sprintf("updated-%d", i)}})
 	}
 	wg.Wait()
+}
+
+func TestNewAPIConfigSnapshotClonesAndIndexesDefinitions(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "api.json")
+	sourceHash := [32]byte{1, 2, 3}
+	files := map[string]APIConfig{
+		"api": {
+			SQL:         []string{"/sql/original.sql"},
+			Description: "original",
+		},
+		"job": {
+			Type:        apiTypeSchedule,
+			Description: "scheduled",
+		},
+	}
+
+	snapshot := newAPIConfigSnapshot(files, sourcePath, sourceHash)
+	originalAPI := files["api"]
+	originalAPI.SQL[0] = "/sql/mutated.sql"
+	files["api"] = APIConfig{Description: "replaced"}
+	originalJob := files["job"]
+	originalJob.Description = "changed"
+	files["job"] = originalJob
+
+	if got := snapshot.Definitions["api"].Description; got != "original" {
+		t.Fatalf("snapshot API description = %q, want original", got)
+	}
+	if got := snapshot.Definitions["api"].SQL[0]; got != "/sql/original.sql" {
+		t.Fatalf("snapshot SQL path = %q, want original path", got)
+	}
+	if _, exists := snapshot.APIs["job"]; exists {
+		t.Fatal("schedule definition was included in HTTP API index")
+	}
+	if got := snapshot.Sources["api"]; got != sourcePath {
+		t.Fatalf("snapshot source = %q, want %q", got, sourcePath)
+	}
+	if got := snapshot.Files[sourcePath]; got.Path != sourcePath || !got.Exists || got.Hash != sourceHash {
+		t.Fatalf("snapshot file state = %#v, want root file state", got)
+	}
+}
+
+func TestPublishedAPISnapshotRemainsStableAfterReplacement(t *testing.T) {
+	setTestSQLFiles(t, map[string]APIConfig{"old": {Description: "old generation"}})
+	captured := currentAPISnapshot()
+
+	setSQLFiles(map[string]APIConfig{"new": {Description: "new generation"}})
+
+	if _, exists := captured.Definitions["old"]; !exists {
+		t.Fatal("captured snapshot lost its original definition")
+	}
+	if _, exists := captured.Definitions["new"]; exists {
+		t.Fatal("captured snapshot observed a later definition")
+	}
+	if _, exists := currentAPISnapshot().Definitions["new"]; !exists {
+		t.Fatal("current snapshot was not replaced")
+	}
+}
+
+func TestRunScriptKeepsSnapshotForNyanCallMe(t *testing.T) {
+	resetJavascriptInclude(t)
+	testDB := setTestSQLiteDB(t)
+	testDB.SetMaxOpenConns(2)
+
+	oldTarget := writeTestScript(t, `JSON.stringify({"generation":"old"})`)
+	newTarget := writeTestScript(t, `JSON.stringify({"generation":"new"})`)
+	caller := writeTestScript(t, `JSON.stringify(nyanCallMe({api:"target"}))`)
+	captured := newAPIConfigSnapshot(map[string]APIConfig{
+		"target": {Script: oldTarget},
+	}, "", [32]byte{})
+	setTestSQLFiles(t, map[string]APIConfig{
+		"target": {Script: newTarget},
+	})
+
+	result, err := runScriptWithSnapshot(captured, []string{caller}, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("runScriptWithSnapshot() error = %v", err)
+	}
+	var decoded map[string]interface{}
+	if err := json.Unmarshal([]byte(result), &decoded); err != nil {
+		t.Fatalf("runScriptWithSnapshot() result = %q: %v", result, err)
+	}
+	if got := decoded["generation"]; got != "old" {
+		t.Fatalf("nested API generation = %v, want old", got)
+	}
+}
+
+func TestIncludedCompleteAPINameIsPreservedForNyanCallMeAndPush(t *testing.T) {
+	resetJavascriptInclude(t)
+	testDB := setTestSQLiteDB(t)
+	testDB.SetMaxOpenConns(2)
+	apiDir := t.TempDir()
+	rootPath := filepath.Join(apiDir, "api.json")
+	childPath := filepath.Join(apiDir, "child.json")
+	targetScript := filepath.Join(apiDir, "target.js")
+	callerScript := filepath.Join(apiDir, "caller.js")
+	writeTestFile(t, targetScript, `JSON.stringify({called:nyanAllParams.api})`)
+	writeTestFile(t, callerScript, `JSON.stringify(nyanCallMe({api:"sub/target"}))`)
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+	writeTestFile(t, childPath, `{"target":{"script":"target.js"},"emitter":{"script":"target.js","push":"sub/target"}}`)
+
+	loaded := loadTestAPIConfig(t, rootPath)
+	if got := loaded.Snapshot.Definitions["sub/emitter"].Push; got != "sub/target" {
+		t.Fatalf("included push target = %q, want complete API name", got)
+	}
+	result, err := runScriptWithSnapshot(loaded.Snapshot, []string{callerScript}, map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("runScriptWithSnapshot() error = %v", err)
+	}
+	if result != `{"called":"sub/target"}` {
+		t.Fatalf("nyanCallMe result = %q", result)
+	}
 }
 
 func TestFindPublicAPIForPath(t *testing.T) {
@@ -1047,7 +2277,7 @@ func TestHubBroadcastsToRequestedChannel(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(handleWebSocket))
 	t.Cleanup(server.Close)
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/updates"
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/sub/updates"
 	headers := http.Header{"Origin": []string{"https://example.invalid"}}
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
 	if err != nil {
@@ -1058,9 +2288,15 @@ func TestHubBroadcastsToRequestedChannel(t *testing.T) {
 	waitForCondition(t, "WebSocket client registration", func() bool {
 		hub.mu.Lock()
 		defer hub.mu.Unlock()
-		return len(hub.clients["updates"]) == 1
+		return len(hub.clients["sub/updates"]) == 1
 	})
-	hub.Broadcast("updates", []byte("hello"))
+	hub.mu.Lock()
+	_, shortened := hub.clients["updates"]
+	hub.mu.Unlock()
+	if shortened {
+		t.Fatal("mounted WebSocket channel was shortened to its last segment")
+	}
+	hub.Broadcast("sub/updates", []byte("hello"))
 	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -1189,6 +2425,21 @@ func TestHandleNyanListsOnlyHTTPAPIs(t *testing.T) {
 	}
 	if response.Name != "NyanQL" || len(response.Apis) != 1 || response.Apis["http-api"].Description != "visible" {
 		t.Fatalf("response = %#v", response)
+	}
+}
+
+func TestHandleNyanReturnsEmptyAPIsObject(t *testing.T) {
+	setTestSQLFiles(t, map[string]APIConfig{})
+	recorder := httptest.NewRecorder()
+	handleNyan(recorder, httptest.NewRequest(http.MethodGet, "/nyan/", nil))
+
+	var response map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	apis, exists := response["apis"].(map[string]interface{})
+	if !exists || len(apis) != 0 {
+		t.Fatalf("apis = %#v, want existing empty object", response["apis"])
 	}
 }
 
@@ -1474,6 +2725,27 @@ func setTestSQLFiles(t *testing.T, files map[string]APIConfig) {
 	setSQLFiles(files)
 	t.Cleanup(func() {
 		setSQLFiles(oldFiles)
+	})
+}
+
+func loadTestAPIConfig(t *testing.T, path string) *apiConfigLoadResult {
+	t.Helper()
+	result, err := loadAPIConfigFile(path)
+	if err != nil {
+		t.Fatalf("loadAPIConfigFile() error = %v", err)
+	}
+	return result
+}
+
+func setTestAPISnapshot(t *testing.T, snapshot *APIConfigSnapshot) {
+	t.Helper()
+	oldSnapshot := currentAPISnapshot()
+	oldBackgroundRuntimes := backgroundRuntimes
+	backgroundRuntimes = nil
+	setAPISnapshot(snapshot)
+	t.Cleanup(func() {
+		setAPISnapshot(oldSnapshot)
+		backgroundRuntimes = oldBackgroundRuntimes
 	})
 }
 

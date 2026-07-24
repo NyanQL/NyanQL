@@ -17,6 +17,7 @@ NyanQLは、主に次のような用途に向いています。
 - INSERT、UPDATE、DELETEなどの更新処理をAPI化する
 - 複数のSQLを1つのトランザクションとしてまとめて実行する
 - JavaScriptで、SQLだけでは書きにくい一連の処理をまとめる
+- `api.json` をincludeして、API定義を複数ファイル・複数階層に分割する
 - WebSocketを使って、API実行後の結果を別の画面へPush配信する
 - `/nyan` で、利用できるAPIの情報を取得する
 
@@ -122,7 +123,7 @@ go build -o nyanql
 - `config.json`
 - `api.json`
 
-SQLファイルやJavaScriptファイルも、`api.json` から参照できる場所に置いてください。
+SQLファイルやJavaScriptファイルも、`api.json` から参照できる場所に置いてください。API定義を分割する場合は、ルートの `api.json` からinclude先を相対パスまたは絶対パスで指定します。
 
 デフォルトでは、NyanQLは実行ファイルと同じ場所にある `config.json` と `api.json` を読み込みます。起動時オプションや環境変数による指定は必須ではありません。別の場所に置きたい場合だけ、追加で指定できます。
 
@@ -218,7 +219,7 @@ Windowsでは、ビルド済みの実行ファイルをダブルクリックし�
 
 ### api.jsonのホットリロード
 
-NyanQLは既定で `api.json` の変更を定期的に確認します。`APIHotReload` を省略した場合は、`Enabled: true`、`Interval: "1s"` として動作します。外部のファイル監視ライブラリは使わず、Go標準ライブラリによる定期確認を行います。
+NyanQLは既定で、ルートの `api.json` と、そこから `type: "include"` で読み込まれるすべてのJSONファイルの変更を定期的に確認します。`APIHotReload` を省略した場合は、`Enabled: true`、`Interval: "1s"` として動作します。外部のファイル監視ライブラリは使わず、Go標準ライブラリによる定期確認を行います。
 
 ```json
 {
@@ -247,7 +248,11 @@ Goのduration形式には日を表す `d` 単位がないため、1日は `"1d"`
 
 確認時刻はNyanQLを起動した時点を基準にします。たとえば `"24h"` は起動後24時間ごとの確認であり、「毎日午前0時」のような固定時刻での確認ではありません。間隔を長くすると、`api.json` の変更反映にも最大でその間隔と同程度の時間がかかります。
 
-確認のたびにファイル内容のSHA-256を比較し、内容が変わった場合だけJSONの解析と定義の交換を試みます。不正なJSONや設定エラーがある場合はログへ記録し、現在稼働中の正常なAPI定義を維持します。同じ不正内容について、確認間隔ごとに同じエラーを繰り返し記録することはありません。ファイルを修正すると、次の変更確認時に再度読み込みます。
+確認のたびに監視対象ごとのファイル内容のSHA-256を比較し、いずれかが変わった場合はルートからincludeグラフ全体を1回再構築します。子ファイルだけを部分的に差し替えることはありません。
+
+includeの追加・変更・削除に成功すると、監視対象も同時に追加・削除されます。参照中のincludeファイルが削除された場合や、候補設定のinclude先がまだ存在しない場合は、現在稼働中の正常な設定を維持したまま、そのパスの確認を続けます。ファイルが再作成または修正されると、次の変更確認時に再読み込みします。
+
+不正なJSON、循環参照、名前競合、scheduleやws_clientの設定エラーなどがある場合は、候補全体を採用しません。同じファイル状態とエラーについて、確認間隔ごとに同じログを繰り返し記録することもありません。すべての検証に成功した場合だけ、通常API、public API、API一覧、schedule、ws_client、監視対象を新しい設定へ交換します。
 
 通常API、public API、`/nyan/`、JSON-RPC、`schedule`、`ws_client`が参照する定義を更新できます。
 
@@ -258,7 +263,7 @@ Goのduration形式には日を表す `d` 単位がないため、1日は `"1d"`
 
 不正なcron式や必須項目の不足がある場合は変更全体を採用せず、現在稼働中の定義を維持します。接続先WebSocketサーバーが停止しているだけの場合は定義を採用し、通常のバックオフ処理で再接続を続けます。
 
-`config.json`、SQL、JavaScript、public配下のファイル自体は監視しません。
+`config.json`、SQL、JavaScript、public配下のファイル自体は監視しません。`Enabled: false` の場合は、ルートとincludeファイルのどちらも監視しません。
 
 ---
 
@@ -266,7 +271,60 @@ Goのduration形式には日を表す `d` 単位がないため、1日は `"1d"`
 
 `api.json` には、API名と、実行するSQLまたはJavaScriptの対応を書きます。
 
-`api.json` 内の相対パスは、`api.json` がある場所を基準にして扱われます。対象は `sql`、`script`、`paramCheck`、`outCheck`、public API の `path` です。
+各 `api.json` 内の相対パスは、その定義が書かれているJSONファイルの場所を基準にして扱われます。対象はincludeの `path`、`sql`、`script`、`paramCheck`、`outCheck`、public APIの `path` です。
+
+### api.jsonを複数ファイルに分ける
+
+`type: "include"` を使うと、API定義を複数ファイルへ分割できます。include定義のJSONキーがmount名になり、`path` に読み込むJSONファイルを指定します。
+
+ルートの `api.json`：
+
+```json
+{
+  "health": {
+    "sql": ["./sql/health.sql"],
+    "description": "稼働確認"
+  },
+  "sub": {
+    "type": "include",
+    "path": "./sub/api.json"
+  }
+}
+```
+
+`sub/api.json`：
+
+```json
+{
+  "getItem": {
+    "sql": ["./sql/getItem.sql"],
+    "description": "商品を取得します"
+  },
+  "admin": {
+    "type": "include",
+    "path": "./admin/api.json"
+  }
+}
+```
+
+`sub/admin/api.json`：
+
+```json
+{
+  "getUser": {
+    "sql": ["./sql/getUser.sql"],
+    "description": "ユーザーを取得します"
+  }
+}
+```
+
+展開後の完全API名は、それぞれ `health`、`sub/getItem`、`sub/admin/getUser` です。includeの階層数は固定されていません。include先には通常APIだけでなく、`public`、`schedule`、`ws_client`、さらに別のincludeも記述できます。
+
+include定義で使用できる項目は `type` と `path` だけです。`sql`、`script`、`trigger`、`connectURL`、`description` などを混在させると設定エラーになります。mount名は空文字、`.`、`..`、`/` を含む名前、前後に空白がある名前を使用できません。
+
+同じ階層にmount `sub` がある場合、直接定義されたAPI名 `sub` と `sub/...` はmount名前空間と競合するためエラーになります。includeを使用しない既存API名の `/` は一律禁止されず、mountと競合しなければ従来どおり利用できます。
+
+循環参照は正規化した絶対パスを使って検出され、エラーにはincludeの参照経路が表示されます。同じファイルを異なるmountから読み込むことはできますが、現在処理中のinclude経路へ同じ物理ファイルが再登場すると循環参照になります。
 
 ### SQLを実行するAPI
 
@@ -325,6 +383,8 @@ Goのduration形式には日を表す `d` 単位がないため、1日は `"1d"`
 
 この例では `./public/app.js` を `http://localhost:8080/public/app.js` で取得できます。空パス、存在しないファイル、ディレクトリへのアクセスは 404 になります。ディレクトリ一覧や `index.html` の自動探索は行いません。
 
+public定義がmount `sub` のinclude先にある場合、公開エンドポイントも完全名になり、`sub/assets` なら `/sub/assets/app.js` で取得します。`path` の相対パスは、そのpublic定義が書かれたJSONファイルを基準に解決されます。
+
 `type: "public"` はBasic認証を通さずに配信します。認証や認可が必要なファイル公開では、`paramCheck` を指定してください。`paramCheck` と `outCheck` では、公開エンドポイント名とリクエストされた相対パスを参照できます。
 
 ```js
@@ -356,6 +416,22 @@ curl -u admin:secret \
 ```
 
 URLのパスにAPI名を書いた場合、NyanQLはそのパスをAPI名として扱います。たとえば `/getItem?id=1` は、`api=getItem` として扱われます。
+
+mount配下のAPIは完全API名を指定します。たとえば `sub/getItem` は、次のいずれの形式でも呼び出せます。
+
+```bash
+curl -u admin:secret "http://localhost:8080/sub/getItem?id=1"
+curl -u admin:secret "http://localhost:8080/?api=sub/getItem&id=1"
+```
+
+```json
+{
+  "api": "sub/getItem",
+  "id": 1
+}
+```
+
+JSON-RPCの `method`、`nyanCallMe` の `api`、`push` の参照先にも同じ完全API名を指定します。mount内からの相対API参照は行わないため、`getItem` が `sub/getItem` に自動補正されることはありません。
 
 ---
 
@@ -509,15 +585,26 @@ curl -u admin:secret "http://localhost:8080/nyan/"
     },
     "getItem": {
       "description": "商品を1件取得します"
+    },
+    "sub/admin/getUser": {
+      "description": "ユーザーを取得します"
     }
   }
 }
 ```
 
+`apis` は通常APIだけを完全API名のキーで示すフラットな一覧です。include定義、public、schedule、ws_clientは一覧に含まれません。
+
 ### APIごとの詳細を見る
 
 ```bash
 curl -u admin:secret "http://localhost:8080/nyan/getItem"
+```
+
+mount配下のAPIも完全API名で取得できます。
+
+```bash
+curl -u admin:secret "http://localhost:8080/nyan/sub/admin/getUser"
 ```
 
 返り値の例です。
@@ -759,7 +846,7 @@ ws.onmessage = function (event) {
 };
 ```
 
-NyanQLのWebSocketサーバでは、URLパスの末尾がチャネル名になります。上の例では、`listItems` がチャネル名です。
+NyanQLのWebSocketサーバでは、先頭の `/` を除いたURLパス全体がチャネル名になります。上の例では、`listItems` がチャネル名です。mount配下の `sub/listItems` をpush先にする場合は、WebSocketも `/sub/listItems` へ接続してください。
 
 ### Pushで配信される内容
 
@@ -803,6 +890,8 @@ NyanQLは、WebSocketサーバとしてPushを配信するだけでなく、Nyan
 ```
 
 この設定を書くと、NyanQLは起動時またはホットリロードでの追加時に `connectURL` へ接続します。接続が切れた場合は、時間をあけながら再接続を試みます。
+
+ws_clientがinclude先にある場合、内部名と `nyanAllParams.ws_client` には `sub/receiveExternalMessage` のような完全名が入ります。mountを削除すると、その配下の接続と再接続処理も停止します。
 
 ホットリロードで `script` または `description` だけを変更した場合は、現在の接続を維持し、次に受信するメッセージから新しい設定を使用します。`connectURL` を変更した場合は現在の接続を閉じ、新しい接続先へ接続します。切り替え中に接続先から送信されたメッセージの受信は保証されません。
 
@@ -856,6 +945,8 @@ scriptが空文字を返した場合、接続先へ返信しません。空で�
 ```
 
 この例では、毎日10:00に `./javascript/daily_job.js` が実行されます。`type: "schedule"` の定義はHTTP APIとしては公開されないため、外部リクエストから直接実行されません。
+
+scheduleがinclude先にある場合、ジョブ名と `nyanAllParams.nyan_job_name` には `sub/dailyJob` のような完全名が入ります。mountを削除すると、その配下のジョブも次回以降実行されません。
 
 cronは5フィールド形式です。
 
