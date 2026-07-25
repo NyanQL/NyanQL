@@ -263,7 +263,7 @@ includeの追加・変更・削除に成功すると、監視対象も同時に�
 
 不正なcron式や必須項目の不足がある場合は変更全体を採用せず、現在稼働中の定義を維持します。接続先WebSocketサーバーが停止しているだけの場合は定義を採用し、通常のバックオフ処理で再接続を続けます。
 
-`config.json`、SQL、JavaScript、public配下のファイル自体は監視しません。`Enabled: false` の場合は、ルートとincludeファイルのどちらも監視しません。
+`config.json`、SQL、JavaScript、public配下のファイル自体は監視しません。ただしAPI実行時のSQL・JavaScript本体と、`/nyan/{API名}` で表示するスキーマは、それぞれのリクエスト時にファイルを読み直します。そのためSQL、script、paramCheck、outCheck内のスキーマ記述は、ファイル保存後の次のAPI詳細取得から反映され、NyanQLの再起動や `api.json` の更新は不要です。`Enabled: false` の場合は、ルートとincludeファイルのどちらも監視しません。
 
 ---
 
@@ -616,7 +616,41 @@ curl -u admin:secret "http://localhost:8080/nyan/sub/admin/getUser"
   "nyanAcceptedParams": {
     "id": 1
   },
-  "nyanOutputColumns": []
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "integer",
+        "examples": [1]
+      }
+    },
+    "required": ["id"],
+    "additionalProperties": true
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "success": {"const": true},
+      "status": {"const": 200},
+      "result": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {}
+          },
+          "required": ["id"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": ["success", "status", "result"],
+    "additionalProperties": false
+  },
+  "schemaSource": {
+    "input": "sql",
+    "output": "sql"
+  }
 }
 ```
 
@@ -631,9 +665,158 @@ const nyanAcceptedParams = {
     { item_id: 1, quantity: 2 }
   ]
 };
-
-const nyanOutputColumns = ["order_id", "order_no"];
 ```
+
+旧形式の `nyanOutputColumns` は廃止しました。JavaScript内に宣言しても解析されず、`/nyan/{API名}` のレスポンスにも含まれません。script APIの出力スキーマを公開する場合は、`outCheck` に `nyanOutputSchema` を定義してください。
+
+現在の `test2` は、入力スキーマを `paramCheck`、出力スキーマを `outCheck` に分けた例です。
+
+```json
+{
+  "test2": {
+    "paramCheck": "./javascript/check_test1.js",
+    "script": "./javascript/script.js",
+    "outCheck": "./javascript/out_check_test2.js",
+    "description": "paramCheckが実行されscriptが動くサンプルです。"
+  }
+}
+```
+
+- `check_test1.js` の `nyanInputSchema` が入力仕様を表します。
+- `out_check_test2.js` の `nyanOutputSchema` が正常レスポンス全体の出力仕様を表します。
+- `out_check_test2.js` の実行部分は、scriptの実際の出力を確認します。
+
+`/nyan/test2` を取得すると、`schemaSource.input` は `paramCheck`、`schemaSource.output` は `outCheck` になります。
+
+```bash
+curl -u admin:secret "http://localhost:8080/nyan/test2"
+```
+
+`nyanOutputSchema` の公開と `outCheck` による実行時チェックは別の役割です。NyanQLは公開したJSON Schemaを使って自動検証しないため、実際の出力を拒否したい条件は `outCheck` のJavaScriptにも記述してください。
+
+### 入出力スキーマを明示する
+
+入力スキーマは `paramCheck` ファイルのトップレベルに `nyanInputSchema` として定義します。出力スキーマは `outCheck` ファイルのトップレベルに `nyanOutputSchema` として定義します。どちらもJSON Schema Draft 2020-12形式のオブジェクトを想定しています。
+
+```js
+const nyanInputSchema = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  properties: {
+    id: {
+      type: "integer",
+      minimum: 1,
+      description: "取得する商品ID",
+      examples: [1]
+    },
+    include_deleted: {
+      type: "boolean",
+      default: false
+    }
+  },
+  required: ["id"],
+  additionalProperties: false
+};
+
+if (!nyanAllParams.id) {
+  ({success: false, status: 400, error: {message: "idを指定してください"}});
+} else {
+  ({success: true, status: 200, error: null});
+}
+```
+
+```js
+const nyanOutputSchema = {
+  type: "object",
+  properties: {
+    success: {const: true},
+    status: {const: 200},
+    result: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: {type: "integer"},
+          name: {type: "string"}
+        },
+        required: ["id", "name"],
+        additionalProperties: false
+      }
+    }
+  },
+  required: ["success", "status", "result"],
+  additionalProperties: false
+};
+
+const output = JSON.parse(nyanAllParams.nyan_output.body);
+({success: output.success === true, status: output.success === true ? 200 : 500});
+```
+
+`nyanOutputSchema` は `result` の中身だけではなく、NyanQLが返す正常レスポンス全体を表します。`$schema` は任意です。記載した場合はそのまま公開され、省略した場合にNyanQLが自動追加することはありません。
+
+現時点では、これらのスキーマは `/nyan/{API名}` からの公開用です。NyanQLはJSON Schemaによるリクエスト値・レスポンス値の実行時検証や、Draft 2020-12メタスキーマに対する完全検証を行いません。業務ルールの確認は従来どおり `paramCheck` / `outCheck` のJavaScriptで行います。
+
+### スキーマの取得優先順位
+
+入力スキーマは次の順で決まります。
+
+1. `paramCheck` 内の `nyanInputSchema`
+2. SQLファイルからの自動生成
+3. API本体のscript内にある `nyanAcceptedParams`
+4. 型不明の空スキーマ `{}`
+
+出力スキーマは次の順で決まります。
+
+1. `outCheck` 内の `nyanOutputSchema`
+2. SQLファイルからの自動生成
+3. 型不明の空スキーマ `{}`
+
+`paramCheck` や `outCheck` が設定されていても、対象の明示スキーマが書かれていなければ次の候補へ進みます。`schemaSource.input` には `paramCheck`、`sql`、`scriptLegacy`、`unknown` のいずれか、`schemaSource.output` には `outCheck`、`sql`、`unknown` のいずれかが入ります。`scriptLegacy` は、入力をscript内の `nyanAcceptedParams` から取得したことを表します。
+
+スキーマはAPI設定のスナップショットには保存せず、`/nyan/{API名}` を取得するたびに関連ファイルから解決します。`/nyan/` のAPI一覧取得ではスキーマファイルを読みません。
+
+`paramCheck` 内に明示的な `nyanInputSchema` がある場合、API詳細では新しい `inputSchema` を正として扱い、旧形式の `nyanAcceptedParams` は省略します。明示スキーマがない場合は、SQLコメントやscript内の `nyanAcceptedParams` から取得できた従来の値を引き続き `nyanAcceptedParams` に表示します。SQLまたはlegacyから自動生成した `inputSchema` も、これまでどおり同時に公開します。
+
+### SQLから自動生成されるスキーマ
+
+入力では、2way-SQLのテスト値から次の型を推測します。
+
+| SQL記述 | 推測結果 |
+|---|---|
+| `/*id*/1` | `integer` |
+| `/*price*/1.5` | `number` |
+| `/*name*/'cat'` | `string` |
+| `/*enabled*/true` | `boolean` |
+| `IN (/*ids*/1)` | `array`、要素は `integer` |
+| `IN (/*codes*/'A')` | `array`、要素は `string` |
+
+コメント後の値はAPIの既定値ではなくSQL単体実行用のテスト値なので、`default` ではなく `examples` に入ります。`/*IF ...*/` の外にあるパラメータは必須、IF内だけにあるパラメータは任意です。`/*BEGIN*/` の内側という理由だけでは任意になりません。複数SQLでは、入力パラメータをすべてのファイルから統合します。同名パラメータの型が競合した場合は、誤った型を断定せずそのプロパティを `{}` にします。SQL由来の入力スキーマは、SQL以外で使われる追加パラメータを拒否しないよう `additionalProperties: true` になります。
+
+出力では、`SELECT` または `RETURNING` の列名を取得し、各列の型は確定せず `{}` とします。明示的な `AS` 別名と単純な列参照を安全に取得できた場合だけ列を限定します。`SELECT *`、別名のない式、条件で変化する列などを含む場合は、実際のレスポンスを過度に制限しないスキーマへフォールバックします。行を返さない更新SQLの `result` は空オブジェクトです。複数SQLでは、実際のレスポンスに使われる最後のSQLから出力スキーマを生成します。
+
+### 静的スキーマ定義の制約
+
+明示スキーマはJavaScriptを実行せず、構文木から静的に読み取ります。使用できる値は、オブジェクト、配列、文字列、数値、真偽値、`null` と、それらのネストです。
+
+次のような動的な定義は対象外です。
+
+```js
+const nyanInputSchema = createSchema();
+```
+
+```js
+const nyanInputSchema = {
+  ...commonSchema
+};
+```
+
+```js
+const nyanInputSchema = {
+  type: schemaType
+};
+```
+
+同一ファイル内の別の `const` を参照する場合も、現時点では動的な参照として扱います。明示スキーマが動的、非オブジェクト、重複宣言などで静的に取得できない場合でも、API設定の読み込みは妨げません。対象の `/nyan/{API名}` を取得したときにスキーマ解決エラーを返します。ファイルを修正すれば、次の詳細取得から正常なスキーマが返ります。なお、スキーマ抽出とは別に、paramCheckやoutCheckのJavaScript本体は従来どおり実行可能なコードである必要があります。
 
 ---
 

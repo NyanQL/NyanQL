@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -28,6 +29,9 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/dop251/goja/ast"
+	"github.com/dop251/goja/parser"
+	"github.com/dop251/goja/token"
 	_ "github.com/duckdb/duckdb-go/v2"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/websocket"
@@ -176,6 +180,21 @@ type APIFileState struct {
 	Error  string
 }
 
+const (
+	schemaSourceParamCheck   = "paramCheck"
+	schemaSourceOutCheck     = "outCheck"
+	schemaSourceSQL          = "sql"
+	schemaSourceScriptLegacy = "scriptLegacy"
+	schemaSourceUnknown      = "unknown"
+)
+
+type APISchema struct {
+	Input        map[string]interface{}
+	Output       map[string]interface{}
+	InputSource  string
+	OutputSource string
+}
+
 // APIConfigSnapshot is an immutable, internally consistent view of the API
 // configuration. Maps and slices reachable from a published snapshot must not
 // be modified.
@@ -265,6 +284,7 @@ const (
 
 // reParams は、/*id*/ のようなプレースホルダーを抽出する正規表現
 var reParams = regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
+var reSQLSchemaConditionParam = regexp.MustCompile(`(?i)([A-Za-z_][A-Za-z0-9_.-]*)\s*(?:==|!=)\s*null`)
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
@@ -1031,6 +1051,27 @@ func cloneAPIConfig(apiConfig APIConfig) APIConfig {
 	cloned := apiConfig
 	cloned.SQL = append([]string(nil), apiConfig.SQL...)
 	return cloned
+}
+
+func cloneJSONCompatibleValue(value interface{}) interface{} {
+	switch value := value.(type) {
+	case map[string]interface{}:
+		cloned := make(map[string]interface{}, len(value))
+		for key, item := range value {
+			cloned[key] = cloneJSONCompatibleValue(item)
+		}
+		return cloned
+	case []interface{}:
+		cloned := make([]interface{}, len(value))
+		for index, item := range value {
+			cloned[index] = cloneJSONCompatibleValue(item)
+		}
+		return cloned
+	case []string:
+		return append([]string(nil), value...)
+	default:
+		return value
+	}
 }
 
 func newAPIConfigSnapshot(files map[string]APIConfig, sourcePath string, sourceHash [sha256.Size]byte) *APIConfigSnapshot {
@@ -2919,11 +2960,17 @@ func handleNyanDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleNyanDetailWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request) {
+	type detailSchemaSource struct {
+		Input  string `json:"input"`
+		Output string `json:"output"`
+	}
 	type detailResponse struct {
 		API                string                 `json:"api"`
 		Description        string                 `json:"description"`
-		NyanAcceptedParams map[string]interface{} `json:"nyanAcceptedParams"`
-		NyanOutputColumns  []string               `json:"nyanOutputColumns,omitempty"`
+		NyanAcceptedParams map[string]interface{} `json:"nyanAcceptedParams,omitempty"`
+		InputSchema        map[string]interface{} `json:"inputSchema"`
+		OutputSchema       map[string]interface{} `json:"outputSchema"`
+		SchemaSource       detailSchemaSource     `json:"schemaSource"`
 	}
 	apiName := strings.TrimPrefix(r.URL.Path, "/nyan/")
 	if apiName == "" {
@@ -2946,9 +2993,8 @@ func handleNyanDetailWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 		return
 	}
 	var acceptedParamsFromScript map[string]interface{}
-	var outputColumns []string
 	if apiConfig.Script != "" {
-		acceptedParamsFromScript, outputColumns, err = parseScriptConstants(apiConfig.Script)
+		acceptedParamsFromScript, err = parseScriptAcceptedParams(apiConfig.Script)
 		if err != nil {
 			log.Printf("Failed to parse script constants: %v", err)
 		} else {
@@ -2957,17 +3003,991 @@ func handleNyanDetailWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 			}
 		}
 	}
+	apiSchema, err := resolveAPISchema(apiConfig)
+	if err != nil {
+		log.Printf("Failed to resolve API schemas for %s: %v", apiName, err)
+		sendJSONError(w, err, http.StatusInternalServerError)
+		return
+	}
+	var visibleAcceptedParams map[string]interface{}
+	if apiSchema.InputSource != schemaSourceParamCheck && len(paramsMap) > 0 {
+		visibleAcceptedParams = paramsMap
+	}
 	resp := detailResponse{
 		API:                apiName,
 		Description:        apiConfig.Description,
-		NyanAcceptedParams: paramsMap,
-		NyanOutputColumns:  outputColumns,
+		NyanAcceptedParams: visibleAcceptedParams,
+		InputSchema:        apiSchema.Input,
+		OutputSchema:       apiSchema.Output,
+		SchemaSource: detailSchemaSource{
+			Input:  normalizeSchemaSource(apiSchema.InputSource),
+			Output: normalizeSchemaSource(apiSchema.OutputSource),
+		},
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("Failed to encode JSON: %v", err)
 		sendJSONError(w, "Internal server error", http.StatusInternalServerError)
 	}
+}
+
+func normalizeSchemaSource(source string) string {
+	switch source {
+	case schemaSourceParamCheck, schemaSourceOutCheck, schemaSourceSQL, schemaSourceScriptLegacy:
+		return source
+	default:
+		return schemaSourceUnknown
+	}
+}
+
+type sqlInputParameterInference struct {
+	shape      string
+	valueType  string
+	examples   []interface{}
+	required   bool
+	conflicted bool
+}
+
+type sqlSchemaBlockKind int
+
+const (
+	sqlSchemaBlockBegin sqlSchemaBlockKind = iota
+	sqlSchemaBlockIf
+)
+
+func generateSQLInputSchema(filePaths []string) (map[string]interface{}, error) {
+	sources := make([]string, 0, len(filePaths))
+	for _, filePath := range filePaths {
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("read SQL file %s for input schema: %w", filePath, err)
+		}
+		sources = append(sources, string(data))
+	}
+	return generateSQLInputSchemaFromSources(sources), nil
+}
+
+func generateSQLInputSchemaFromSources(sources []string) map[string]interface{} {
+	parameters := make(map[string]*sqlInputParameterInference)
+	for _, source := range sources {
+		collectSQLInputParameterInferences(source, parameters)
+	}
+
+	properties := make(map[string]interface{}, len(parameters))
+	required := make([]string, 0, len(parameters))
+	names := make([]string, 0, len(parameters))
+	for name := range parameters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		inference := parameters[name]
+		properties[name] = sqlInputParameterSchema(inference)
+		if inference.required {
+			required = append(required, name)
+		}
+	}
+
+	schema := map[string]interface{}{
+		"type":                 "object",
+		"properties":           properties,
+		"additionalProperties": true,
+	}
+	if len(required) > 0 {
+		schema["required"] = required
+	}
+	return schema
+}
+
+func collectSQLInputParameterInferences(source string, parameters map[string]*sqlInputParameterInference) {
+	blocks := make([]sqlSchemaBlockKind, 0)
+	for index := 0; index < len(source); {
+		switch {
+		case source[index] == '\'' || source[index] == '"' || source[index] == '`':
+			index = scanSQLSchemaQuotedValue(source, index)
+			continue
+		case index+1 < len(source) && source[index] == '-' && source[index+1] == '-':
+			index += 2
+			for index < len(source) && source[index] != '\n' {
+				index++
+			}
+			continue
+		case index+1 < len(source) && source[index] == '/' && source[index+1] == '*':
+			commentEnd := strings.Index(source[index+2:], "*/")
+			if commentEnd < 0 {
+				return
+			}
+			commentEnd += index + 2
+			comment := strings.TrimSpace(source[index+2 : commentEnd])
+			upperComment := strings.ToUpper(comment)
+			if condition, ok := sqlSchemaIFCondition(comment); ok {
+				for _, match := range reSQLSchemaConditionParam.FindAllStringSubmatch(condition, -1) {
+					registerSQLInputParameter(parameters, match[1], "", "", nil, false)
+				}
+				blocks = append(blocks, sqlSchemaBlockIf)
+			} else {
+				switch {
+				case upperComment == "BEGIN":
+					blocks = append(blocks, sqlSchemaBlockBegin)
+				case upperComment == "END":
+					if len(blocks) > 0 {
+						blocks = blocks[:len(blocks)-1]
+					}
+				case isSQLSchemaParameterName(comment):
+					rawDefault, ok := sqlSchemaPlaceholderDefault(source, commentEnd+2)
+					if ok {
+						shape, valueType, example := inferSQLSchemaDefault(rawDefault, isSQLSchemaINParameter(source, index))
+						registerSQLInputParameter(parameters, comment, shape, valueType, example, !containsSQLSchemaIFBlock(blocks))
+					}
+				}
+			}
+			index = commentEnd + 2
+			continue
+		default:
+			index++
+		}
+	}
+}
+
+func sqlSchemaIFCondition(comment string) (string, bool) {
+	if len(comment) <= 2 || !strings.EqualFold(comment[:2], "IF") || !isSQLSchemaWhitespace(comment[2]) {
+		return "", false
+	}
+	return strings.TrimSpace(comment[2:]), true
+}
+
+func registerSQLInputParameter(parameters map[string]*sqlInputParameterInference, name, shape, valueType string, example interface{}, required bool) {
+	inference, exists := parameters[name]
+	if !exists {
+		inference = &sqlInputParameterInference{}
+		parameters[name] = inference
+	}
+	if required {
+		inference.required = true
+	}
+	if inference.conflicted || shape == "" {
+		return
+	}
+	if inference.shape == "" {
+		inference.shape = shape
+		inference.valueType = valueType
+	} else if inference.shape != shape || (inference.valueType != "" && valueType != "" && inference.valueType != valueType) {
+		inference.shape = ""
+		inference.valueType = ""
+		inference.examples = nil
+		inference.conflicted = true
+		return
+	} else if inference.valueType == "" {
+		inference.valueType = valueType
+	}
+	if example != nil && !containsInterfaceValue(inference.examples, example) {
+		inference.examples = append(inference.examples, example)
+	}
+}
+
+func sqlInputParameterSchema(inference *sqlInputParameterInference) map[string]interface{} {
+	if inference == nil || inference.conflicted || inference.shape == "" {
+		return map[string]interface{}{}
+	}
+	schema := make(map[string]interface{})
+	if inference.shape == "array" {
+		schema["type"] = "array"
+		items := make(map[string]interface{})
+		if inference.valueType != "" {
+			items["type"] = inference.valueType
+		}
+		schema["items"] = items
+	} else if inference.valueType != "" {
+		schema["type"] = inference.valueType
+	}
+	if len(inference.examples) > 0 {
+		schema["examples"] = append([]interface{}(nil), inference.examples...)
+	}
+	return schema
+}
+
+func containsInterfaceValue(values []interface{}, candidate interface{}) bool {
+	for _, value := range values {
+		if reflect.DeepEqual(value, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSQLSchemaIFBlock(blocks []sqlSchemaBlockKind) bool {
+	for _, block := range blocks {
+		if block == sqlSchemaBlockIf {
+			return true
+		}
+	}
+	return false
+}
+
+func isSQLSchemaParameterName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for index, char := range name {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || char == '_' || (index > 0 && char >= '0' && char <= '9') || (index > 0 && (char == '.' || char == '-')) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func sqlSchemaPlaceholderDefault(source string, offset int) (string, bool) {
+	index := offset
+	for index < len(source) && isSQLSchemaWhitespace(source[index]) {
+		index++
+	}
+	if index >= len(source) {
+		return "", false
+	}
+	start := index
+	switch source[index] {
+	case '\'', '"':
+		index = scanSQLSchemaQuotedValue(source, index)
+	case '{':
+		index = scanBalancedSQLValue(source, index, '{', '}')
+	case '[':
+		index = scanBalancedSQLValue(source, index, '[', ']')
+	default:
+		for index < len(source) && !strings.ContainsRune(" \t\r\n,;)", rune(source[index])) {
+			index++
+		}
+	}
+	if index <= start {
+		return "", false
+	}
+	return source[start:index], true
+}
+
+func scanSQLSchemaQuotedValue(source string, start int) int {
+	quote := source[start]
+	for index := start + 1; index < len(source); index++ {
+		if source[index] == '\\' && index+1 < len(source) {
+			index++
+			continue
+		}
+		if source[index] != quote {
+			continue
+		}
+		if index+1 < len(source) && source[index+1] == quote {
+			index++
+			continue
+		}
+		return index + 1
+	}
+	return len(source)
+}
+
+func isSQLSchemaWhitespace(char byte) bool {
+	return char == ' ' || char == '\t' || char == '\r' || char == '\n'
+}
+
+func isSQLSchemaINParameter(source string, commentStart int) bool {
+	index := commentStart - 1
+	for index >= 0 && isSQLSchemaWhitespace(source[index]) {
+		index--
+	}
+	if index < 0 || source[index] != '(' {
+		return false
+	}
+	index--
+	for index >= 0 && isSQLSchemaWhitespace(source[index]) {
+		index--
+	}
+	wordEnd := index + 1
+	for index >= 0 && ((source[index] >= 'a' && source[index] <= 'z') || (source[index] >= 'A' && source[index] <= 'Z')) {
+		index--
+	}
+	return strings.EqualFold(source[index+1:wordEnd], "IN")
+}
+
+func inferSQLSchemaDefault(rawDefault string, array bool) (string, string, interface{}) {
+	rawDefault = strings.TrimSpace(rawDefault)
+	valueType, example := inferSQLSchemaScalarDefault(rawDefault)
+	if array {
+		if example == nil {
+			return "array", valueType, nil
+		}
+		return "array", valueType, []interface{}{example}
+	}
+	if valueType == "" {
+		return "", "", nil
+	}
+	return "scalar", valueType, example
+}
+
+func inferSQLSchemaScalarDefault(rawDefault string) (string, interface{}) {
+	if len(rawDefault) >= 2 && (rawDefault[0] == '\'' || rawDefault[0] == '"') && rawDefault[len(rawDefault)-1] == rawDefault[0] {
+		quote := string(rawDefault[0])
+		value := rawDefault[1 : len(rawDefault)-1]
+		value = strings.ReplaceAll(value, quote+quote, quote)
+		return "string", value
+	}
+	if strings.EqualFold(rawDefault, "true") {
+		return "boolean", true
+	}
+	if strings.EqualFold(rawDefault, "false") {
+		return "boolean", false
+	}
+	if integer, err := strconv.ParseInt(rawDefault, 10, 64); err == nil {
+		return "integer", integer
+	}
+	if number, err := strconv.ParseFloat(rawDefault, 64); err == nil && !math.IsInf(number, 0) && !math.IsNaN(number) {
+		return "number", number
+	}
+	return "", nil
+}
+
+type sqlTopLevelToken struct {
+	value string
+	start int
+	end   int
+}
+
+func generateSQLOutputSchema(filePaths []string) (map[string]interface{}, error) {
+	if len(filePaths) == 0 {
+		return map[string]interface{}{}, nil
+	}
+	filePath := filePaths[len(filePaths)-1]
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("read SQL file %s for output schema: %w", filePath, err)
+	}
+	return generateSQLOutputSchemaFromSource(string(data)), nil
+}
+
+func generateSQLOutputSchemaFromSources(sources []string) map[string]interface{} {
+	if len(sources) == 0 {
+		return map[string]interface{}{}
+	}
+	return generateSQLOutputSchemaFromSource(sources[len(sources)-1])
+}
+
+func generateSQLOutputSchemaFromSource(source string) map[string]interface{} {
+	if !isSelectQuery(source) && !isReturningQuery(source) {
+		return sqlMutationOutputSchema()
+	}
+
+	columns, safe := extractSQLResultColumnNames(source)
+	return sqlResultSetOutputSchema(columns, safe)
+}
+
+func resolveAPISchema(apiConfig APIConfig) (APISchema, error) {
+	resolved := unknownAPISchema()
+
+	paramCheckPath := strings.TrimSpace(getParamCheckScriptPath(apiConfig))
+	if paramCheckPath != "" {
+		input, found, err := readOptionalStaticJavaScriptObjectConstant(paramCheckPath, "nyanInputSchema")
+		if err != nil {
+			return APISchema{}, fmt.Errorf("input schema from paramCheck: %w", err)
+		}
+		if found {
+			resolved.Input = input
+			resolved.InputSource = schemaSourceParamCheck
+		}
+	}
+
+	outCheckPath := strings.TrimSpace(apiConfig.OutCheck)
+	if outCheckPath != "" {
+		output, found, err := readOptionalStaticJavaScriptObjectConstant(outCheckPath, "nyanOutputSchema")
+		if err != nil {
+			return APISchema{}, fmt.Errorf("output schema from outCheck: %w", err)
+		}
+		if found {
+			resolved.Output = output
+			resolved.OutputSource = schemaSourceOutCheck
+		}
+	}
+
+	if len(apiConfig.SQL) > 0 {
+		if resolved.InputSource == schemaSourceUnknown {
+			input, err := generateSQLInputSchema(apiConfig.SQL)
+			if err == nil {
+				resolved.Input = input
+				resolved.InputSource = schemaSourceSQL
+			}
+		}
+		if resolved.OutputSource == schemaSourceUnknown {
+			output, err := generateSQLOutputSchema(apiConfig.SQL)
+			if err == nil {
+				resolved.Output = output
+				resolved.OutputSource = schemaSourceSQL
+			}
+		}
+	}
+
+	if apiConfig.Script != "" && resolved.InputSource == schemaSourceUnknown {
+		acceptedParams, acceptedFound, err := readStaticLegacyAcceptedParams(apiConfig.Script)
+		if err == nil {
+			if acceptedFound {
+				resolved.Input = legacyInputSchema(acceptedParams)
+				resolved.InputSource = schemaSourceScriptLegacy
+			}
+		}
+	}
+
+	return resolved, nil
+}
+
+func readStaticLegacyAcceptedParams(filePath string) (map[string]interface{}, bool, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, false, err
+	}
+	acceptedValue, acceptedFound, err := extractStaticJavaScriptConstant(filePath, data, "nyanAcceptedParams")
+	if err != nil {
+		return nil, false, err
+	}
+
+	acceptedParams := map[string]interface{}{}
+	if acceptedFound {
+		var ok bool
+		acceptedParams, ok = acceptedValue.(map[string]interface{})
+		if !ok {
+			return nil, false, fmt.Errorf("nyanAcceptedParams must be a static object literal, got %T", acceptedValue)
+		}
+	}
+	return acceptedParams, acceptedFound, nil
+}
+
+func readOptionalStaticJavaScriptObjectConstant(filePath, constantName string) (map[string]interface{}, bool, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, false, nil
+	}
+	return extractStaticJavaScriptObjectConstant(filePath, data, constantName)
+}
+
+func unknownAPISchema() APISchema {
+	return APISchema{
+		Input:        map[string]interface{}{},
+		Output:       map[string]interface{}{},
+		InputSource:  schemaSourceUnknown,
+		OutputSource: schemaSourceUnknown,
+	}
+}
+
+func legacyInputSchema(params map[string]interface{}) map[string]interface{} {
+	properties := make(map[string]interface{}, len(params))
+	for name, value := range params {
+		properties[name] = legacyValueSchema(value)
+	}
+	return map[string]interface{}{
+		"type":                 "object",
+		"properties":           properties,
+		"additionalProperties": true,
+	}
+}
+
+func legacyValueSchema(value interface{}) map[string]interface{} {
+	schema := make(map[string]interface{})
+	switch value := value.(type) {
+	case string:
+		schema["type"] = "string"
+	case bool:
+		schema["type"] = "boolean"
+	case float64:
+		if math.IsInf(value, 0) || math.IsNaN(value) {
+			return schema
+		}
+		if math.Trunc(value) == value {
+			schema["type"] = "integer"
+		} else {
+			schema["type"] = "number"
+		}
+	case float32:
+		number := float64(value)
+		if math.IsInf(number, 0) || math.IsNaN(number) {
+			return schema
+		}
+		if math.Trunc(number) == number {
+			schema["type"] = "integer"
+		} else {
+			schema["type"] = "number"
+		}
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		schema["type"] = "integer"
+	case map[string]interface{}:
+		properties := make(map[string]interface{}, len(value))
+		for name, item := range value {
+			properties[name] = legacyValueSchema(item)
+		}
+		schema["type"] = "object"
+		schema["properties"] = properties
+		schema["additionalProperties"] = true
+	case []interface{}:
+		schema["type"] = "array"
+		schema["items"] = legacyArrayItemsSchema(value)
+	case nil:
+		return schema
+	default:
+		return schema
+	}
+	schema["examples"] = []interface{}{cloneJSONCompatibleValue(value)}
+	return schema
+}
+
+func legacyArrayItemsSchema(values []interface{}) map[string]interface{} {
+	if len(values) == 0 {
+		return map[string]interface{}{}
+	}
+	first := legacyValueSchema(values[0])
+	delete(first, "examples")
+	for _, value := range values[1:] {
+		candidate := legacyValueSchema(value)
+		delete(candidate, "examples")
+		if !reflect.DeepEqual(first, candidate) {
+			return map[string]interface{}{}
+		}
+	}
+	return first
+}
+
+func sqlResponseOutputSchema(resultSchema map[string]interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"success": map[string]interface{}{"const": true},
+			"status":  map[string]interface{}{"const": int64(http.StatusOK)},
+			"result":  resultSchema,
+		},
+		"required":             []string{"success", "status", "result"},
+		"additionalProperties": false,
+	}
+}
+
+func sqlMutationOutputSchema() map[string]interface{} {
+	return sqlResponseOutputSchema(map[string]interface{}{
+		"type":                 "object",
+		"additionalProperties": false,
+	})
+}
+
+func sqlResultSetOutputSchema(columns []string, safe bool) map[string]interface{} {
+	items := map[string]interface{}{
+		"type": "object",
+	}
+	if safe {
+		properties := make(map[string]interface{}, len(columns))
+		for _, column := range columns {
+			properties[column] = map[string]interface{}{}
+		}
+		items["properties"] = properties
+		items["required"] = append([]string(nil), columns...)
+		items["additionalProperties"] = false
+	} else {
+		items["additionalProperties"] = true
+	}
+	return sqlResponseOutputSchema(map[string]interface{}{
+		"type":  "array",
+		"items": items,
+	})
+}
+
+func extractSQLResultColumnNames(source string) ([]string, bool) {
+	tokens := scanSQLTopLevelTokens(source)
+	clauseIndex := -1
+	clauseName := ""
+	for index, token := range tokens {
+		if token.value == "RETURNING" {
+			clauseIndex = index
+			clauseName = token.value
+		}
+	}
+	if clauseIndex < 0 {
+		for index, token := range tokens {
+			if token.value == "SELECT" {
+				clauseIndex = index
+				clauseName = token.value
+				break
+			}
+		}
+	}
+	if clauseIndex < 0 {
+		return nil, false
+	}
+
+	start := tokens[clauseIndex].end
+	end := len(source)
+	if clauseName == "SELECT" {
+		for _, token := range tokens[clauseIndex+1:] {
+			if token.value == "FROM" || token.value == "INTO" {
+				end = token.start
+				break
+			}
+		}
+	}
+	if semicolon := findSQLTopLevelSemicolon(source, start, end); semicolon >= 0 {
+		end = semicolon
+	}
+	if start >= end {
+		return nil, false
+	}
+
+	columnList := source[start:end]
+	if containsSQLConditionalDirective(columnList) {
+		return nil, false
+	}
+	if clauseName == "SELECT" {
+		columnList = trimSQLSelectModifier(columnList)
+	}
+	expressions := splitSQLTopLevelExpressions(columnList)
+	if len(expressions) == 0 {
+		return nil, false
+	}
+
+	columns := make([]string, 0, len(expressions))
+	seen := make(map[string]struct{}, len(expressions))
+	for _, expression := range expressions {
+		column, ok := extractSQLResultColumnName(expression)
+		if !ok {
+			return nil, false
+		}
+		if _, duplicate := seen[column]; duplicate {
+			return nil, false
+		}
+		seen[column] = struct{}{}
+		columns = append(columns, column)
+	}
+	return columns, true
+}
+
+func scanSQLTopLevelTokens(source string) []sqlTopLevelToken {
+	tokens := make([]sqlTopLevelToken, 0)
+	depth := 0
+	for index := 0; index < len(source); {
+		switch {
+		case source[index] == '\'' || source[index] == '"' || source[index] == '`':
+			index = scanSQLSchemaQuotedValue(source, index)
+		case source[index] == '[':
+			index = scanSQLBracketIdentifier(source, index)
+		case index+1 < len(source) && source[index] == '-' && source[index+1] == '-':
+			index += 2
+			for index < len(source) && source[index] != '\n' {
+				index++
+			}
+		case index+1 < len(source) && source[index] == '/' && source[index+1] == '*':
+			commentEnd := strings.Index(source[index+2:], "*/")
+			if commentEnd < 0 {
+				return tokens
+			}
+			index += commentEnd + 4
+		case source[index] == '(':
+			depth++
+			index++
+		case source[index] == ')':
+			if depth > 0 {
+				depth--
+			}
+			index++
+		case isSQLIdentifierStart(source[index]):
+			start := index
+			index++
+			for index < len(source) && isSQLIdentifierPart(source[index]) {
+				index++
+			}
+			if depth == 0 {
+				tokens = append(tokens, sqlTopLevelToken{
+					value: strings.ToUpper(source[start:index]),
+					start: start,
+					end:   index,
+				})
+			}
+		default:
+			index++
+		}
+	}
+	return tokens
+}
+
+func findSQLTopLevelSemicolon(source string, start, end int) int {
+	depth := 0
+	for index := start; index < end; {
+		switch {
+		case source[index] == '\'' || source[index] == '"' || source[index] == '`':
+			index = scanSQLSchemaQuotedValue(source, index)
+		case source[index] == '[':
+			index = scanSQLBracketIdentifier(source, index)
+		case index+1 < end && source[index] == '-' && source[index+1] == '-':
+			index += 2
+			for index < end && source[index] != '\n' {
+				index++
+			}
+		case index+1 < end && source[index] == '/' && source[index+1] == '*':
+			commentEnd := strings.Index(source[index+2:end], "*/")
+			if commentEnd < 0 {
+				return -1
+			}
+			index += commentEnd + 4
+		case source[index] == '(':
+			depth++
+			index++
+		case source[index] == ')':
+			if depth > 0 {
+				depth--
+			}
+			index++
+		case source[index] == ';' && depth == 0:
+			return index
+		default:
+			index++
+		}
+	}
+	return -1
+}
+
+func containsSQLConditionalDirective(source string) bool {
+	for index := 0; index+1 < len(source); {
+		if source[index] == '\'' || source[index] == '"' || source[index] == '`' {
+			index = scanSQLSchemaQuotedValue(source, index)
+			continue
+		}
+		if source[index] != '/' || source[index+1] != '*' {
+			index++
+			continue
+		}
+		commentEnd := strings.Index(source[index+2:], "*/")
+		if commentEnd < 0 {
+			return true
+		}
+		commentEnd += index + 2
+		comment := strings.TrimSpace(source[index+2 : commentEnd])
+		if _, ok := sqlSchemaIFCondition(comment); ok || strings.EqualFold(comment, "BEGIN") || strings.EqualFold(comment, "END") {
+			return true
+		}
+		index = commentEnd + 2
+	}
+	return false
+}
+
+func trimSQLSelectModifier(columnList string) string {
+	trimmed := strings.TrimSpace(columnList)
+	for _, modifier := range []string{"DISTINCT", "ALL"} {
+		if len(trimmed) > len(modifier) && strings.EqualFold(trimmed[:len(modifier)], modifier) && isSQLSchemaWhitespace(trimmed[len(modifier)]) {
+			return strings.TrimSpace(trimmed[len(modifier):])
+		}
+	}
+	return trimmed
+}
+
+func splitSQLTopLevelExpressions(source string) []string {
+	result := make([]string, 0)
+	start := 0
+	depth := 0
+	for index := 0; index < len(source); {
+		switch {
+		case source[index] == '\'' || source[index] == '"' || source[index] == '`':
+			index = scanSQLSchemaQuotedValue(source, index)
+		case source[index] == '[':
+			index = scanSQLBracketIdentifier(source, index)
+		case index+1 < len(source) && source[index] == '-' && source[index+1] == '-':
+			index += 2
+			for index < len(source) && source[index] != '\n' {
+				index++
+			}
+		case index+1 < len(source) && source[index] == '/' && source[index+1] == '*':
+			commentEnd := strings.Index(source[index+2:], "*/")
+			if commentEnd < 0 {
+				return nil
+			}
+			index += commentEnd + 4
+		case source[index] == '(':
+			depth++
+			index++
+		case source[index] == ')':
+			if depth == 0 {
+				return nil
+			}
+			depth--
+			index++
+		case source[index] == ',' && depth == 0:
+			if expression := strings.TrimSpace(source[start:index]); expression != "" {
+				result = append(result, expression)
+			} else {
+				return nil
+			}
+			index++
+			start = index
+		default:
+			index++
+		}
+	}
+	if depth != 0 {
+		return nil
+	}
+	if expression := strings.TrimSpace(source[start:]); expression != "" {
+		result = append(result, expression)
+	} else {
+		return nil
+	}
+	return result
+}
+
+func extractSQLResultColumnName(expression string) (string, bool) {
+	tokens := scanSQLTopLevelTokens(expression)
+	for index := len(tokens) - 1; index >= 0; index-- {
+		if tokens[index].value != "AS" {
+			continue
+		}
+		alias, ok := parseSQLStandaloneIdentifier(expression[tokens[index].end:])
+		if !ok {
+			return "", false
+		}
+		if strings.TrimSpace(expression[:tokens[index].start]) == "" {
+			return "", false
+		}
+		return alias, true
+	}
+	return parseSQLQualifiedIdentifier(expression)
+}
+
+func parseSQLStandaloneIdentifier(source string) (string, bool) {
+	trimmed := strings.TrimSpace(stripSQLComments(source))
+	identifier, next, ok := scanSQLIdentifierSegment(trimmed, 0)
+	if !ok || strings.TrimSpace(trimmed[next:]) != "" {
+		return "", false
+	}
+	return identifier, true
+}
+
+func parseSQLQualifiedIdentifier(source string) (string, bool) {
+	trimmed := strings.TrimSpace(stripSQLComments(source))
+	index := 0
+	last := ""
+	for {
+		for index < len(trimmed) && isSQLSchemaWhitespace(trimmed[index]) {
+			index++
+		}
+		identifier, next, ok := scanSQLIdentifierSegment(trimmed, index)
+		if !ok {
+			return "", false
+		}
+		last = identifier
+		index = next
+		for index < len(trimmed) && isSQLSchemaWhitespace(trimmed[index]) {
+			index++
+		}
+		if index == len(trimmed) {
+			return last, true
+		}
+		if trimmed[index] != '.' {
+			return "", false
+		}
+		index++
+	}
+}
+
+func scanSQLIdentifierSegment(source string, start int) (string, int, bool) {
+	if start >= len(source) {
+		return "", start, false
+	}
+	switch source[start] {
+	case '"', '`':
+		quote := source[start]
+		var value strings.Builder
+		for index := start + 1; index < len(source); index++ {
+			if source[index] != quote {
+				value.WriteByte(source[index])
+				continue
+			}
+			if index+1 < len(source) && source[index+1] == quote {
+				value.WriteByte(quote)
+				index++
+				continue
+			}
+			if value.Len() == 0 {
+				return "", start, false
+			}
+			return value.String(), index + 1, true
+		}
+	case '[':
+		var value strings.Builder
+		for index := start + 1; index < len(source); index++ {
+			if source[index] != ']' {
+				value.WriteByte(source[index])
+				continue
+			}
+			if index+1 < len(source) && source[index+1] == ']' {
+				value.WriteByte(']')
+				index++
+				continue
+			}
+			if value.Len() == 0 {
+				return "", start, false
+			}
+			return value.String(), index + 1, true
+		}
+	default:
+		if !isSQLIdentifierStart(source[start]) {
+			return "", start, false
+		}
+		index := start + 1
+		for index < len(source) && isSQLIdentifierPart(source[index]) {
+			index++
+		}
+		return source[start:index], index, true
+	}
+	return "", start, false
+}
+
+func scanSQLBracketIdentifier(source string, start int) int {
+	for index := start + 1; index < len(source); index++ {
+		if source[index] != ']' {
+			continue
+		}
+		if index+1 < len(source) && source[index+1] == ']' {
+			index++
+			continue
+		}
+		return index + 1
+	}
+	return len(source)
+}
+
+func stripSQLComments(source string) string {
+	var result strings.Builder
+	for index := 0; index < len(source); {
+		switch {
+		case source[index] == '\'' || source[index] == '"' || source[index] == '`':
+			end := scanSQLSchemaQuotedValue(source, index)
+			result.WriteString(source[index:end])
+			index = end
+		case source[index] == '[':
+			end := scanSQLBracketIdentifier(source, index)
+			result.WriteString(source[index:end])
+			index = end
+		case index+1 < len(source) && source[index] == '-' && source[index+1] == '-':
+			index += 2
+			for index < len(source) && source[index] != '\n' {
+				index++
+			}
+			result.WriteByte(' ')
+		case index+1 < len(source) && source[index] == '/' && source[index+1] == '*':
+			commentEnd := strings.Index(source[index+2:], "*/")
+			if commentEnd < 0 {
+				return result.String()
+			}
+			index += commentEnd + 4
+			result.WriteByte(' ')
+		default:
+			result.WriteByte(source[index])
+			index++
+		}
+	}
+	return result.String()
+}
+
+func isSQLIdentifierStart(char byte) bool {
+	return (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || char == '_'
+}
+
+func isSQLIdentifierPart(char byte) bool {
+	return isSQLIdentifierStart(char) || (char >= '0' && char <= '9') || char == '$'
 }
 
 func parseSQLParams(filePaths []string) (map[string]interface{}, error) {
@@ -3930,37 +4950,248 @@ func nyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 	}
 }
 
-// parseScriptConstants は、指定されたスクリプトファイルから定数をパースします。
-func parseScriptConstants(scriptPath string) (map[string]interface{}, []string, error) {
+func parseStaticJavaScriptValue(filename, source string) (interface{}, error) {
+	program, err := parser.ParseFile(nil, filename, "("+source+");", 0)
+	if err != nil {
+		return nil, fmt.Errorf("parse static JavaScript value: %w", err)
+	}
+	if len(program.Body) != 1 {
+		return nil, fmt.Errorf("parse static JavaScript value: expected one expression")
+	}
+	statement, ok := program.Body[0].(*ast.ExpressionStatement)
+	if !ok {
+		return nil, fmt.Errorf("parse static JavaScript value: expected an expression, got %T", program.Body[0])
+	}
+	return convertStaticJavaScriptValue(statement.Expression, "$")
+}
+
+func convertStaticJavaScriptValue(expression ast.Expression, path string) (interface{}, error) {
+	switch value := expression.(type) {
+	case *ast.ObjectLiteral:
+		result := make(map[string]interface{}, len(value.Value))
+		for _, rawProperty := range value.Value {
+			property, ok := rawProperty.(*ast.PropertyKeyed)
+			if !ok {
+				return nil, fmt.Errorf("static JavaScript value at %s: %s are not supported", path, staticJavaScriptPropertyDescription(rawProperty))
+			}
+			if property.Computed {
+				return nil, fmt.Errorf("static JavaScript value at %s: computed property names are not supported", path)
+			}
+			if property.Kind != ast.PropertyKindValue {
+				return nil, fmt.Errorf("static JavaScript value at %s: property kind %q is not supported", path, property.Kind)
+			}
+			keyLiteral, ok := property.Key.(*ast.StringLiteral)
+			if !ok {
+				return nil, fmt.Errorf("static JavaScript value at %s: property names must be strings, got %T", path, property.Key)
+			}
+			key := keyLiteral.Value.String()
+			if _, exists := result[key]; exists {
+				return nil, fmt.Errorf("static JavaScript value at %s: duplicate property %q", path, key)
+			}
+			converted, err := convertStaticJavaScriptValue(property.Value, staticJavaScriptChildPath(path, key))
+			if err != nil {
+				return nil, err
+			}
+			result[key] = converted
+		}
+		return result, nil
+	case *ast.ArrayLiteral:
+		result := make([]interface{}, len(value.Value))
+		for index, item := range value.Value {
+			itemPath := fmt.Sprintf("%s[%d]", path, index)
+			if item == nil {
+				return nil, fmt.Errorf("static JavaScript value at %s: array holes are not supported", itemPath)
+			}
+			converted, err := convertStaticJavaScriptValue(item, itemPath)
+			if err != nil {
+				return nil, err
+			}
+			result[index] = converted
+		}
+		return result, nil
+	case *ast.StringLiteral:
+		return value.Value.String(), nil
+	case *ast.NumberLiteral:
+		return staticJavaScriptNumber(value.Value, path)
+	case *ast.BooleanLiteral:
+		return value.Value, nil
+	case *ast.NullLiteral:
+		return nil, nil
+	case *ast.UnaryExpression:
+		if value.Postfix || (value.Operator != token.MINUS && value.Operator != token.PLUS) {
+			return nil, fmt.Errorf("static JavaScript value at %s: unary operator %q is not supported", path, value.Operator)
+		}
+		numberLiteral, ok := value.Operand.(*ast.NumberLiteral)
+		if !ok {
+			return nil, fmt.Errorf("static JavaScript value at %s: unary %q requires a numeric literal", path, value.Operator)
+		}
+		number, err := staticJavaScriptNumber(numberLiteral.Value, path)
+		if err != nil {
+			return nil, err
+		}
+		if value.Operator == token.PLUS {
+			return number, nil
+		}
+		switch number := number.(type) {
+		case int64:
+			return -number, nil
+		case float64:
+			return -number, nil
+		default:
+			return nil, fmt.Errorf("static JavaScript value at %s: unsupported numeric value %T", path, number)
+		}
+	default:
+		return nil, fmt.Errorf("static JavaScript value at %s: %s are not supported", path, staticJavaScriptExpressionDescription(expression))
+	}
+}
+
+func staticJavaScriptNumber(value interface{}, path string) (interface{}, error) {
+	switch number := value.(type) {
+	case int64:
+		return number, nil
+	case float64:
+		if math.IsInf(number, 0) || math.IsNaN(number) {
+			return nil, fmt.Errorf("static JavaScript value at %s: non-finite numbers are not JSON-compatible", path)
+		}
+		return number, nil
+	default:
+		return nil, fmt.Errorf("static JavaScript value at %s: numeric value %T is not JSON-compatible", path, value)
+	}
+}
+
+func staticJavaScriptChildPath(parent, key string) string {
+	if key != "" && !strings.ContainsAny(key, ".[]") {
+		return parent + "." + key
+	}
+	return fmt.Sprintf("%s[%q]", parent, key)
+}
+
+func staticJavaScriptPropertyDescription(property ast.Property) string {
+	switch property.(type) {
+	case *ast.SpreadElement:
+		return "spread properties"
+	case *ast.PropertyShort:
+		return "shorthand properties"
+	default:
+		return fmt.Sprintf("properties of type %T", property)
+	}
+}
+
+func staticJavaScriptExpressionDescription(expression ast.Expression) string {
+	switch expression.(type) {
+	case *ast.CallExpression:
+		return "function calls"
+	case *ast.Identifier:
+		return "identifier references"
+	case *ast.SpreadElement:
+		return "spread elements"
+	case *ast.ConditionalExpression:
+		return "conditional expressions"
+	case *ast.TemplateLiteral:
+		return "template literals"
+	case *ast.FunctionLiteral, *ast.ArrowFunctionLiteral:
+		return "function values"
+	case *ast.BinaryExpression:
+		return "computed expressions"
+	default:
+		return fmt.Sprintf("expressions of type %T", expression)
+	}
+}
+
+func readStaticJavaScriptObjectConstant(filePath, constantName string) (map[string]interface{}, bool, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, false, fmt.Errorf("read JavaScript file %s: %w", filePath, err)
+	}
+	return extractStaticJavaScriptObjectConstant(filePath, data, constantName)
+}
+
+func extractStaticJavaScriptObjectConstant(filename string, source []byte, constantName string) (map[string]interface{}, bool, error) {
+	converted, found, err := extractStaticJavaScriptConstant(filename, source, constantName)
+	if err != nil || !found {
+		return nil, found, err
+	}
+	object, ok := converted.(map[string]interface{})
+	if !ok {
+		return nil, false, fmt.Errorf("JavaScript file %s: %s must be a static object literal, got %T", filename, constantName, converted)
+	}
+	return object, true, nil
+}
+
+func extractStaticJavaScriptConstant(filename string, source []byte, constantName string) (interface{}, bool, error) {
+	if strings.TrimSpace(constantName) == "" {
+		return nil, false, fmt.Errorf("JavaScript constant name is empty")
+	}
+	program, err := parser.ParseFile(nil, filename, source, 0)
+	if err != nil {
+		return nil, false, fmt.Errorf("parse JavaScript file %s: %w", filename, err)
+	}
+
+	var initializer ast.Expression
+	for _, statement := range program.Body {
+		switch declaration := statement.(type) {
+		case *ast.LexicalDeclaration:
+			for _, binding := range declaration.List {
+				if !staticJavaScriptBindingHasName(binding, constantName) {
+					continue
+				}
+				if declaration.Token != token.CONST {
+					return nil, false, fmt.Errorf("JavaScript file %s: %s must be declared with const", filename, constantName)
+				}
+				if initializer != nil {
+					return nil, false, fmt.Errorf("JavaScript file %s: duplicate declaration of %s", filename, constantName)
+				}
+				if binding.Initializer == nil {
+					return nil, false, fmt.Errorf("JavaScript file %s: %s has no initializer", filename, constantName)
+				}
+				initializer = binding.Initializer
+			}
+		case *ast.VariableStatement:
+			for _, binding := range declaration.List {
+				if staticJavaScriptBindingHasName(binding, constantName) {
+					return nil, false, fmt.Errorf("JavaScript file %s: %s must be declared with const", filename, constantName)
+				}
+			}
+		}
+	}
+
+	if initializer == nil {
+		return nil, false, nil
+	}
+	converted, err := convertStaticJavaScriptValue(initializer, constantName)
+	if err != nil {
+		return nil, false, fmt.Errorf("JavaScript file %s: %w", filename, err)
+	}
+	return converted, true, nil
+}
+
+func staticJavaScriptBindingHasName(binding *ast.Binding, constantName string) bool {
+	if binding == nil {
+		return false
+	}
+	identifier, ok := binding.Target.(*ast.Identifier)
+	return ok && identifier.Name.String() == constantName
+}
+
+// parseScriptAcceptedParams は、指定されたスクリプトファイルから従来形式の入力パラメータ例をパースします。
+func parseScriptAcceptedParams(scriptPath string) (map[string]interface{}, error) {
 	data, err := os.ReadFile(scriptPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read script file %s: %v", scriptPath, err)
+		return nil, fmt.Errorf("failed to read script file %s: %v", scriptPath, err)
 	}
 	content := string(data)
 
-	// 戻り値用の変数
 	var acceptedParams map[string]interface{} = map[string]interface{}{}
-	var outputColumns []string
 
 	// const nyanAcceptedParams = {...};
 	reAcceptedParams := regexp.MustCompile(`(?s)const\s+nyanAcceptedParams\s*=\s*({[\s\S]*?})\s*;`)
 	if match := reAcceptedParams.FindStringSubmatch(content); len(match) >= 2 {
 		jsonStr := match[1]
 		if err := json.Unmarshal([]byte(jsonStr), &acceptedParams); err != nil {
-			return nil, nil, fmt.Errorf("failed to parse nyanAcceptedParams: %v", err)
+			return nil, fmt.Errorf("failed to parse nyanAcceptedParams: %v", err)
 		}
 	}
-
-	// const nyanOutputColumns = [...];
-	reOutputColumns := regexp.MustCompile(`(?s)const\s+nyanOutputColumns\s*=\s*(\[[\s\S]*?\])\s*;`)
-	if match := reOutputColumns.FindStringSubmatch(content); len(match) >= 2 {
-		jsonStr := match[1]
-		if err := json.Unmarshal([]byte(jsonStr), &outputColumns); err != nil {
-			return nil, nil, fmt.Errorf("failed to parse nyanOutputColumns: %v", err)
-		}
-	}
-
-	return acceptedParams, outputColumns, nil
+	return acceptedParams, nil
 }
 
 func respondJSONRPCError(w http.ResponseWriter, id interface{}, code int, message string, data interface{}) {
