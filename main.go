@@ -373,6 +373,8 @@ const (
 	configuredHTTPAccessInternal     = "internal"
 	configuredHTTPResponseNyan       = "nyan"
 	configuredHTTPResponseRaw        = "raw"
+	mcpProtocolVersion20250326       = "2025-03-26"
+	mcpProtocolVersion20250618       = "2025-06-18"
 	mcpProtocolVersion20251125       = "2025-11-25"
 	maxConfiguredHTTPBodyBytes       = 1 << 20
 	maxConfiguredHTTPResponseBytes   = 4 << 20
@@ -1148,14 +1150,26 @@ func handleMCPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 		writeMCPError(w, request.ID, -32600, "Invalid Request", nil)
 		return
 	}
-	if request.Method != "initialize" {
-		protocolVersion := strings.TrimSpace(r.Header.Get("MCP-Protocol-Version"))
-		if protocolVersion != mcpProtocolVersion20251125 {
+	var protocolVersion string
+	if request.Method == "initialize" {
+		requestedVersion, ok := mcpInitializeProtocolVersion(request)
+		if !ok {
+			writeMCPError(w, request.ID, -32602, "Invalid params", nil)
+			return
+		}
+		protocolVersion = negotiateMCPProtocolVersion(requestedVersion, serverConfig.ProtocolVersions)
+	} else {
+		var ok bool
+		protocolVersion, ok = mcpSubsequentRequestProtocolVersion(
+			r.Header.Get("MCP-Protocol-Version"),
+			serverConfig.ProtocolVersions,
+		)
+		if !ok {
 			http.Error(w, "unsupported or missing MCP-Protocol-Version", http.StatusBadRequest)
 			return
 		}
 	}
-	w.Header().Set("MCP-Protocol-Version", mcpProtocolVersion20251125)
+	w.Header().Set("MCP-Protocol-Version", protocolVersion)
 
 	if len(request.ID) == 0 {
 		handleMCPNotification(w, request)
@@ -1164,7 +1178,7 @@ func handleMCPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 
 	switch request.Method {
 	case "initialize":
-		handleMCPInitialize(w, request, serverName, serverConfig)
+		handleMCPInitialize(w, request, serverName, serverConfig, protocolVersion)
 	case "ping":
 		writeMCPResult(w, request.ID, map[string]interface{}{})
 	case "tools/list":
@@ -1252,6 +1266,64 @@ func mcpAcceptsJSONAndEventStream(accept string) bool {
 	return strings.Contains(accept, "application/json") && strings.Contains(accept, "text/event-stream")
 }
 
+func mcpInitializeProtocolVersion(request MCPJSONRPCRequest) (string, bool) {
+	var params struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if len(request.Params) == 0 || json.Unmarshal(request.Params, &params) != nil {
+		return "", false
+	}
+	version := strings.TrimSpace(params.ProtocolVersion)
+	return version, version != ""
+}
+
+func isImplementedMCPProtocolVersion(version string) bool {
+	switch version {
+	case mcpProtocolVersion20250618, mcpProtocolVersion20251125:
+		return true
+	default:
+		return false
+	}
+}
+
+func containsMCPProtocolVersion(versions []string, candidate string) bool {
+	for _, version := range versions {
+		if version == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func preferredMCPProtocolVersion(versions []string) string {
+	for _, candidate := range []string{
+		mcpProtocolVersion20251125,
+		mcpProtocolVersion20250618,
+	} {
+		if containsMCPProtocolVersion(versions, candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func negotiateMCPProtocolVersion(requested string, configured []string) string {
+	if containsMCPProtocolVersion(configured, requested) {
+		return requested
+	}
+	return preferredMCPProtocolVersion(configured)
+}
+
+func mcpSubsequentRequestProtocolVersion(header string, configured []string) (string, bool) {
+	version := strings.TrimSpace(header)
+	if version == "" {
+		// MCP Streamable HTTP defines 2025-03-26 as the compatibility default
+		// when a subsequent request does not carry the version header.
+		version = mcpProtocolVersion20250326
+	}
+	return version, containsMCPProtocolVersion(configured, version)
+}
+
 func handleMCPNotification(w http.ResponseWriter, request MCPJSONRPCRequest) {
 	switch request.Method {
 	case "notifications/initialized", "notifications/cancelled":
@@ -1261,11 +1333,8 @@ func handleMCPNotification(w http.ResponseWriter, request MCPJSONRPCRequest) {
 	}
 }
 
-func handleMCPInitialize(w http.ResponseWriter, request MCPJSONRPCRequest, serverName string, serverConfig APIConfig) {
-	var params struct {
-		ProtocolVersion string `json:"protocolVersion"`
-	}
-	if len(request.Params) == 0 || json.Unmarshal(request.Params, &params) != nil || strings.TrimSpace(params.ProtocolVersion) == "" {
+func handleMCPInitialize(w http.ResponseWriter, request MCPJSONRPCRequest, serverName string, serverConfig APIConfig, protocolVersion string) {
+	if protocolVersion == "" {
 		writeMCPError(w, request.ID, -32602, "Invalid params", nil)
 		return
 	}
@@ -1278,7 +1347,7 @@ func handleMCPInitialize(w http.ResponseWriter, request MCPJSONRPCRequest, serve
 		version = buildVersion
 	}
 	result := map[string]interface{}{
-		"protocolVersion": mcpProtocolVersion20251125,
+		"protocolVersion": protocolVersion,
 		"capabilities": map[string]interface{}{
 			"tools": map[string]interface{}{
 				"listChanged": false,
@@ -2296,17 +2365,21 @@ func validateMCPServerConfig(apiName string, apiConfig APIConfig, definitions ma
 	if len(apiConfig.ProtocolVersions) == 0 {
 		return fmt.Errorf("configuration error for MCP server %q: protocolVersions is required", apiName)
 	}
-	supportsInitialVersion := false
+	seenProtocolVersions := make(map[string]struct{}, len(apiConfig.ProtocolVersions))
 	for _, version := range apiConfig.ProtocolVersions {
 		if version == "" {
 			return fmt.Errorf("configuration error for MCP server %q: protocolVersions cannot contain an empty value", apiName)
 		}
-		if version == mcpProtocolVersion20251125 {
-			supportsInitialVersion = true
+		if !isImplementedMCPProtocolVersion(version) {
+			return fmt.Errorf("configuration error for MCP server %q: unsupported protocolVersions entry %q", apiName, version)
 		}
+		if _, exists := seenProtocolVersions[version]; exists {
+			return fmt.Errorf("configuration error for MCP server %q: duplicate protocolVersions entry %q", apiName, version)
+		}
+		seenProtocolVersions[version] = struct{}{}
 	}
-	if !supportsInitialVersion {
-		return fmt.Errorf("configuration error for MCP server %q: protocolVersions must include %q", apiName, mcpProtocolVersion20251125)
+	if preferredMCPProtocolVersion(apiConfig.ProtocolVersions) == "" {
+		return fmt.Errorf("configuration error for MCP server %q: protocolVersions contains no implemented version", apiName)
 	}
 	resourceURL, err := url.ParseRequestURI(apiConfig.Resource)
 	if err != nil || resourceURL.Scheme == "" || resourceURL.Host == "" {
@@ -2937,7 +3010,11 @@ func cloneJSONCompatibleValue(value interface{}) interface{} {
 		}
 		return cloned
 	case []string:
-		return append([]string(nil), value...)
+		cloned := make([]interface{}, len(value))
+		for index, item := range value {
+			cloned[index] = item
+		}
+		return cloned
 	default:
 		return value
 	}

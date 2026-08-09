@@ -3676,6 +3676,16 @@ func TestLoadAPIConfigFileValidatesConfiguredHTTPAndMCPRoutes(t *testing.T) {
 			want: "must be an internal API",
 		},
 		{
+			name: "unsupported MCP protocol version",
+			data: `{"guard":{"script":"guard.js","http":{"access":"internal","responseMode":"raw"}},"target":{"script":"target.js"},"server":{"type":"mcp","path":"/mcp","transport":"streamable_http","protocolVersions":["2024-11-05"],"resource":"http://localhost/mcp","guard":{"api":"guard"},"tools":[{"name":"target","api":"target","securitySchemes":[{"type":"noauth"}]}]}}`,
+			want: "unsupported protocolVersions entry",
+		},
+		{
+			name: "duplicate MCP protocol version",
+			data: `{"guard":{"script":"guard.js","http":{"access":"internal","responseMode":"raw"}},"target":{"script":"target.js"},"server":{"type":"mcp","path":"/mcp","transport":"streamable_http","protocolVersions":["2025-06-18","2025-06-18"],"resource":"http://localhost/mcp","guard":{"api":"guard"},"tools":[{"name":"target","api":"target","securitySchemes":[{"type":"noauth"}]}]}}`,
+			want: "duplicate protocolVersions entry",
+		},
+		{
 			name: "duplicate MCP tool",
 			data: `{"guard":{"script":"guard.js","http":{"access":"internal","responseMode":"raw"}},"target":{"script":"target.js"},"server":{"type":"mcp","path":"/mcp","transport":"streamable_http","protocolVersions":["2025-11-25"],"resource":"http://localhost/mcp","guard":{"api":"guard"},"tools":[{"name":"target","api":"target","securitySchemes":[{"type":"noauth"}]},{"name":"target","api":"target","securitySchemes":[{"type":"noauth"}]}]}}`,
 			want: "duplicate tool name",
@@ -3974,6 +3984,93 @@ func TestMCPInitialize(t *testing.T) {
 	}
 }
 
+func TestMCPProtocolVersionNegotiation(t *testing.T) {
+	serverConfig := APIConfig{
+		Type: apiTypeMCP,
+		Path: "/mcp",
+		ProtocolVersions: []string{
+			mcpProtocolVersion20251125,
+			mcpProtocolVersion20250618,
+		},
+		Resource: "http://localhost/mcp",
+	}
+	snapshot := newAPIConfigSnapshot(nil, "", [sha256.Size]byte{})
+
+	initialize := performTestMCPRequestWithProtocol(
+		t,
+		snapshot,
+		serverConfig,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"chatgpt","version":"1"}}}`,
+		"",
+		mcpProtocolVersion20250618,
+	)
+	if initialize.Code != http.StatusOK {
+		t.Fatalf("2025-06-18 initialize status = %d; body=%s", initialize.Code, initialize.Body.String())
+	}
+	if got := initialize.Header().Get("MCP-Protocol-Version"); got != mcpProtocolVersion20250618 {
+		t.Fatalf("2025-06-18 initialize response header = %q", got)
+	}
+	initializeResult := decodeTestJSONObject(t, initialize.Body.Bytes())["result"].(map[string]interface{})
+	if got := initializeResult["protocolVersion"]; got != mcpProtocolVersion20250618 {
+		t.Fatalf("2025-06-18 initialize result protocolVersion = %#v", got)
+	}
+
+	toolsList := performTestMCPRequestWithProtocol(
+		t,
+		snapshot,
+		serverConfig,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`,
+		"",
+		mcpProtocolVersion20250618,
+	)
+	if toolsList.Code != http.StatusOK {
+		t.Fatalf("2025-06-18 tools/list status = %d; body=%s", toolsList.Code, toolsList.Body.String())
+	}
+	if got := toolsList.Header().Get("MCP-Protocol-Version"); got != mcpProtocolVersion20250618 {
+		t.Fatalf("2025-06-18 tools/list response header = %q", got)
+	}
+
+	unsupportedInitialize := performTestMCPRequestWithProtocol(
+		t,
+		snapshot,
+		serverConfig,
+		`{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2099-01-01","capabilities":{},"clientInfo":{"name":"future-client","version":"1"}}}`,
+		"",
+		"2099-01-01",
+	)
+	if unsupportedInitialize.Code != http.StatusOK {
+		t.Fatalf("unsupported initialize status = %d; body=%s", unsupportedInitialize.Code, unsupportedInitialize.Body.String())
+	}
+	unsupportedResult := decodeTestJSONObject(t, unsupportedInitialize.Body.Bytes())["result"].(map[string]interface{})
+	if got := unsupportedResult["protocolVersion"]; got != mcpProtocolVersion20251125 {
+		t.Fatalf("unsupported initialize negotiated protocolVersion = %#v", got)
+	}
+
+	unsupportedSubsequent := performTestMCPRequestWithProtocol(
+		t,
+		snapshot,
+		serverConfig,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}`,
+		"",
+		"2099-01-01",
+	)
+	if unsupportedSubsequent.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported subsequent protocol status = %d; body=%s", unsupportedSubsequent.Code, unsupportedSubsequent.Body.String())
+	}
+
+	missingSubsequent := performTestMCPRequestWithProtocol(
+		t,
+		snapshot,
+		serverConfig,
+		`{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{}}`,
+		"",
+		"",
+	)
+	if missingSubsequent.Code != http.StatusBadRequest {
+		t.Fatalf("missing subsequent protocol status = %d; body=%s", missingSubsequent.Code, missingSubsequent.Body.String())
+	}
+}
+
 func TestMCPConcurrencyLimiter(t *testing.T) {
 	mcpConcurrencyLimiters.Lock()
 	oldLimiters := mcpConcurrencyLimiters.Limiters
@@ -4076,6 +4173,45 @@ const nyanOutputSchema = {
 	metaSecurity := tool["_meta"].(map[string]interface{})["securitySchemes"].([]interface{})
 	if !reflect.DeepEqual(security, metaSecurity) {
 		t.Fatalf("top-level and _meta securitySchemes differ: %#v / %#v", security, metaSecurity)
+	}
+}
+
+func TestMCPToolsListSupportsGeneratedSQLSchemas(t *testing.T) {
+	dir := t.TempDir()
+	query := filepath.Join(dir, "list.sql")
+	writeTestFile(t, query, `SELECT id, stamp_date FROM stamps ORDER BY stamp_date DESC;`)
+	snapshot := newAPIConfigSnapshot(map[string]APIConfig{
+		"sql_list": {
+			SQL:         []string{query},
+			Description: "List stamps from SQL",
+		},
+	}, "", [sha256.Size]byte{})
+	serverConfig := APIConfig{Tools: []MCPToolConfig{{
+		Name: "list_stamps",
+		API:  "sql_list",
+		SecuritySchemes: []MCPSecurityScheme{{
+			Type: "noauth",
+		}},
+	}}}
+
+	rec := performTestMCPRequest(t, snapshot, serverConfig, `{"jsonrpc":"2.0","id":"sql-list","method":"tools/list","params":{}}`, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	response := decodeTestJSONObject(t, rec.Body.Bytes())
+	tools := response["result"].(map[string]interface{})["tools"].([]interface{})
+	if len(tools) != 1 {
+		t.Fatalf("tools = %#v, want one generated SQL tool", tools)
+	}
+	tool := tools[0].(map[string]interface{})
+	outputSchema := tool["outputSchema"].(map[string]interface{})
+	required := outputSchema["required"].([]interface{})
+	if !reflect.DeepEqual(required, []interface{}{"success", "status", "result"}) {
+		t.Fatalf("generated SQL output required = %#v", required)
+	}
+	items := outputSchema["properties"].(map[string]interface{})["result"].(map[string]interface{})["items"].(map[string]interface{})
+	if !reflect.DeepEqual(items["required"], []interface{}{"id", "stamp_date"}) {
+		t.Fatalf("generated SQL item required = %#v", items["required"])
 	}
 }
 
@@ -5673,10 +5809,20 @@ func extractTestHTMLInputValue(t *testing.T, document, name string) string {
 
 func performTestMCPRequest(t *testing.T, snapshot *APIConfigSnapshot, serverConfig APIConfig, body, authorization string) *httptest.ResponseRecorder {
 	t.Helper()
+	return performTestMCPRequestWithProtocol(t, snapshot, serverConfig, body, authorization, mcpProtocolVersion20251125)
+}
+
+func performTestMCPRequestWithProtocol(t *testing.T, snapshot *APIConfigSnapshot, serverConfig APIConfig, body, authorization, protocolVersion string) *httptest.ResponseRecorder {
+	t.Helper()
+	if len(serverConfig.ProtocolVersions) == 0 {
+		serverConfig.ProtocolVersions = []string{mcpProtocolVersion20251125}
+	}
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("MCP-Protocol-Version", mcpProtocolVersion20251125)
+	if protocolVersion != "" {
+		req.Header.Set("MCP-Protocol-Version", protocolVersion)
+	}
 	if authorization != "" {
 		req.Header.Set("Authorization", authorization)
 	}
