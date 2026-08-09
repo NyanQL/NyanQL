@@ -1,0 +1,250 @@
+{
+  "list": {
+    "sql": ["./sql/sqlite/list.sql"],
+    "http": {"access": "internal"},
+    "description": "当月の一覧を表示します。"
+  },
+  "oauth_protected_resource_metadata": {
+    "script": "./javascript/oauth/protected_resource_metadata.js",
+    "http": {
+      "path": "/.well-known/oauth-protected-resource/mcp",
+      "methods": ["GET"],
+      "access": "anonymous",
+      "responseMode": "raw",
+      "allowedOrigins": ["https://chatgpt.com", "https://platform.openai.com"],
+      "rateLimit": {"requests": 120, "window": "1m"}
+    },
+    "runtime": {
+      "settings": {
+        "issuer": "https://stamp.necomori.asia",
+        "resource": "https://stamp.necomori.asia/mcp",
+        "scopes": ["stamps:read", "offline_access"]
+      }
+    },
+    "description": "MCP protected resource metadata"
+  },
+  "oauth_authorization_server_metadata": {
+    "script": "./javascript/oauth/authorization_server_metadata.js",
+    "http": {
+      "path": "/.well-known/oauth-authorization-server",
+      "methods": ["GET"],
+      "access": "anonymous",
+      "responseMode": "raw",
+      "allowedOrigins": ["https://chatgpt.com", "https://platform.openai.com"],
+      "rateLimit": {"requests": 120, "window": "1m"}
+    },
+    "runtime": {
+      "settings": {
+        "issuer": "https://stamp.necomori.asia",
+        "authorizationEndpoint": "https://stamp.necomori.asia/oauth/authorize",
+        "tokenEndpoint": "https://stamp.necomori.asia/oauth/token",
+        "registrationEndpoint": "https://stamp.necomori.asia/oauth/register",
+        "revocationEndpoint": "https://stamp.necomori.asia/oauth/revoke",
+        "scopes": ["stamps:read", "offline_access"]
+      }
+    },
+    "description": "OAuth authorization server metadata"
+  },
+  "oauth_register": {
+    "script": "./javascript/oauth/register.js",
+    "http": {
+      "path": "/oauth/register",
+      "methods": ["POST"],
+      "access": "anonymous",
+      "responseMode": "raw",
+      "allowedOrigins": ["https://chatgpt.com", "https://platform.openai.com"],
+      "rateLimit": {"requests": 10, "window": "1m"}
+    },
+    "runtime": {
+      "capabilities": ["sql", "crypto"],
+      "sqlFiles": [
+        "./sql/oauth/insert_client.sql",
+        "./sql/oauth/insert_client_redirect_uri.sql"
+      ],
+      "settings": {
+        "scopes": ["stamps:read", "offline_access"],
+        "redirectURIAllowedPrefixes": ["https://chatgpt.com/connector/oauth/"],
+        "allowLoopbackRedirects": false,
+        "maxClients": 1000
+      }
+    },
+    "description": "OAuth dynamic client registration"
+  },
+  "oauth_authorize": {
+    "script": "./javascript/oauth/authorize.js",
+    "http": {
+      "path": "/oauth/authorize",
+      "methods": ["GET", "POST"],
+      "access": "anonymous",
+      "responseMode": "raw",
+      "allowedOrigins": ["https://chatgpt.com", "https://platform.openai.com"],
+      "rateLimit": {"requests": 30, "window": "1m"}
+    },
+    "runtime": {
+      "capabilities": ["sql", "crypto", "password"],
+      "sqlFiles": [
+        "./sql/oauth/select_client_redirect_uri.sql",
+        "./sql/oauth/insert_authorization_request.sql",
+        "./sql/oauth/select_authorization_request.sql",
+        "./sql/oauth/consume_authorization_request.sql",
+        "./sql/oauth/select_user_by_username.sql",
+        "./sql/oauth/increment_authorization_attempt.sql",
+        "./sql/oauth/upsert_consent.sql",
+        "./sql/oauth/insert_authorization_code.sql"
+      ],
+      "settings": {
+        "resource": "https://stamp.necomori.asia/mcp",
+        "authorizationEndpoint": "https://stamp.necomori.asia/oauth/authorize",
+        "authorizationCookiePath": "/oauth/authorize",
+        "scopes": ["stamps:read", "offline_access"],
+        "redirectURIAllowedPrefixes": ["https://chatgpt.com/connector/oauth/"],
+        "allowLoopbackRedirects": false,
+        "dummyPasswordHash": "$argon2id$v=19$m=65536,t=3,p=2$GbP1xKkH/FbDk3bytDlq1Q$1jcT6iSqZ9N0I3LuX7w/pGjJgWVCTbTr9WhK7r91gV8"
+      }
+    },
+    "description": "OAuth authorization endpoint"
+  },
+  "oauth_token": {
+    "script": "./javascript/oauth/token.js",
+    "http": {
+      "path": "/oauth/token",
+      "methods": ["POST"],
+      "access": "anonymous",
+      "responseMode": "raw",
+      "allowedOrigins": ["https://chatgpt.com", "https://platform.openai.com"],
+      "rateLimit": {"requests": 30, "window": "1m"}
+    },
+    "runtime": {
+      "capabilities": ["sql", "crypto"],
+      "sqlFiles": [
+        "./sql/oauth/select_authorization_code.sql",
+        "./sql/oauth/consume_authorization_code.sql",
+        "./sql/oauth/insert_access_token.sql",
+        "./sql/oauth/insert_refresh_token_family.sql",
+        "./sql/oauth/insert_refresh_token.sql",
+        "./sql/oauth/lock_refresh_token.sql",
+        "./sql/oauth/select_refresh_token.sql",
+        "./sql/oauth/consume_refresh_token.sql",
+        "./sql/oauth/revoke_refresh_token_family.sql",
+        "./sql/oauth/revoke_refresh_tokens_in_family.sql",
+        "./sql/oauth/revoke_access_tokens_in_refresh_family.sql"
+      ],
+      "settings": {
+        "resource": "https://stamp.necomori.asia/mcp",
+        "accessTokenLifetimeSeconds": 3600,
+        "refreshTokenLifetimeSeconds": 7776000
+      }
+    },
+    "description": "OAuth token endpoint"
+  },
+  "oauth_revoke": {
+    "script": "./javascript/oauth/revoke.js",
+    "http": {
+      "path": "/oauth/revoke",
+      "methods": ["POST"],
+      "access": "anonymous",
+      "responseMode": "raw",
+      "allowedOrigins": ["https://chatgpt.com", "https://platform.openai.com"],
+      "rateLimit": {"requests": 30, "window": "1m"}
+    },
+    "runtime": {
+      "capabilities": ["sql", "crypto"],
+      "sqlFiles": [
+        "./sql/oauth/revoke_access_token.sql",
+        "./sql/oauth/select_refresh_token.sql",
+        "./sql/oauth/revoke_refresh_token_family.sql",
+        "./sql/oauth/revoke_refresh_tokens_in_family.sql",
+        "./sql/oauth/revoke_access_tokens_in_refresh_family.sql"
+      ]
+    },
+    "description": "OAuth token revocation endpoint"
+  },
+  "oauth_bootstrap_user": {
+    "script": "./javascript/oauth/bootstrap_user.js",
+    "http": {
+      "path": "/oauth/admin/users",
+      "methods": ["POST"],
+      "access": "basic",
+      "responseMode": "raw",
+      "allowedRemoteIPs": ["127.0.0.1", "::1"],
+      "rateLimit": {"requests": 5, "window": "1m"}
+    },
+    "runtime": {
+      "capabilities": ["sql", "password"],
+      "sqlFiles": ["./sql/oauth/upsert_user.sql"]
+    },
+    "description": "OAuth development user bootstrap endpoint"
+  },
+  "oauth_verify_access": {
+    "script": "./javascript/oauth/verify_access.js",
+    "http": {
+      "access": "internal"
+    },
+    "runtime": {
+      "capabilities": ["sql", "crypto"],
+      "sqlFiles": ["./sql/oauth/select_access_token.sql"],
+      "settings": {
+        "resource": "https://stamp.necomori.asia/mcp",
+        "protectedResourceMetadata": "https://stamp.necomori.asia/.well-known/oauth-protected-resource/mcp"
+      }
+    },
+    "description": "Internal MCP access-token guard"
+  },
+  "oauth_cleanup": {
+    "type": "schedule",
+    "script": "./javascript/oauth/cleanup.js",
+    "trigger": {
+      "type": "cron",
+      "value": "17 3 * * *"
+    },
+    "runtime": {
+      "capabilities": ["sql"],
+      "sqlFiles": [
+        "./sql/oauth/cleanup_authorization_requests.sql",
+        "./sql/oauth/cleanup_authorization_codes.sql",
+        "./sql/oauth/cleanup_access_tokens.sql",
+        "./sql/oauth/cleanup_refresh_tokens.sql",
+        "./sql/oauth/cleanup_refresh_token_families.sql",
+        "./sql/oauth/cleanup_clients.sql"
+      ],
+      "settings": {
+        "retentionDays": 7,
+        "clientRetentionDays": 3650
+      }
+    },
+    "description": "Expired OAuth data cleanup"
+  },
+  "server_mcp_http": {
+    "type": "mcp",
+    "path": "/mcp",
+    "transport": "streamable_http",
+    "protocolVersions": ["2025-11-25"],
+    "resource": "https://stamp.necomori.asia/mcp",
+    "allowedOrigins": ["https://chatgpt.com", "https://platform.openai.com"],
+    "rateLimit": {"requests": 120, "window": "1m"},
+    "maxConcurrent": 8,
+    "guard": {
+      "api": "oauth_verify_access"
+    },
+    "tools": [
+      {
+        "name": "list_stamps",
+        "api": "list",
+        "title": "スタンプ一覧を取得",
+        "description": "当月のスタンプ登録状況を一覧で取得します。",
+        "securitySchemes": [
+          {
+            "type": "oauth2",
+            "scopes": ["stamps:read"]
+          }
+        ],
+        "annotations": {
+          "readOnlyHint": true,
+          "destructiveHint": false,
+          "openWorldHint": false
+        }
+      }
+    ],
+    "instructions": "NyanQLのスタンプ情報を操作するMCP Serverです。"
+  }
+}

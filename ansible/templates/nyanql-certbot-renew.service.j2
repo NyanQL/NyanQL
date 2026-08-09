@@ -1,0 +1,10 @@
+[Unit]
+Description=Renew the NyanQL domain certificate
+After=network-online.target nyanql-acme-webroot.service
+Wants=network-online.target
+Requires=nyanql-acme-webroot.service
+
+[Service]
+Type=oneshot
+ExecStart={{ certbot_venv }}/bin/certbot renew --cert-name {{ letsencrypt_cert_name }} --quiet
+PrivateTmp=true

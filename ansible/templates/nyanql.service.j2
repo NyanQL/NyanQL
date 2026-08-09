@@ -1,0 +1,35 @@
+[Unit]
+Description=NyanQL MCP Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ nyanql_service_user }}
+Group={{ nyanql_service_group }}
+WorkingDirectory={{ nyanql_source_dir }}
+ExecStart={{ nyanql_binary_path }} --config {{ nyanql_config_dir }}/config.json --api {{ nyanql_api_path }}
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0027
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths={{ nyanql_data_dir }} {{ nyanql_log_dir }}
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

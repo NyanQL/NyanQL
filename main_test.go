@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -3463,6 +3467,2231 @@ func TestWebSocketMessageTypeLabels(t *testing.T) {
 			t.Errorf("websocketMessageTypeLabel(%d) = %q, want %q", messageType, got, want)
 		}
 	}
+}
+
+func TestAPIConfigUnmarshalConfiguredHTTPRuntimeAndMCP(t *testing.T) {
+	data := []byte(`{
+		"type":"mcp",
+		"path":"/mcp",
+		"http":{"path":"/oauth/token","methods":["POST"],"access":"anonymous","responseMode":"raw","rateLimit":{"requests":20,"window":"1m"}},
+		"runtime":{"capabilities":["sql","crypto"],"sqlFiles":["./sql/one.sql","./sql/two.sql"],"settings":{"issuer":"https://example.test","nested":{"enabled":true}}},
+		"transport":"streamable_http",
+		"protocolVersions":["2025-11-25"],
+		"resource":"https://example.test/mcp",
+		"guard":{"api":"oauth_verify"},
+		"rateLimit":{"requests":100,"window":"1m"},
+		"maxConcurrent":8,
+		"instructions":"Use the configured tools.",
+		"tools":[{
+			"name":"list_stamps",
+			"api":"list",
+			"title":"List stamps",
+			"securitySchemes":[{"type":"oauth2","scopes":["stamps:read"]}],
+			"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}
+		}]
+	}`)
+
+	var got APIConfig
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if got.HTTP == nil || got.HTTP.Path != "/oauth/token" || !reflect.DeepEqual(got.HTTP.Methods, []string{"POST"}) || got.HTTP.Access != "anonymous" || got.HTTP.ResponseMode != "raw" {
+		t.Fatalf("HTTP config = %#v", got.HTTP)
+	}
+	if got.HTTP.RateLimit == nil || got.HTTP.RateLimit.Requests != 20 || got.HTTP.RateLimit.Window != "1m" {
+		t.Fatalf("HTTP rate limit = %#v", got.HTTP.RateLimit)
+	}
+	if !reflect.DeepEqual(got.Runtime.Capabilities, []string{"sql", "crypto"}) {
+		t.Fatalf("runtime capabilities = %#v", got.Runtime.Capabilities)
+	}
+	if !reflect.DeepEqual(got.Runtime.SQLFiles, []string{"./sql/one.sql", "./sql/two.sql"}) {
+		t.Fatalf("runtime SQL files = %#v", got.Runtime.SQLFiles)
+	}
+	nested, ok := got.Runtime.Settings["nested"].(map[string]interface{})
+	if !ok || nested["enabled"] != true {
+		t.Fatalf("runtime settings = %#v", got.Runtime.Settings)
+	}
+	if got.Transport != "streamable_http" || !reflect.DeepEqual(got.ProtocolVersions, []string{"2025-11-25"}) || got.Resource != "https://example.test/mcp" || got.Guard.API != "oauth_verify" {
+		t.Fatalf("MCP config = transport:%q versions:%#v resource:%q guard:%#v", got.Transport, got.ProtocolVersions, got.Resource, got.Guard)
+	}
+	if got.RateLimit == nil || got.RateLimit.Requests != 100 || got.RateLimit.Window != "1m" || got.MaxConcurrent != 8 {
+		t.Fatalf("MCP limits = rate:%#v maxConcurrent:%d", got.RateLimit, got.MaxConcurrent)
+	}
+	if got.Instructions != "Use the configured tools." || len(got.Tools) != 1 {
+		t.Fatalf("MCP instructions/tools = %q / %#v", got.Instructions, got.Tools)
+	}
+	tool := got.Tools[0]
+	if tool.Name != "list_stamps" || tool.API != "list" || tool.Title != "List stamps" {
+		t.Fatalf("tool = %#v", tool)
+	}
+	if len(tool.SecuritySchemes) != 1 || tool.SecuritySchemes[0].Type != "oauth2" || !reflect.DeepEqual(tool.SecuritySchemes[0].Scopes, []string{"stamps:read"}) {
+		t.Fatalf("security schemes = %#v", tool.SecuritySchemes)
+	}
+	if tool.Annotations.ReadOnlyHint == nil || !*tool.Annotations.ReadOnlyHint || tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint || tool.Annotations.OpenWorldHint == nil || *tool.Annotations.OpenWorldHint {
+		t.Fatalf("annotations = %#v", tool.Annotations)
+	}
+}
+
+func TestNewAPIConfigSnapshotDeepClonesConfiguredExtensions(t *testing.T) {
+	readOnly := true
+	destructive := false
+	openWorld := false
+	original := APIConfig{
+		Type:             apiTypeMCP,
+		RateLimit:        &HTTPRateLimitConfig{Requests: 50, Window: "1m"},
+		MaxConcurrent:    4,
+		HTTP:             &HTTPAPIConfig{Path: "/raw", Methods: []string{"GET"}, Access: configuredHTTPAccessAnonymous, ResponseMode: configuredHTTPResponseRaw, RateLimit: &HTTPRateLimitConfig{Requests: 10, Window: "1m"}},
+		Runtime:          APIRuntimeConfig{Capabilities: []string{"crypto"}, SQLFiles: []string{"/sql/original.sql"}, Settings: map[string]interface{}{"nested": map[string]interface{}{"value": "original"}, "items": []interface{}{"first"}}},
+		ProtocolVersions: []string{mcpProtocolVersion20251125},
+		Tools: []MCPToolConfig{{
+			Name: "tool",
+			API:  "target",
+			SecuritySchemes: []MCPSecurityScheme{{
+				Type:   "oauth2",
+				Scopes: []string{"read"},
+			}},
+			Annotations: MCPToolAnnotations{ReadOnlyHint: &readOnly, DestructiveHint: &destructive, OpenWorldHint: &openWorld},
+		}},
+	}
+	snapshot := newAPIConfigSnapshot(map[string]APIConfig{"server": original}, "", [sha256.Size]byte{})
+
+	original.HTTP.Path = "/mutated"
+	original.HTTP.Methods[0] = "DELETE"
+	original.HTTP.RateLimit.Requests = 999
+	original.HTTP.RateLimit.Window = "24h"
+	original.Runtime.Capabilities[0] = "sql"
+	original.Runtime.SQLFiles[0] = "/sql/mutated.sql"
+	original.Runtime.Settings["nested"].(map[string]interface{})["value"] = "mutated"
+	original.Runtime.Settings["items"].([]interface{})[0] = "mutated"
+	original.ProtocolVersions[0] = "mutated"
+	original.RateLimit.Requests = 999
+	original.RateLimit.Window = "24h"
+	original.Tools[0].SecuritySchemes[0].Scopes[0] = "write"
+	*original.Tools[0].Annotations.ReadOnlyHint = false
+	*original.Tools[0].Annotations.DestructiveHint = true
+	*original.Tools[0].Annotations.OpenWorldHint = true
+
+	got := snapshot.Definitions["server"]
+	if got.HTTP == original.HTTP || got.HTTP.Path != "/raw" || !reflect.DeepEqual(got.HTTP.Methods, []string{"GET"}) {
+		t.Fatalf("snapshot HTTP config = %#v", got.HTTP)
+	}
+	if got.HTTP.RateLimit == original.HTTP.RateLimit || got.HTTP.RateLimit.Requests != 10 || got.HTTP.RateLimit.Window != "1m" {
+		t.Fatalf("snapshot HTTP rate limit = %#v", got.HTTP.RateLimit)
+	}
+	if !reflect.DeepEqual(got.Runtime.Capabilities, []string{"crypto"}) || !reflect.DeepEqual(got.Runtime.SQLFiles, []string{"/sql/original.sql"}) || got.Runtime.Settings["nested"].(map[string]interface{})["value"] != "original" || got.Runtime.Settings["items"].([]interface{})[0] != "first" {
+		t.Fatalf("snapshot runtime = %#v", got.Runtime)
+	}
+	if !reflect.DeepEqual(got.ProtocolVersions, []string{mcpProtocolVersion20251125}) || got.Tools[0].SecuritySchemes[0].Scopes[0] != "read" {
+		t.Fatalf("snapshot MCP slices = versions:%#v tools:%#v", got.ProtocolVersions, got.Tools)
+	}
+	if got.RateLimit == original.RateLimit || got.RateLimit.Requests != 50 || got.RateLimit.Window != "1m" || got.MaxConcurrent != 4 {
+		t.Fatalf("snapshot MCP limits = rate:%#v maxConcurrent:%d", got.RateLimit, got.MaxConcurrent)
+	}
+	annotations := got.Tools[0].Annotations
+	if annotations.ReadOnlyHint == nil || !*annotations.ReadOnlyHint || annotations.DestructiveHint == nil || *annotations.DestructiveHint || annotations.OpenWorldHint == nil || *annotations.OpenWorldHint {
+		t.Fatalf("snapshot annotations = %#v", annotations)
+	}
+}
+
+func TestLoadAPIConfigFileValidatesConfiguredHTTPAndMCPRoutes(t *testing.T) {
+	valid := `{
+		"guard":{"script":"guard.js","http":{"access":"internal","responseMode":"raw"},"runtime":{"capabilities":["crypto"]}},
+		"target":{"script":"target.js","description":"target"},
+		"metadata":{"script":"metadata.js","http":{"path":"/.well-known/example","methods":["GET"],"access":"anonymous","responseMode":"raw"}},
+		"server":{"type":"mcp","path":"/mcp","transport":"streamable_http","protocolVersions":["2025-11-25"],"resource":"http://127.0.0.1/mcp","guard":{"api":"guard"},"tools":[{"name":"target","api":"target","securitySchemes":[{"type":"oauth2","scopes":["target:read"]}]}]}
+	}`
+	validPath := filepath.Join(t.TempDir(), "api.json")
+	writeTestFile(t, validPath, valid)
+	loaded, err := loadAPIConfigFile(validPath)
+	if err != nil {
+		t.Fatalf("valid configured API load error = %v", err)
+	}
+	if loaded.Snapshot.Definitions["metadata"].HTTP.Path != "/.well-known/example" || loaded.Snapshot.Definitions["server"].Guard.API != "guard" {
+		t.Fatalf("loaded configured APIs = %#v", loaded.Snapshot.Definitions)
+	}
+
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{
+			name: "relative HTTP path",
+			data: `{"endpoint":{"script":"x.js","http":{"path":"oauth/token","access":"anonymous","responseMode":"raw"}}}`,
+			want: "HTTP path must be an absolute path",
+		},
+		{
+			name: "unsupported access",
+			data: `{"endpoint":{"script":"x.js","http":{"path":"/x","access":"public","responseMode":"raw"}}}`,
+			want: "unsupported http.access",
+		},
+		{
+			name: "raw without script",
+			data: `{"endpoint":{"http":{"path":"/x","access":"anonymous","responseMode":"raw"}}}`,
+			want: "raw HTTP responses require script",
+		},
+		{
+			name: "invalid method",
+			data: `{"endpoint":{"script":"x.js","http":{"path":"/x","methods":["GET\\nBAD"],"access":"anonymous","responseMode":"raw"}}}`,
+			want: "invalid HTTP method",
+		},
+		{
+			name: "duplicate HTTP route",
+			data: `{"first":{"script":"x.js","http":{"path":"/same","access":"anonymous","responseMode":"raw"}},"second":{"script":"y.js","http":{"path":"/same","access":"anonymous","responseMode":"raw"}}}`,
+			want: "conflicts with",
+		},
+		{
+			name: "reserved route",
+			data: `{"endpoint":{"script":"x.js","http":{"path":"/nyan-rpc","access":"anonymous","responseMode":"raw"}}}`,
+			want: "is reserved",
+		},
+		{
+			name: "unsupported runtime capability",
+			data: `{"endpoint":{"script":"x.js","http":{"path":"/x","access":"anonymous","responseMode":"raw"},"runtime":{"capabilities":["host_exec"]}}}`,
+			want: "unsupported runtime capability",
+		},
+		{
+			name: "SQL capability requires allowlist",
+			data: `{"endpoint":{"script":"x.js","http":{"path":"/x","access":"anonymous","responseMode":"raw"},"runtime":{"capabilities":["sql"]}}}`,
+			want: "runtime.sqlFiles is required",
+		},
+		{
+			name: "SQL allowlist requires capability",
+			data: `{"endpoint":{"script":"x.js","http":{"path":"/x","access":"anonymous","responseMode":"raw"},"runtime":{"sqlFiles":["query.sql"]}}}`,
+			want: "runtime.sqlFiles requires the sql capability",
+		},
+		{
+			name: "invalid rate limit requests",
+			data: `{"endpoint":{"script":"x.js","http":{"path":"/x","access":"anonymous","responseMode":"raw","rateLimit":{"requests":0,"window":"1m"}}}}`,
+			want: "http.rateLimit.requests",
+		},
+		{
+			name: "invalid rate limit window",
+			data: `{"endpoint":{"script":"x.js","http":{"path":"/x","access":"anonymous","responseMode":"raw","rateLimit":{"requests":10,"window":"500ms"}}}}`,
+			want: "http.rateLimit.window",
+		},
+		{
+			name: "MCP guard must be internal",
+			data: `{"guard":{"script":"guard.js","http":{"path":"/guard","access":"anonymous","responseMode":"raw"}},"target":{"script":"target.js"},"server":{"type":"mcp","path":"/mcp","transport":"streamable_http","protocolVersions":["2025-11-25"],"resource":"http://localhost/mcp","guard":{"api":"guard"},"tools":[{"name":"target","api":"target"}]}}`,
+			want: "must be an internal API",
+		},
+		{
+			name: "duplicate MCP tool",
+			data: `{"guard":{"script":"guard.js","http":{"access":"internal","responseMode":"raw"}},"target":{"script":"target.js"},"server":{"type":"mcp","path":"/mcp","transport":"streamable_http","protocolVersions":["2025-11-25"],"resource":"http://localhost/mcp","guard":{"api":"guard"},"tools":[{"name":"target","api":"target","securitySchemes":[{"type":"noauth"}]},{"name":"target","api":"target","securitySchemes":[{"type":"noauth"}]}]}}`,
+			want: "duplicate tool name",
+		},
+		{
+			name: "MCP tool requires one security scheme",
+			data: `{"guard":{"script":"guard.js","http":{"access":"internal","responseMode":"raw"}},"target":{"script":"target.js"},"server":{"type":"mcp","path":"/mcp","transport":"streamable_http","protocolVersions":["2025-11-25"],"resource":"http://localhost/mcp","guard":{"api":"guard"},"tools":[{"name":"target","api":"target"}]}}`,
+			want: "must declare exactly one security scheme",
+		},
+		{
+			name: "MCP OAuth tool requires scope",
+			data: `{"guard":{"script":"guard.js","http":{"access":"internal","responseMode":"raw"}},"target":{"script":"target.js"},"server":{"type":"mcp","path":"/mcp","transport":"streamable_http","protocolVersions":["2025-11-25"],"resource":"http://localhost/mcp","guard":{"api":"guard"},"tools":[{"name":"target","api":"target","securitySchemes":[{"type":"oauth2"}]}]}}`,
+			want: "must declare at least one scope",
+		},
+		{
+			name: "invalid MCP rate limit",
+			data: `{"guard":{"script":"guard.js","http":{"access":"internal","responseMode":"raw"}},"target":{"script":"target.js"},"server":{"type":"mcp","path":"/mcp","transport":"streamable_http","protocolVersions":["2025-11-25"],"resource":"http://localhost/mcp","rateLimit":{"requests":0,"window":"1m"},"guard":{"api":"guard"},"tools":[{"name":"target","api":"target","securitySchemes":[{"type":"noauth"}]}]}}`,
+			want: "rateLimit.requests",
+		},
+		{
+			name: "invalid MCP max concurrency",
+			data: `{"guard":{"script":"guard.js","http":{"access":"internal","responseMode":"raw"}},"target":{"script":"target.js"},"server":{"type":"mcp","path":"/mcp","transport":"streamable_http","protocolVersions":["2025-11-25"],"resource":"http://localhost/mcp","maxConcurrent":257,"guard":{"api":"guard"},"tools":[{"name":"target","api":"target","securitySchemes":[{"type":"noauth"}]}]}}`,
+			want: "maxConcurrent",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apiPath := filepath.Join(t.TempDir(), "api.json")
+			writeTestFile(t, apiPath, tt.data)
+			result, err := loadAPIConfigFile(apiPath)
+			if err == nil {
+				t.Fatalf("loadAPIConfigFile() result = %#v, want error containing %q", result, tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("loadAPIConfigFile() error = %q, want substring %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfiguredHTTPRawResponseRequestContextAndCapabilities(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	script := writeTestScript(t, `
+JSON.stringify({
+  status: 201,
+  headers: {"Content-Type":"application/json", "X-Script":"ok"},
+  body: {
+    method: nyanRequest.method,
+    path: nyanRequest.path,
+    query: nyanRequest.query,
+    form: nyanRequest.form,
+    json: nyanRequest.json,
+    requestHeader: nyanRequest.headers["x-test"],
+    cookie: nyanRequest.cookies.session,
+    rawBody: nyanRequest.body,
+    mergedName: nyanAllParams.name,
+    cryptoType: typeof nyanCrypto,
+    passwordType: typeof nyanPassword,
+    sqlType: typeof nyanRunSQL,
+	transactionType: typeof nyanTx,
+    hostExecType: typeof nyanHostExec,
+    fileType: typeof nyanGetFile,
+    httpType: typeof nyanGetAPI
+  }
+});
+`)
+	setTestSQLFiles(t, map[string]APIConfig{
+		"raw_endpoint": {
+			Script:  script,
+			HTTP:    &HTTPAPIConfig{Path: "/raw", Methods: []string{http.MethodPost}, Access: configuredHTTPAccessAnonymous, ResponseMode: configuredHTTPResponseRaw},
+			Runtime: APIRuntimeConfig{Capabilities: []string{"crypto"}},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/raw?q=one&q=two", strings.NewReader("name=cat"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Test", "header-value")
+	req.AddCookie(&http.Cookie{Name: "session", Value: "cookie-value"})
+	rec := httptest.NewRecorder()
+	unifiedHandler(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if rec.Header().Get("X-Script") != "ok" || rec.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("response headers = %#v", rec.Header())
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("response body = %q: %v", rec.Body.String(), err)
+	}
+	if body["method"] != http.MethodPost || body["path"] != "/raw" || body["requestHeader"] != "header-value" || body["cookie"] != "cookie-value" || body["rawBody"] != "name=cat" || body["mergedName"] != "cat" {
+		t.Fatalf("request context body = %#v", body)
+	}
+	query := body["query"].(map[string]interface{})
+	if !reflect.DeepEqual(query["q"], []interface{}{"one", "two"}) {
+		t.Fatalf("query values = %#v", query)
+	}
+	form := body["form"].(map[string]interface{})
+	if form["name"] != "cat" {
+		t.Fatalf("form values = %#v", form)
+	}
+	if body["cryptoType"] != "object" || body["passwordType"] != "undefined" || body["sqlType"] != "undefined" || body["transactionType"] != "undefined" || body["hostExecType"] != "undefined" || body["fileType"] != "undefined" || body["httpType"] != "undefined" {
+		t.Fatalf("restricted capability types = %#v", body)
+	}
+}
+
+func TestConfiguredHTTPRejectsDisallowedMethodBeforeRunningScript(t *testing.T) {
+	setTestSQLFiles(t, map[string]APIConfig{
+		"post_only": {
+			Script: "/script/must-not-run.js",
+			HTTP:   &HTTPAPIConfig{Path: "/post-only", Methods: []string{http.MethodPost}, Access: configuredHTTPAccessAnonymous, ResponseMode: configuredHTTPResponseRaw},
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	unifiedHandler(rec, httptest.NewRequest(http.MethodGet, "/post-only", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d; body=%q", rec.Code, http.StatusMethodNotAllowed, rec.Body.String())
+	}
+	if rec.Header().Get("Allow") != http.MethodPost {
+		t.Fatalf("Allow = %q, want %q", rec.Header().Get("Allow"), http.MethodPost)
+	}
+}
+
+func TestConfiguredHTTPInternalAPICannotUseLegacyHTTPRoute(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	oldConfig := config
+	config.BasicAuth = BasicAuthConfig{Username: "nyan", Password: "secret"}
+	t.Cleanup(func() { config = oldConfig })
+	script := writeTestScript(t, `JSON.stringify({status:200,headers:{"Content-Type":"application/json"},body:{exposed:true}});`)
+	setTestSQLFiles(t, map[string]APIConfig{
+		"guard": {
+			Script: script,
+			HTTP:   &HTTPAPIConfig{Access: configuredHTTPAccessInternal, ResponseMode: configuredHTTPResponseRaw},
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/guard", nil)
+	req.SetBasicAuth("nyan", "secret")
+	rec := httptest.NewRecorder()
+	unifiedHandler(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("internal API status = %d, want %d; body=%q", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestConfiguredHTTPResponseRejectsUnsafeValues(t *testing.T) {
+	tests := []struct {
+		name     string
+		response configuredHTTPResponse
+	}{
+		{name: "hop-by-hop header", response: configuredHTTPResponse{Status: 200, Headers: map[string]interface{}{"Connection": "close"}, Body: "no"}},
+		{name: "content length", response: configuredHTTPResponse{Status: 200, Headers: map[string]interface{}{"Content-Length": "2"}, Body: "no"}},
+		{name: "header newline", response: configuredHTTPResponse{Status: 200, Headers: map[string]interface{}{"X-Test": "ok\r\nInjected: yes"}, Body: "no"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			err := writeConfiguredHTTPResponse(rec, httptest.NewRequest(http.MethodGet, "/", nil), tt.response)
+			if err == nil {
+				t.Fatalf("writeConfiguredHTTPResponse() error = nil for %#v", tt.response)
+			}
+		})
+	}
+	if _, err := parseConfiguredHTTPResponse(`{"status":700,"body":"invalid"}`); err == nil {
+		t.Fatal("parseConfiguredHTTPResponse() error = nil for out-of-range status")
+	}
+}
+
+func TestRestrictedRuntimeSQLAllowlistAndNoTransactionGlobal(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	dir := t.TempDir()
+	allowedSQL := filepath.Join(dir, "allowed.sql")
+	deniedSQL := filepath.Join(dir, "denied.sql")
+	writeTestFile(t, allowedSQL, `SELECT 'allowed' AS value`)
+	writeTestFile(t, deniedSQL, `SELECT 'denied' AS value`)
+	encodedAllowed, err := json.Marshal(allowedSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedDenied, err := json.Marshal(deniedSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeConfig := APIRuntimeConfig{Capabilities: []string{"sql"}, SQLFiles: []string{allowedSQL}}
+
+	allowedScript := writeTestScript(t, fmt.Sprintf(`
+const rows = nyanRunSQL(%s, {});
+JSON.stringify({transactionType:typeof nyanTx, value:rows[0].value});
+`, encodedAllowed))
+	result, err := runScriptWithRuntimeWithSnapshot(newAPIConfigSnapshot(nil, "", [sha256.Size]byte{}), []string{allowedScript}, map[string]interface{}{}, runtimeConfig, true)
+	if err != nil {
+		t.Fatalf("allowed restricted SQL error = %v", err)
+	}
+	allowedResult := decodeTestJSONObject(t, []byte(result))
+	if allowedResult["transactionType"] != "undefined" || allowedResult["value"] != "allowed" {
+		t.Fatalf("allowed restricted SQL result = %#v", allowedResult)
+	}
+
+	deniedScript := writeTestScript(t, fmt.Sprintf(`nyanRunSQL(%s, {});`, encodedDenied))
+	if _, err := runScriptWithRuntimeWithSnapshot(newAPIConfigSnapshot(nil, "", [sha256.Size]byte{}), []string{deniedScript}, map[string]interface{}{}, runtimeConfig, true); err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("non-allowlisted restricted SQL error = %v", err)
+	}
+}
+
+func TestGenericCryptographicPrimitives(t *testing.T) {
+	first, err := secureRandomBase64URL(32)
+	if err != nil {
+		t.Fatalf("secureRandomBase64URL() error = %v", err)
+	}
+	second, err := secureRandomBase64URL(32)
+	if err != nil {
+		t.Fatalf("secureRandomBase64URL() second error = %v", err)
+	}
+	if first == second || strings.Contains(first, "=") {
+		t.Fatalf("random values are not unique raw base64url values: first=%q second=%q", first, second)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(first)
+	if err != nil || len(decoded) != 32 {
+		t.Fatalf("random value decode = %d bytes, error=%v, value=%q", len(decoded), err, first)
+	}
+	for _, size := range []int{15, 129} {
+		if _, err := secureRandomBase64URL(size); err == nil {
+			t.Fatalf("secureRandomBase64URL(%d) error = nil", size)
+		}
+	}
+
+	const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	const challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+	if got := sha256Base64URL(verifier); got != challenge {
+		t.Fatalf("sha256Base64URL(PKCE verifier) = %q, want %q", got, challenge)
+	}
+	if !timingSafeStringEqual("same", "same") || timingSafeStringEqual("same", "different") || timingSafeStringEqual("a", "a\x00") {
+		t.Fatal("timingSafeStringEqual() returned an unexpected result")
+	}
+
+	encoded, err := hashPasswordArgon2ID("correct horse battery staple")
+	if err != nil {
+		t.Fatalf("hashPasswordArgon2ID() error = %v", err)
+	}
+	if !strings.HasPrefix(encoded, "$argon2id$v=") {
+		t.Fatalf("password hash = %q, want Argon2id PHC string", encoded)
+	}
+	valid, err := verifyPasswordArgon2ID("correct horse battery staple", encoded)
+	if err != nil || !valid {
+		t.Fatalf("verifyPasswordArgon2ID(correct) = %t, error=%v", valid, err)
+	}
+	valid, err = verifyPasswordArgon2ID("wrong", encoded)
+	if err != nil || valid {
+		t.Fatalf("verifyPasswordArgon2ID(wrong) = %t, error=%v", valid, err)
+	}
+	if valid, err := verifyPasswordArgon2ID("password", "not-a-phc-string"); err == nil || valid {
+		t.Fatalf("verifyPasswordArgon2ID(malformed) = %t, error=%v", valid, err)
+	}
+}
+
+func TestMCPInitialize(t *testing.T) {
+	oldConfig := config
+	config.Name = "NyanQL Test"
+	config.Version = "v-test"
+	t.Cleanup(func() { config = oldConfig })
+	serverConfig := APIConfig{
+		Type:             apiTypeMCP,
+		Path:             "/mcp",
+		ProtocolVersions: []string{mcpProtocolVersion20251125},
+		Resource:         "http://localhost/mcp",
+		Instructions:     "Test instructions",
+	}
+	rec := performTestMCPRequest(t, newAPIConfigSnapshot(nil, "", [sha256.Size]byte{}), serverConfig, `{"jsonrpc":"2.0","id":7,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("MCP-Protocol-Version") != mcpProtocolVersion20251125 || rec.Header().Get("MCP-Session-Id") != "" {
+		t.Fatalf("MCP headers = %#v", rec.Header())
+	}
+	response := decodeTestJSONObject(t, rec.Body.Bytes())
+	if response["jsonrpc"] != "2.0" || response["id"] != float64(7) {
+		t.Fatalf("JSON-RPC response = %#v", response)
+	}
+	result := response["result"].(map[string]interface{})
+	if result["protocolVersion"] != mcpProtocolVersion20251125 || result["instructions"] != "Test instructions" {
+		t.Fatalf("initialize result = %#v", result)
+	}
+	serverInfo := result["serverInfo"].(map[string]interface{})
+	if serverInfo["name"] != "NyanQL Test" || serverInfo["version"] != "v-test" {
+		t.Fatalf("serverInfo = %#v", serverInfo)
+	}
+	toolsCapability := result["capabilities"].(map[string]interface{})["tools"].(map[string]interface{})
+	if toolsCapability["listChanged"] != false {
+		t.Fatalf("tools capability = %#v", toolsCapability)
+	}
+}
+
+func TestMCPConcurrencyLimiter(t *testing.T) {
+	mcpConcurrencyLimiters.Lock()
+	oldLimiters := mcpConcurrencyLimiters.Limiters
+	mcpConcurrencyLimiters.Limiters = make(map[string]chan struct{})
+	mcpConcurrencyLimiters.Unlock()
+	t.Cleanup(func() {
+		mcpConcurrencyLimiters.Lock()
+		mcpConcurrencyLimiters.Limiters = oldLimiters
+		mcpConcurrencyLimiters.Unlock()
+	})
+
+	releaseFirst, acquired := acquireMCPExecutionSlot("server", 1)
+	if !acquired {
+		t.Fatal("first MCP execution slot was not acquired")
+	}
+	if release, acquired := acquireMCPExecutionSlot("server", 1); acquired {
+		release()
+		t.Fatal("MCP execution exceeded maxConcurrent")
+	}
+	releaseOther, acquired := acquireMCPExecutionSlot("other-server", 1)
+	if !acquired {
+		t.Fatal("different MCP server incorrectly shared concurrency slots")
+	}
+	releaseOther()
+	releaseFirst()
+	releaseAgain, acquired := acquireMCPExecutionSlot("server", 1)
+	if !acquired {
+		t.Fatal("released MCP execution slot was not reusable")
+	}
+	releaseAgain()
+}
+
+func TestMCPToolsListUsesAllowlistSchemasAndMetadata(t *testing.T) {
+	dir := t.TempDir()
+	paramCheck := filepath.Join(dir, "param_check.js")
+	outCheck := filepath.Join(dir, "out_check.js")
+	writeTestFile(t, paramCheck, `
+const nyanInputSchema = {
+  type: "object",
+  properties: {id: {type: "integer"}},
+  required: ["id"],
+  additionalProperties: false
+};
+({success:true,status:200,error:null});
+`)
+	writeTestFile(t, outCheck, `
+const nyanOutputSchema = {
+  type: "object",
+  properties: {success: {type: "boolean"}},
+  required: ["success"]
+};
+({success:true,status:200,error:null});
+`)
+	readOnly := true
+	destructive := false
+	openWorld := false
+	snapshot := newAPIConfigSnapshot(map[string]APIConfig{
+		"listed": {ParamCheck: paramCheck, OutCheck: outCheck, Description: "Fallback description"},
+		"hidden": {Description: "Must not be exposed"},
+	}, "", [sha256.Size]byte{})
+	serverConfig := APIConfig{Tools: []MCPToolConfig{{
+		Name:  "get_stamp",
+		API:   "listed",
+		Title: "Get stamp",
+		SecuritySchemes: []MCPSecurityScheme{{
+			Type:   "oauth2",
+			Scopes: []string{"stamps:read"},
+		}},
+		Annotations: MCPToolAnnotations{ReadOnlyHint: &readOnly, DestructiveHint: &destructive, OpenWorldHint: &openWorld},
+	}}}
+	rec := performTestMCPRequest(t, snapshot, serverConfig, `{"jsonrpc":"2.0","id":"list-1","method":"tools/list","params":{}}`, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	response := decodeTestJSONObject(t, rec.Body.Bytes())
+	result := response["result"].(map[string]interface{})
+	tools := result["tools"].([]interface{})
+	if len(tools) != 1 {
+		t.Fatalf("tools = %#v, want one allowlisted tool", tools)
+	}
+	tool := tools[0].(map[string]interface{})
+	if tool["name"] != "get_stamp" || tool["title"] != "Get stamp" || tool["description"] != "Fallback description" {
+		t.Fatalf("tool identity = %#v", tool)
+	}
+	input := tool["inputSchema"].(map[string]interface{})
+	if !reflect.DeepEqual(input["required"], []interface{}{"id"}) || input["additionalProperties"] != false {
+		t.Fatalf("input schema = %#v", input)
+	}
+	if _, ok := tool["outputSchema"].(map[string]interface{}); !ok {
+		t.Fatalf("output schema = %#v", tool["outputSchema"])
+	}
+	annotations := tool["annotations"].(map[string]interface{})
+	if annotations["readOnlyHint"] != true || annotations["destructiveHint"] != false || annotations["openWorldHint"] != false {
+		t.Fatalf("annotations = %#v", annotations)
+	}
+	security := tool["securitySchemes"].([]interface{})
+	if len(security) != 1 || security[0].(map[string]interface{})["type"] != "oauth2" {
+		t.Fatalf("securitySchemes = %#v", security)
+	}
+	metaSecurity := tool["_meta"].(map[string]interface{})["securitySchemes"].([]interface{})
+	if !reflect.DeepEqual(security, metaSecurity) {
+		t.Fatalf("top-level and _meta securitySchemes differ: %#v / %#v", security, metaSecurity)
+	}
+}
+
+func TestMCPToolCallValidatesArgumentsAndHonorsGuard(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	dir := t.TempDir()
+	guardScript := filepath.Join(dir, "guard.js")
+	paramCheck := filepath.Join(dir, "param_check.js")
+	targetScript := filepath.Join(dir, "target.js")
+	writeTestFile(t, guardScript, `
+(function () {
+  const challenge = 'Bearer resource_metadata="http://localhost/.well-known/oauth-protected-resource/mcp"';
+  if (nyanRequest.headers.authorization !== "Bearer good-token") {
+    return JSON.stringify({allow:false,status:401,headers:{"WWW-Authenticate":challenge},mcpMeta:{"mcp/www_authenticate":[challenge]}});
+  }
+  return JSON.stringify({allow:true,status:200,principal:{subject:"user-1"}});
+})()
+`)
+	writeTestFile(t, paramCheck, `
+const nyanInputSchema = {
+  type: "object",
+  properties: {id: {type: "integer"}},
+  required: ["id"],
+  additionalProperties: false
+};
+({success:true,status:200,error:null});
+`)
+	writeTestFile(t, targetScript, `
+JSON.stringify({success:true,status:200,result:{id:nyanAllParams.id,subject:nyanAllParams.nyan_guard.subject}});
+`)
+	snapshot := newAPIConfigSnapshot(map[string]APIConfig{
+		"guard": {
+			Script:  guardScript,
+			HTTP:    &HTTPAPIConfig{Access: configuredHTTPAccessInternal, ResponseMode: configuredHTTPResponseRaw},
+			Runtime: APIRuntimeConfig{},
+		},
+		"target": {Script: targetScript, ParamCheck: paramCheck, Description: "target"},
+	}, "", [sha256.Size]byte{})
+	serverConfig := APIConfig{
+		Resource: "http://localhost/mcp",
+		Guard:    MCPGuardConfig{API: "guard"},
+		Tools: []MCPToolConfig{{
+			Name: "target",
+			API:  "target",
+			SecuritySchemes: []MCPSecurityScheme{{
+				Type:   "oauth2",
+				Scopes: []string{"target:read"},
+			}},
+		}},
+	}
+
+	invalid := performTestMCPRequest(t, snapshot, serverConfig, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"target","arguments":{"id":"not-an-integer"}}}`, "Bearer good-token")
+	invalidResponse := decodeTestJSONObject(t, invalid.Body.Bytes())
+	invalidResult := invalidResponse["result"].(map[string]interface{})
+	if invalidResult["isError"] != true || !strings.Contains(invalidResult["content"].([]interface{})[0].(map[string]interface{})["text"].(string), "arguments") {
+		t.Fatalf("invalid argument result = %#v", invalidResult)
+	}
+
+	denied := performTestMCPRequest(t, snapshot, serverConfig, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"target","arguments":{"id":7}}}`, "")
+	if denied.Code != http.StatusUnauthorized {
+		t.Fatalf("denied HTTP status = %d; body=%s", denied.Code, denied.Body.String())
+	}
+	if got := denied.Header().Get("WWW-Authenticate"); !strings.Contains(got, "resource_metadata=") {
+		t.Fatalf("WWW-Authenticate = %q", got)
+	}
+	deniedResult := decodeTestJSONObject(t, denied.Body.Bytes())["result"].(map[string]interface{})
+	if deniedResult["isError"] != true {
+		t.Fatalf("denied result = %#v", deniedResult)
+	}
+	meta := deniedResult["_meta"].(map[string]interface{})
+	if len(meta["mcp/www_authenticate"].([]interface{})) != 1 {
+		t.Fatalf("denied MCP metadata = %#v", meta)
+	}
+
+	allowed := performTestMCPRequest(t, snapshot, serverConfig, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"target","arguments":{"id":7}}}`, "Bearer good-token")
+	if allowed.Code != http.StatusOK {
+		t.Fatalf("allowed HTTP status = %d; body=%s", allowed.Code, allowed.Body.String())
+	}
+	allowedResponse := decodeTestJSONObject(t, allowed.Body.Bytes())
+	if _, exists := allowedResponse["error"]; exists {
+		t.Fatalf("allowed response = %#v", allowedResponse)
+	}
+	allowedResult := allowedResponse["result"].(map[string]interface{})
+	structured := allowedResult["structuredContent"].(map[string]interface{})
+	result := structured["result"].(map[string]interface{})
+	if result["id"] != float64(7) || result["subject"] != "user-1" {
+		t.Fatalf("structuredContent = %#v", structured)
+	}
+	if len(allowedResult["content"].([]interface{})) != 1 {
+		t.Fatalf("content = %#v", allowedResult["content"])
+	}
+}
+
+func TestOAuthSQLiteEndToEndWithRealAssets(t *testing.T) {
+	resetJavascriptInclude(t)
+	testDB := setTestSQLiteDB(t)
+	migrateOAuthTestDatabase(t, testDB)
+
+	oldConfig := config
+	config.BasicAuth = BasicAuthConfig{Username: "admin", Password: "bootstrap-secret"}
+	t.Cleanup(func() { config = oldConfig })
+
+	targetScript := writeTestScript(t, `
+JSON.stringify({
+  success: true,
+  status: 200,
+  result: {
+    echo: nyanAllParams.echo,
+    api: nyanAllParams.api,
+    username: nyanAllParams.nyan_guard.username,
+    clientId: nyanAllParams.nyan_guard.clientId,
+    hasInjectedMode: Object.prototype.hasOwnProperty.call(nyanAllParams, "nyan_mode"),
+    hasInjectedRequest: Object.prototype.hasOwnProperty.call(nyanAllParams, "nyan_request")
+  }
+});
+`)
+	snapshot := newOAuthIntegrationTestSnapshot(t, targetScript)
+	setTestAPISnapshot(t, snapshot)
+
+	oversized := strings.Repeat("x", maxConfiguredHTTPBodyBytes+1)
+	tooLargeRegister := performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/register", "application/json", oversized, nil)
+	if tooLargeRegister.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized registration status = %d, want %d; body=%s", tooLargeRegister.Code, http.StatusRequestEntityTooLarge, tooLargeRegister.Body.String())
+	}
+	var clientCount int
+	if err := testDB.QueryRow(`SELECT COUNT(*) FROM oauth_clients`).Scan(&clientCount); err != nil {
+		t.Fatal(err)
+	}
+	if clientCount != 0 {
+		t.Fatalf("clients after oversized registration = %d, want 0", clientCount)
+	}
+	tooLargeMCP := performOAuthTestMCPRequest(t, oversized, "")
+	if tooLargeMCP.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized MCP status = %d, want %d; body=%s", tooLargeMCP.Code, http.StatusRequestEntityTooLarge, tooLargeMCP.Body.String())
+	}
+
+	protectedMetadata := performOAuthTestHTTPRequest(t, http.MethodGet, "/.well-known/oauth-protected-resource/mcp", "", "", nil)
+	if protectedMetadata.Code != http.StatusOK {
+		t.Fatalf("protected resource metadata status = %d; body=%s", protectedMetadata.Code, protectedMetadata.Body.String())
+	}
+	protectedMetadataBody := decodeTestJSONObject(t, protectedMetadata.Body.Bytes())
+	if protectedMetadataBody["resource"] != oauthIntegrationTestResource || !reflect.DeepEqual(protectedMetadataBody["authorization_servers"], []interface{}{oauthIntegrationTestIssuer}) || !reflect.DeepEqual(protectedMetadataBody["scopes_supported"], []interface{}{"stamps:read", "offline_access"}) {
+		t.Fatalf("protected resource metadata = %#v", protectedMetadataBody)
+	}
+	authorizationMetadata := performOAuthTestHTTPRequest(t, http.MethodGet, "/.well-known/oauth-authorization-server", "", "", nil)
+	if authorizationMetadata.Code != http.StatusOK {
+		t.Fatalf("authorization server metadata status = %d; body=%s", authorizationMetadata.Code, authorizationMetadata.Body.String())
+	}
+	authorizationMetadataBody := decodeTestJSONObject(t, authorizationMetadata.Body.Bytes())
+	if authorizationMetadataBody["issuer"] != oauthIntegrationTestIssuer || authorizationMetadataBody["authorization_endpoint"] != oauthIntegrationTestIssuer+"/oauth/authorize" || !reflect.DeepEqual(authorizationMetadataBody["code_challenge_methods_supported"], []interface{}{"S256"}) || !reflect.DeepEqual(authorizationMetadataBody["grant_types_supported"], []interface{}{"authorization_code", "refresh_token"}) {
+		t.Fatalf("authorization server metadata = %#v", authorizationMetadataBody)
+	}
+
+	bootstrap := performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/admin/users", "application/json", `{
+		"username":"integration-user",
+		"password":"correct horse battery staple",
+		"display_name":"Integration User"
+	}`, func(req *http.Request) {
+		req.SetBasicAuth("admin", "bootstrap-secret")
+	})
+	if bootstrap.Code != http.StatusOK {
+		t.Fatalf("bootstrap status = %d; body=%s", bootstrap.Code, bootstrap.Body.String())
+	}
+	bootstrapBody := decodeTestJSONObject(t, bootstrap.Body.Bytes())
+	if bootstrapBody["success"] != true {
+		t.Fatalf("bootstrap response = %#v", bootstrapBody)
+	}
+	var passwordHash string
+	if err := testDB.QueryRow(`SELECT password_hash FROM oauth_users WHERE username = ?`, "integration-user").Scan(&passwordHash); err != nil {
+		t.Fatal(err)
+	}
+	if passwordHash == "correct horse battery staple" || !strings.HasPrefix(passwordHash, "$argon2id$") {
+		t.Fatalf("stored password hash = %q", passwordHash)
+	}
+
+	const callbackURL = "https://chatgpt.com/connector/oauth/integration-callback"
+	badDCR := performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/register", "application/json", `{
+		"client_name":"Untrusted redirect",
+		"redirect_uris":["https://attacker.example/callback"],
+		"grant_types":["authorization_code","refresh_token"],
+		"response_types":["code"],
+		"token_endpoint_auth_method":"none",
+		"scope":"stamps:read offline_access"
+	}`, nil)
+	if badDCR.Code != http.StatusBadRequest {
+		t.Fatalf("untrusted DCR status = %d; body=%s", badDCR.Code, badDCR.Body.String())
+	}
+
+	const registrationBody = `{
+			"client_name":"ChatGPT integration test",
+			"redirect_uris":["https://chatgpt.com/connector/oauth/integration-callback"],
+			"response_types":["code"],
+			"token_endpoint_auth_method":"none"
+		}`
+	dcr := performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/register", "application/json", registrationBody, nil)
+	if dcr.Code != http.StatusCreated {
+		t.Fatalf("DCR status = %d; body=%s", dcr.Code, dcr.Body.String())
+	}
+	dcrBody := decodeTestJSONObject(t, dcr.Body.Bytes())
+	clientID, _ := dcrBody["client_id"].(string)
+	if !strings.HasPrefix(clientID, "nyan_client_") || dcrBody["token_endpoint_auth_method"] != "none" || !reflect.DeepEqual(dcrBody["grant_types"], []interface{}{"authorization_code", "refresh_token"}) || dcrBody["scope"] != "stamps:read offline_access" {
+		t.Fatalf("DCR response = %#v", dcrBody)
+	}
+	capacityDCR := performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/register", "application/json", registrationBody, nil)
+	if capacityDCR.Code != http.StatusServiceUnavailable {
+		t.Fatalf("DCR capacity status = %d; body=%s", capacityDCR.Code, capacityDCR.Body.String())
+	}
+
+	const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	challenge := sha256Base64URL(verifier)
+	authorizationTarget := func(redirectURI, resource string) string {
+		query := url.Values{
+			"response_type":         {"code"},
+			"client_id":             {clientID},
+			"redirect_uri":          {redirectURI},
+			"resource":              {resource},
+			"scope":                 {"stamps:read offline_access"},
+			"state":                 {"state-integration"},
+			"code_challenge":        {challenge},
+			"code_challenge_method": {"S256"},
+		}
+		return "/oauth/authorize?" + query.Encode()
+	}
+
+	badRedirect := performOAuthTestHTTPRequest(t, http.MethodGet, authorizationTarget("https://attacker.example/callback", oauthIntegrationTestResource), "", "", nil)
+	if badRedirect.Code != http.StatusBadRequest {
+		t.Fatalf("unregistered redirect status = %d, want %d; location=%q body=%s", badRedirect.Code, http.StatusBadRequest, badRedirect.Header().Get("Location"), badRedirect.Body.String())
+	}
+	if badRedirect.Header().Get("Location") != "" {
+		t.Fatalf("unregistered redirect was followed: %q", badRedirect.Header().Get("Location"))
+	}
+
+	badResource := performOAuthTestHTTPRequest(t, http.MethodGet, authorizationTarget(callbackURL, "https://server.example/wrong-resource"), "", "", nil)
+	if badResource.Code != http.StatusFound {
+		t.Fatalf("invalid resource authorization status = %d; body=%s", badResource.Code, badResource.Body.String())
+	}
+	badResourceLocation, err := url.Parse(badResource.Header().Get("Location"))
+	if err != nil || badResourceLocation.Query().Get("error") != "invalid_target" || badResourceLocation.Query().Get("state") != "state-integration" {
+		t.Fatalf("invalid resource redirect = %q, error=%v", badResource.Header().Get("Location"), err)
+	}
+
+	authorizeGET := performOAuthTestHTTPRequest(t, http.MethodGet, authorizationTarget(callbackURL, oauthIntegrationTestResource), "", "", nil)
+	if authorizeGET.Code != http.StatusOK || !strings.Contains(authorizeGET.Header().Get("Content-Type"), "text/html") {
+		t.Fatalf("authorize GET status = %d headers=%#v body=%s", authorizeGET.Code, authorizeGET.Header(), authorizeGET.Body.String())
+	}
+	if authorizeGET.Header().Get("Referrer-Policy") != "strict-origin" {
+		t.Fatalf("authorize Referrer-Policy = %q, want strict-origin", authorizeGET.Header().Get("Referrer-Policy"))
+	}
+	wantAuthorizeCSP := "default-src 'none'; form-action 'self' https://chatgpt.com; base-uri 'none'; frame-ancestors 'none'"
+	if got := authorizeGET.Header().Get("Content-Security-Policy"); got != wantAuthorizeCSP {
+		t.Fatalf("authorize Content-Security-Policy = %q, want %q", got, wantAuthorizeCSP)
+	}
+	requestID := extractTestHTMLInputValue(t, authorizeGET.Body.String(), "request_id")
+	var csrfCookie *http.Cookie
+	for _, cookie := range authorizeGET.Result().Cookies() {
+		if strings.HasPrefix(cookie.Name, "nyan_oauth_csrf_") {
+			csrfCookie = cookie
+			break
+		}
+	}
+	expectedCSRFCookieName := "nyan_oauth_csrf_" + sha256Hash(requestID)[:32]
+	if csrfCookie == nil || csrfCookie.Name != expectedCSRFCookieName || csrfCookie.Value == "" || !csrfCookie.HttpOnly || !csrfCookie.Secure {
+		t.Fatalf("authorization CSRF cookie = %#v", csrfCookie)
+	}
+
+	parallelAuthorizeGET := performOAuthTestHTTPRequest(t, http.MethodGet, authorizationTarget(callbackURL, oauthIntegrationTestResource), "", "", nil)
+	if parallelAuthorizeGET.Code != http.StatusOK {
+		t.Fatalf("parallel authorize GET status = %d; body=%s", parallelAuthorizeGET.Code, parallelAuthorizeGET.Body.String())
+	}
+	parallelRequestID := extractTestHTMLInputValue(t, parallelAuthorizeGET.Body.String(), "request_id")
+	var parallelCSRFCookie *http.Cookie
+	for _, cookie := range parallelAuthorizeGET.Result().Cookies() {
+		if strings.HasPrefix(cookie.Name, "nyan_oauth_csrf_") {
+			parallelCSRFCookie = cookie
+			break
+		}
+	}
+	if parallelCSRFCookie == nil || parallelCSRFCookie.Name == csrfCookie.Name || parallelCSRFCookie.Name != "nyan_oauth_csrf_"+sha256Hash(parallelRequestID)[:32] {
+		t.Fatalf("parallel authorization CSRF cookies = first:%#v second:%#v", csrfCookie, parallelCSRFCookie)
+	}
+
+	authorizeForm := url.Values{
+		"request_id": {requestID},
+		"decision":   {"allow"},
+		"username":   {"integration-user"},
+		"password":   {"correct horse battery staple"},
+	}
+	authorizePOST := performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/authorize", "application/x-www-form-urlencoded", authorizeForm.Encode(), func(req *http.Request) {
+		req.AddCookie(csrfCookie)
+		req.AddCookie(parallelCSRFCookie)
+	})
+	if authorizePOST.Code != http.StatusSeeOther {
+		t.Fatalf("authorize POST status = %d; body=%s", authorizePOST.Code, authorizePOST.Body.String())
+	}
+	clearedCSRFCookies := authorizePOST.Result().Cookies()
+	if len(clearedCSRFCookies) != 1 {
+		t.Fatalf("cleared authorization CSRF cookies = %#v", clearedCSRFCookies)
+	}
+	clearedCSRFCookie := clearedCSRFCookies[0]
+	if clearedCSRFCookie.Name != csrfCookie.Name || clearedCSRFCookie.MaxAge >= 0 {
+		t.Fatalf("cleared authorization CSRF cookie = %#v", clearedCSRFCookie)
+	}
+	callback, err := url.Parse(authorizePOST.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse authorize redirect %q: %v", authorizePOST.Header().Get("Location"), err)
+	}
+	code := callback.Query().Get("code")
+	if callback.Scheme+"://"+callback.Host+callback.Path != callbackURL || !strings.HasPrefix(code, "nyan_ac_") || callback.Query().Get("state") != "state-integration" {
+		t.Fatalf("authorize redirect = %q", callback.String())
+	}
+
+	denyForm := url.Values{
+		"request_id": {parallelRequestID},
+		"decision":   {"deny"},
+	}
+	denyPOST := performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/authorize", "application/x-www-form-urlencoded", denyForm.Encode(), func(req *http.Request) {
+		req.AddCookie(csrfCookie)
+		req.AddCookie(parallelCSRFCookie)
+	})
+	if denyPOST.Code != http.StatusSeeOther {
+		t.Fatalf("parallel authorize denial status = %d; body=%s", denyPOST.Code, denyPOST.Body.String())
+	}
+	denialCallback, err := url.Parse(denyPOST.Header().Get("Location"))
+	if err != nil || denialCallback.Query().Get("error") != "access_denied" || denialCallback.Query().Get("state") != "state-integration" {
+		t.Fatalf("parallel authorize denial redirect = %q, error=%v", denyPOST.Header().Get("Location"), err)
+	}
+	clearedParallelCSRFCookies := denyPOST.Result().Cookies()
+	if len(clearedParallelCSRFCookies) != 1 {
+		t.Fatalf("cleared parallel authorization CSRF cookies = %#v", clearedParallelCSRFCookies)
+	}
+	clearedParallelCSRFCookie := clearedParallelCSRFCookies[0]
+	if clearedParallelCSRFCookie.Name != parallelCSRFCookie.Name || clearedParallelCSRFCookie.MaxAge >= 0 {
+		t.Fatalf("cleared parallel authorization CSRF cookie = %#v", clearedParallelCSRFCookie)
+	}
+
+	var storedCodeHash string
+	var consumedAt sql.NullInt64
+	if err := testDB.QueryRow(`SELECT code_hash, consumed_at FROM oauth_authorization_codes WHERE client_id = ?`, clientID).Scan(&storedCodeHash, &consumedAt); err != nil {
+		t.Fatal(err)
+	}
+	if storedCodeHash == code || storedCodeHash != sha256Hash(code) || strings.Contains(storedCodeHash, code) || consumedAt.Valid {
+		t.Fatalf("stored authorization code = hash:%q plaintext:%q consumed:%#v", storedCodeHash, code, consumedAt)
+	}
+
+	tokenRequest := func(codeValue, verifierValue, redirectURI, resource string) *httptest.ResponseRecorder {
+		form := url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {codeValue},
+			"client_id":     {clientID},
+			"redirect_uri":  {redirectURI},
+			"code_verifier": {verifierValue},
+			"resource":      {resource},
+		}
+		return performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/token", "application/x-www-form-urlencoded", form.Encode(), nil)
+	}
+
+	wrongResourceToken := tokenRequest(code, verifier, callbackURL, "https://server.example/wrong-resource")
+	if wrongResourceToken.Code != http.StatusBadRequest || decodeTestJSONObject(t, wrongResourceToken.Body.Bytes())["error"] != "invalid_target" {
+		t.Fatalf("wrong resource token response = status:%d body:%s", wrongResourceToken.Code, wrongResourceToken.Body.String())
+	}
+	wrongRedirectToken := tokenRequest(code, verifier, "https://chatgpt.com/connector/oauth/another-callback", oauthIntegrationTestResource)
+	if wrongRedirectToken.Code != http.StatusBadRequest || decodeTestJSONObject(t, wrongRedirectToken.Body.Bytes())["error"] != "invalid_grant" {
+		t.Fatalf("wrong redirect token response = status:%d body:%s", wrongRedirectToken.Code, wrongRedirectToken.Body.String())
+	}
+	wrongVerifierToken := tokenRequest(code, strings.Repeat("A", 43), callbackURL, oauthIntegrationTestResource)
+	if wrongVerifierToken.Code != http.StatusBadRequest || decodeTestJSONObject(t, wrongVerifierToken.Body.Bytes())["error"] != "invalid_grant" {
+		t.Fatalf("wrong PKCE token response = status:%d body:%s", wrongVerifierToken.Code, wrongVerifierToken.Body.String())
+	}
+	if err := testDB.QueryRow(`SELECT consumed_at FROM oauth_authorization_codes WHERE code_hash = ?`, storedCodeHash).Scan(&consumedAt); err != nil {
+		t.Fatal(err)
+	}
+	if consumedAt.Valid {
+		t.Fatalf("authorization code consumed by a rejected token request: %#v", consumedAt)
+	}
+
+	tokenResponse := tokenRequest(code, verifier, callbackURL, oauthIntegrationTestResource)
+	if tokenResponse.Code != http.StatusOK {
+		t.Fatalf("token status = %d; body=%s", tokenResponse.Code, tokenResponse.Body.String())
+	}
+	tokenBody := decodeTestJSONObject(t, tokenResponse.Body.Bytes())
+	accessToken, _ := tokenBody["access_token"].(string)
+	refreshToken, _ := tokenBody["refresh_token"].(string)
+	if !strings.HasPrefix(accessToken, "nyan_at_") || !strings.HasPrefix(refreshToken, "nyan_rt_") || tokenBody["token_type"] != "Bearer" || tokenBody["scope"] != "stamps:read offline_access" {
+		t.Fatalf("token response = %#v", tokenBody)
+	}
+
+	codeReuse := tokenRequest(code, verifier, callbackURL, oauthIntegrationTestResource)
+	if codeReuse.Code != http.StatusBadRequest || decodeTestJSONObject(t, codeReuse.Body.Bytes())["error"] != "invalid_grant" {
+		t.Fatalf("authorization code reuse response = status:%d body:%s", codeReuse.Code, codeReuse.Body.String())
+	}
+
+	var storedTokenHash string
+	var revokedAt sql.NullInt64
+	var refreshFamilyID sql.NullInt64
+	if err := testDB.QueryRow(`SELECT token_hash, revoked_at, refresh_family_id FROM oauth_access_tokens WHERE client_id = ?`, clientID).Scan(&storedTokenHash, &revokedAt, &refreshFamilyID); err != nil {
+		t.Fatal(err)
+	}
+	if storedTokenHash == accessToken || storedTokenHash != sha256Hash(accessToken) || strings.Contains(storedTokenHash, accessToken) || revokedAt.Valid || !refreshFamilyID.Valid {
+		t.Fatalf("stored access token = hash:%q plaintext:%q revoked:%#v family:%#v", storedTokenHash, accessToken, revokedAt, refreshFamilyID)
+	}
+
+	var initialRefreshID int64
+	var initialRefreshFamilyID int64
+	var storedRefreshHash string
+	var refreshParentID sql.NullInt64
+	var refreshConsumedAt sql.NullInt64
+	var refreshRevokedAt sql.NullInt64
+	var refreshFamilyRevokedAt sql.NullInt64
+	if err := testDB.QueryRow(`
+		SELECT rt.id, rt.family_id, rt.token_hash, rt.parent_id, rt.consumed_at, rt.revoked_at, f.revoked_at
+		FROM oauth_refresh_tokens AS rt
+		JOIN oauth_refresh_token_families AS f ON f.id = rt.family_id
+		WHERE rt.token_hash = ?`, sha256Hash(refreshToken)).Scan(
+		&initialRefreshID,
+		&initialRefreshFamilyID,
+		&storedRefreshHash,
+		&refreshParentID,
+		&refreshConsumedAt,
+		&refreshRevokedAt,
+		&refreshFamilyRevokedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if storedRefreshHash == refreshToken || storedRefreshHash != sha256Hash(refreshToken) || strings.Contains(storedRefreshHash, refreshToken) || refreshParentID.Valid || refreshConsumedAt.Valid || refreshRevokedAt.Valid || refreshFamilyRevokedAt.Valid || refreshFamilyID.Int64 <= 0 || refreshFamilyID.Int64 != initialRefreshFamilyID {
+		t.Fatalf("stored refresh token = hash:%q plaintext:%q parent:%#v consumed:%#v revoked:%#v familyRevoked:%#v family:%#v", storedRefreshHash, refreshToken, refreshParentID, refreshConsumedAt, refreshRevokedAt, refreshFamilyRevokedAt, refreshFamilyID)
+	}
+
+	mcpCallBody := `{"jsonrpc":"2.0","id":"oauth-e2e","method":"tools/call","params":{"name":"oauth_e2e","arguments":{"echo":"hello","api":"attacker","nyan_mode":"checkOnly","nyan_guard":{"username":"attacker"},"nyan_request":{"headers":{"authorization":"Bearer attacker"}}}}}`
+	authorizedMCP := performOAuthTestMCPRequest(t, mcpCallBody, "Bearer "+accessToken)
+	if authorizedMCP.Code != http.StatusOK {
+		t.Fatalf("authorized MCP status = %d; headers=%#v body=%s", authorizedMCP.Code, authorizedMCP.Header(), authorizedMCP.Body.String())
+	}
+	authorizedResponse := decodeTestJSONObject(t, authorizedMCP.Body.Bytes())
+	if _, exists := authorizedResponse["error"]; exists {
+		t.Fatalf("authorized MCP response = %#v", authorizedResponse)
+	}
+	structured := authorizedResponse["result"].(map[string]interface{})["structuredContent"].(map[string]interface{})
+	toolResult := structured["result"].(map[string]interface{})
+	if toolResult["echo"] != "hello" || toolResult["api"] != "oauth_e2e_target" || toolResult["username"] != "integration-user" || toolResult["clientId"] != clientID || toolResult["hasInjectedMode"] != false || toolResult["hasInjectedRequest"] != false {
+		t.Fatalf("authorized MCP structured result = %#v", toolResult)
+	}
+
+	refreshTokenRequest := func(refreshValue, requestClientID, resource, requestedScope string) *httptest.ResponseRecorder {
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {refreshValue},
+			"client_id":     {requestClientID},
+			"resource":      {resource},
+		}
+		if requestedScope != "" {
+			form.Set("scope", requestedScope)
+		}
+		return performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/token", "application/x-www-form-urlencoded", form.Encode(), nil)
+	}
+
+	wrongClientRefresh := refreshTokenRequest(refreshToken, clientID+"-other", oauthIntegrationTestResource, "")
+	if wrongClientRefresh.Code != http.StatusBadRequest || decodeTestJSONObject(t, wrongClientRefresh.Body.Bytes())["error"] != "invalid_grant" {
+		t.Fatalf("wrong client refresh response = status:%d body:%s", wrongClientRefresh.Code, wrongClientRefresh.Body.String())
+	}
+	wrongResourceRefresh := refreshTokenRequest(refreshToken, clientID, "https://server.example/wrong-resource", "")
+	if wrongResourceRefresh.Code != http.StatusBadRequest || decodeTestJSONObject(t, wrongResourceRefresh.Body.Bytes())["error"] != "invalid_target" {
+		t.Fatalf("wrong resource refresh response = status:%d body:%s", wrongResourceRefresh.Code, wrongResourceRefresh.Body.String())
+	}
+	elevatedScopeRefresh := refreshTokenRequest(refreshToken, clientID, oauthIntegrationTestResource, "stamps:read offline_access stamps:write")
+	if elevatedScopeRefresh.Code != http.StatusBadRequest || decodeTestJSONObject(t, elevatedScopeRefresh.Body.Bytes())["error"] != "invalid_scope" {
+		t.Fatalf("elevated scope refresh response = status:%d body:%s", elevatedScopeRefresh.Code, elevatedScopeRefresh.Body.String())
+	}
+	if err := testDB.QueryRow(`SELECT consumed_at FROM oauth_refresh_tokens WHERE id = ?`, initialRefreshID).Scan(&refreshConsumedAt); err != nil {
+		t.Fatal(err)
+	}
+	if refreshConsumedAt.Valid {
+		t.Fatal("refresh token was consumed by a rejected refresh request")
+	}
+
+	rotatedResponse := refreshTokenRequest(refreshToken, clientID, oauthIntegrationTestResource, "stamps:read")
+	if rotatedResponse.Code != http.StatusOK {
+		t.Fatalf("refresh rotation status = %d; body=%s", rotatedResponse.Code, rotatedResponse.Body.String())
+	}
+	rotatedBody := decodeTestJSONObject(t, rotatedResponse.Body.Bytes())
+	rotatedAccessToken, _ := rotatedBody["access_token"].(string)
+	rotatedRefreshToken, _ := rotatedBody["refresh_token"].(string)
+	if !strings.HasPrefix(rotatedAccessToken, "nyan_at_") || !strings.HasPrefix(rotatedRefreshToken, "nyan_rt_") || rotatedAccessToken == accessToken || rotatedRefreshToken == refreshToken || rotatedBody["scope"] != "stamps:read" {
+		t.Fatalf("refresh rotation response = %#v", rotatedBody)
+	}
+
+	if err := testDB.QueryRow(`SELECT consumed_at, revoked_at FROM oauth_refresh_tokens WHERE id = ?`, initialRefreshID).Scan(&refreshConsumedAt, &refreshRevokedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !refreshConsumedAt.Valid || refreshRevokedAt.Valid {
+		t.Fatalf("rotated source refresh token = consumed:%#v revoked:%#v", refreshConsumedAt, refreshRevokedAt)
+	}
+	var rotatedRefreshID int64
+	var rotatedRefreshFamilyID int64
+	var rotatedRefreshParentID sql.NullInt64
+	var rotatedRefreshHash string
+	var rotatedRefreshScope string
+	var rotatedFamilyScope string
+	if err := testDB.QueryRow(`
+		SELECT rt.id, rt.family_id, rt.parent_id, rt.token_hash, rt.scope, rf.scope
+		FROM oauth_refresh_tokens AS rt
+		JOIN oauth_refresh_token_families AS rf ON rf.id = rt.family_id
+		WHERE rt.token_hash = ?`, sha256Hash(rotatedRefreshToken)).Scan(
+		&rotatedRefreshID,
+		&rotatedRefreshFamilyID,
+		&rotatedRefreshParentID,
+		&rotatedRefreshHash,
+		&rotatedRefreshScope,
+		&rotatedFamilyScope,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if rotatedRefreshFamilyID != initialRefreshFamilyID || !rotatedRefreshParentID.Valid || rotatedRefreshParentID.Int64 != initialRefreshID || rotatedRefreshHash != sha256Hash(rotatedRefreshToken) || rotatedRefreshHash == rotatedRefreshToken || rotatedRefreshScope != "stamps:read offline_access" || rotatedFamilyScope != "stamps:read offline_access" {
+		t.Fatalf("rotated refresh token = id:%d family:%d parent:%#v hash:%q scope:%q familyScope:%q", rotatedRefreshID, rotatedRefreshFamilyID, rotatedRefreshParentID, rotatedRefreshHash, rotatedRefreshScope, rotatedFamilyScope)
+	}
+	var rotatedAccessFamilyID sql.NullInt64
+	if err := testDB.QueryRow(`SELECT refresh_family_id FROM oauth_access_tokens WHERE token_hash = ?`, sha256Hash(rotatedAccessToken)).Scan(&rotatedAccessFamilyID); err != nil {
+		t.Fatal(err)
+	}
+	if !rotatedAccessFamilyID.Valid || rotatedAccessFamilyID.Int64 != initialRefreshFamilyID {
+		t.Fatalf("rotated access-token family = %#v, want %d", rotatedAccessFamilyID, initialRefreshFamilyID)
+	}
+	rotatedMCP := performOAuthTestMCPRequest(t, mcpCallBody, "Bearer "+rotatedAccessToken)
+	if rotatedMCP.Code != http.StatusOK {
+		t.Fatalf("rotated access-token MCP status = %d; body=%s", rotatedMCP.Code, rotatedMCP.Body.String())
+	}
+	rotatedElevatedScope := refreshTokenRequest(rotatedRefreshToken, clientID, oauthIntegrationTestResource, "stamps:read offline_access stamps:write")
+	if rotatedElevatedScope.Code != http.StatusBadRequest || decodeTestJSONObject(t, rotatedElevatedScope.Body.Bytes())["error"] != "invalid_scope" {
+		t.Fatalf("rotated token elevated-scope response = status:%d body:%s", rotatedElevatedScope.Code, rotatedElevatedScope.Body.String())
+	}
+	var rotatedConsumedAt sql.NullInt64
+	if err := testDB.QueryRow(`SELECT consumed_at FROM oauth_refresh_tokens WHERE id = ?`, rotatedRefreshID).Scan(&rotatedConsumedAt); err != nil {
+		t.Fatal(err)
+	}
+	if rotatedConsumedAt.Valid {
+		t.Fatal("rotated refresh token was consumed by an excessive-scope request")
+	}
+
+	replayedRefresh := refreshTokenRequest(refreshToken, clientID, oauthIntegrationTestResource, "")
+	if replayedRefresh.Code != http.StatusBadRequest || decodeTestJSONObject(t, replayedRefresh.Body.Bytes())["error"] != "invalid_grant" {
+		t.Fatalf("refresh replay response = status:%d body:%s", replayedRefresh.Code, replayedRefresh.Body.String())
+	}
+	if err := testDB.QueryRow(`SELECT revoked_at FROM oauth_refresh_token_families WHERE id = ?`, initialRefreshFamilyID).Scan(&refreshFamilyRevokedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !refreshFamilyRevokedAt.Valid {
+		t.Fatal("refresh-token replay did not revoke its family")
+	}
+	var activeRefreshTokens int
+	if err := testDB.QueryRow(`SELECT COUNT(*) FROM oauth_refresh_tokens WHERE family_id = ? AND revoked_at IS NULL`, initialRefreshFamilyID).Scan(&activeRefreshTokens); err != nil {
+		t.Fatal(err)
+	}
+	var activeAccessTokens int
+	if err := testDB.QueryRow(`SELECT COUNT(*) FROM oauth_access_tokens WHERE refresh_family_id = ? AND revoked_at IS NULL`, initialRefreshFamilyID).Scan(&activeAccessTokens); err != nil {
+		t.Fatal(err)
+	}
+	if activeRefreshTokens != 0 || activeAccessTokens != 0 {
+		t.Fatalf("active family credentials after replay = refresh:%d access:%d", activeRefreshTokens, activeAccessTokens)
+	}
+	rotatedAfterReplay := refreshTokenRequest(rotatedRefreshToken, clientID, oauthIntegrationTestResource, "")
+	if rotatedAfterReplay.Code != http.StatusBadRequest || decodeTestJSONObject(t, rotatedAfterReplay.Body.Bytes())["error"] != "invalid_grant" {
+		t.Fatalf("rotated token after replay response = status:%d body:%s", rotatedAfterReplay.Code, rotatedAfterReplay.Body.String())
+	}
+
+	replayedFamilyMCP := performOAuthTestMCPRequest(t, mcpCallBody, "Bearer "+rotatedAccessToken)
+	if replayedFamilyMCP.Code != http.StatusUnauthorized {
+		t.Fatalf("replayed-family MCP status = %d, want %d; body=%s", replayedFamilyMCP.Code, http.StatusUnauthorized, replayedFamilyMCP.Body.String())
+	}
+	if !strings.Contains(replayedFamilyMCP.Header().Get("WWW-Authenticate"), `error="invalid_token"`) ||
+		!strings.Contains(replayedFamilyMCP.Header().Get("WWW-Authenticate"), `error_description="`) {
+		t.Fatalf("replayed-family MCP challenge = %q", replayedFamilyMCP.Header().Get("WWW-Authenticate"))
+	}
+	replayedFamilyResult := decodeTestJSONObject(t, replayedFamilyMCP.Body.Bytes())["result"].(map[string]interface{})
+	if replayedFamilyResult["isError"] != true || len(replayedFamilyResult["_meta"].(map[string]interface{})["mcp/www_authenticate"].([]interface{})) != 1 {
+		t.Fatalf("replayed-family MCP result = %#v", replayedFamilyResult)
+	}
+
+	secondAuthorizeGET := performOAuthTestHTTPRequest(t, http.MethodGet, authorizationTarget(callbackURL, oauthIntegrationTestResource), "", "", nil)
+	if secondAuthorizeGET.Code != http.StatusOK {
+		t.Fatalf("second authorize GET status = %d; body=%s", secondAuthorizeGET.Code, secondAuthorizeGET.Body.String())
+	}
+	secondRequestID := extractTestHTMLInputValue(t, secondAuthorizeGET.Body.String(), "request_id")
+	var secondCSRFCookie *http.Cookie
+	for _, cookie := range secondAuthorizeGET.Result().Cookies() {
+		if cookie.Name == "nyan_oauth_csrf_"+sha256Hash(secondRequestID)[:32] {
+			secondCSRFCookie = cookie
+			break
+		}
+	}
+	if secondCSRFCookie == nil {
+		t.Fatal("second authorization CSRF cookie is missing")
+	}
+	secondAuthorizeForm := url.Values{
+		"request_id": {secondRequestID},
+		"decision":   {"allow"},
+		"username":   {"integration-user"},
+		"password":   {"correct horse battery staple"},
+	}
+	secondAuthorizePOST := performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/authorize", "application/x-www-form-urlencoded", secondAuthorizeForm.Encode(), func(req *http.Request) {
+		req.AddCookie(secondCSRFCookie)
+	})
+	if secondAuthorizePOST.Code != http.StatusSeeOther {
+		t.Fatalf("second authorize POST status = %d; body=%s", secondAuthorizePOST.Code, secondAuthorizePOST.Body.String())
+	}
+	secondCallback, err := url.Parse(secondAuthorizePOST.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCode := secondCallback.Query().Get("code")
+	secondTokenResponse := tokenRequest(secondCode, verifier, callbackURL, oauthIntegrationTestResource)
+	if secondTokenResponse.Code != http.StatusOK {
+		t.Fatalf("second token status = %d; body=%s", secondTokenResponse.Code, secondTokenResponse.Body.String())
+	}
+	secondTokenBody := decodeTestJSONObject(t, secondTokenResponse.Body.Bytes())
+	secondAccessToken, _ := secondTokenBody["access_token"].(string)
+	secondRefreshToken, _ := secondTokenBody["refresh_token"].(string)
+	if secondAccessToken == "" || secondRefreshToken == "" {
+		t.Fatalf("second token response = %#v", secondTokenBody)
+	}
+	var secondRefreshFamilyID int64
+	if err := testDB.QueryRow(`SELECT family_id FROM oauth_refresh_tokens WHERE token_hash = ?`, sha256Hash(secondRefreshToken)).Scan(&secondRefreshFamilyID); err != nil {
+		t.Fatal(err)
+	}
+	revokeForm := url.Values{
+		"token":           {secondRefreshToken},
+		"client_id":       {clientID},
+		"token_type_hint": {"refresh_token"},
+	}
+	revoke := performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/revoke", "application/x-www-form-urlencoded", revokeForm.Encode(), nil)
+	if revoke.Code != http.StatusOK || revoke.Body.Len() != 0 {
+		t.Fatalf("refresh revoke response = status:%d body:%q", revoke.Code, revoke.Body.String())
+	}
+	var explicitlyRevokedFamilyAt sql.NullInt64
+	if err := testDB.QueryRow(`SELECT revoked_at FROM oauth_refresh_token_families WHERE id = ?`, secondRefreshFamilyID).Scan(&explicitlyRevokedFamilyAt); err != nil {
+		t.Fatal(err)
+	}
+	var explicitlyRevokedRefreshAt sql.NullInt64
+	if err := testDB.QueryRow(`SELECT revoked_at FROM oauth_refresh_tokens WHERE token_hash = ?`, sha256Hash(secondRefreshToken)).Scan(&explicitlyRevokedRefreshAt); err != nil {
+		t.Fatal(err)
+	}
+	var explicitlyRevokedAccessAt sql.NullInt64
+	if err := testDB.QueryRow(`SELECT revoked_at FROM oauth_access_tokens WHERE token_hash = ?`, sha256Hash(secondAccessToken)).Scan(&explicitlyRevokedAccessAt); err != nil {
+		t.Fatal(err)
+	}
+	if !explicitlyRevokedFamilyAt.Valid || !explicitlyRevokedRefreshAt.Valid || !explicitlyRevokedAccessAt.Valid {
+		t.Fatalf("explicit refresh revocation = family:%#v refresh:%#v access:%#v", explicitlyRevokedFamilyAt, explicitlyRevokedRefreshAt, explicitlyRevokedAccessAt)
+	}
+	revokedMCP := performOAuthTestMCPRequest(t, mcpCallBody, "Bearer "+secondAccessToken)
+	if revokedMCP.Code != http.StatusUnauthorized {
+		t.Fatalf("explicitly revoked-family MCP status = %d, want %d; body=%s", revokedMCP.Code, http.StatusUnauthorized, revokedMCP.Body.String())
+	}
+}
+
+func TestOAuthRefreshTokenRejectsExpiredAndDisabledPrincipals(t *testing.T) {
+	resetJavascriptInclude(t)
+	testDB := setTestSQLiteDB(t)
+	migrateOAuthTestDatabase(t, testDB)
+
+	const clientID = "refresh-validation-client"
+	if _, err := testDB.Exec(`INSERT INTO oauth_users(id, username, password_hash) VALUES (1, 'refresh-validation-user', 'unused')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testDB.Exec(`INSERT INTO oauth_clients(client_id, client_name, token_endpoint_auth_method, grant_types, response_types, scope) VALUES (?, 'Refresh validation', 'none', '["authorization_code","refresh_token"]', '["code"]', 'stamps:read offline_access')`, clientID); err != nil {
+		t.Fatal(err)
+	}
+	targetScript := writeTestScript(t, `JSON.stringify({success:true,status:200,result:{}});`)
+	setTestAPISnapshot(t, newOAuthIntegrationTestSnapshot(t, targetScript))
+
+	refreshRequest := func(token string) *httptest.ResponseRecorder {
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {token},
+			"client_id":     {clientID},
+			"resource":      {oauthIntegrationTestResource},
+		}
+		return performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/token", "application/x-www-form-urlencoded", form.Encode(), nil)
+	}
+	assertRejectedWithoutConsumption := func(label, token string, tokenID int64) {
+		t.Helper()
+		response := refreshRequest(token)
+		if response.Code != http.StatusBadRequest || decodeTestJSONObject(t, response.Body.Bytes())["error"] != "invalid_grant" {
+			t.Fatalf("%s response = status:%d body:%s", label, response.Code, response.Body.String())
+		}
+		var consumedAt sql.NullInt64
+		if err := testDB.QueryRow(`SELECT consumed_at FROM oauth_refresh_tokens WHERE id = ?`, tokenID).Scan(&consumedAt); err != nil {
+			t.Fatal(err)
+		}
+		if consumedAt.Valid {
+			t.Fatalf("%s token was consumed: %#v", label, consumedAt)
+		}
+	}
+
+	logWriter := log.Writer()
+	var capturedLogs strings.Builder
+	log.SetOutput(&capturedLogs)
+	t.Cleanup(func() { log.SetOutput(logWriter) })
+
+	expiredToken, _, expiredTokenID := seedOAuthRefreshTokenTestRecord(t, testDB, clientID, "expired", time.Now().Add(-time.Minute).Unix())
+	assertRejectedWithoutConsumption("expired refresh token", expiredToken, expiredTokenID)
+
+	disabledUserToken, _, disabledUserTokenID := seedOAuthRefreshTokenTestRecord(t, testDB, clientID, "disabled-user", time.Now().Add(time.Hour).Unix())
+	if _, err := testDB.Exec(`UPDATE oauth_users SET enabled = 0 WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	assertRejectedWithoutConsumption("disabled user", disabledUserToken, disabledUserTokenID)
+	if _, err := testDB.Exec(`UPDATE oauth_users SET enabled = 1 WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+
+	disabledClientToken, _, disabledClientTokenID := seedOAuthRefreshTokenTestRecord(t, testDB, clientID, "disabled-client", time.Now().Add(time.Hour).Unix())
+	if _, err := testDB.Exec(`UPDATE oauth_clients SET enabled = 0 WHERE client_id = ?`, clientID); err != nil {
+		t.Fatal(err)
+	}
+	assertRejectedWithoutConsumption("disabled client", disabledClientToken, disabledClientTokenID)
+	if _, err := testDB.Exec(`UPDATE oauth_clients SET enabled = 1 WHERE client_id = ?`, clientID); err != nil {
+		t.Fatal(err)
+	}
+
+	nearExpiry := time.Now().Add(120 * time.Second).Unix()
+	nearExpiryToken, nearExpiryFamilyID, _ := seedOAuthRefreshTokenTestRecord(t, testDB, clientID, "near-expiry", nearExpiry)
+	nearExpiryResponse := refreshRequest(nearExpiryToken)
+	if nearExpiryResponse.Code != http.StatusOK {
+		t.Fatalf("near-expiry refresh response = status:%d body:%s", nearExpiryResponse.Code, nearExpiryResponse.Body.String())
+	}
+	nearExpiryBody := decodeTestJSONObject(t, nearExpiryResponse.Body.Bytes())
+	nearExpiryAccessToken, _ := nearExpiryBody["access_token"].(string)
+	expiresIn, _ := nearExpiryBody["expires_in"].(float64)
+	if nearExpiryAccessToken == "" || expiresIn <= 0 || expiresIn > 120 {
+		t.Fatalf("near-expiry token response = %#v", nearExpiryBody)
+	}
+	var accessExpiresAt int64
+	if err := testDB.QueryRow(`SELECT expires_at FROM oauth_access_tokens WHERE token_hash = ? AND refresh_family_id = ?`, sha256Hash(nearExpiryAccessToken), nearExpiryFamilyID).Scan(&accessExpiresAt); err != nil {
+		t.Fatal(err)
+	}
+	if accessExpiresAt > nearExpiry {
+		t.Fatalf("near-expiry access expiration = %d, family expiration = %d", accessExpiresAt, nearExpiry)
+	}
+	revokeAccessForm := url.Values{
+		"token":           {nearExpiryAccessToken},
+		"client_id":       {clientID},
+		"token_type_hint": {"access_token"},
+	}
+	revokeAccessResponse := performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/revoke", "application/x-www-form-urlencoded", revokeAccessForm.Encode(), nil)
+	if revokeAccessResponse.Code != http.StatusOK || revokeAccessResponse.Body.Len() != 0 {
+		t.Fatalf("family-bound access-token revoke response = status:%d body:%q", revokeAccessResponse.Code, revokeAccessResponse.Body.String())
+	}
+	var nearExpiryFamilyRevokedAt sql.NullInt64
+	if err := testDB.QueryRow(`SELECT revoked_at FROM oauth_refresh_token_families WHERE id = ?`, nearExpiryFamilyID).Scan(&nearExpiryFamilyRevokedAt); err != nil {
+		t.Fatal(err)
+	}
+	var activeNearExpiryRefreshTokens int
+	if err := testDB.QueryRow(`SELECT COUNT(*) FROM oauth_refresh_tokens WHERE family_id = ? AND revoked_at IS NULL`, nearExpiryFamilyID).Scan(&activeNearExpiryRefreshTokens); err != nil {
+		t.Fatal(err)
+	}
+	var activeNearExpiryAccessTokens int
+	if err := testDB.QueryRow(`SELECT COUNT(*) FROM oauth_access_tokens WHERE refresh_family_id = ? AND revoked_at IS NULL`, nearExpiryFamilyID).Scan(&activeNearExpiryAccessTokens); err != nil {
+		t.Fatal(err)
+	}
+	if !nearExpiryFamilyRevokedAt.Valid || activeNearExpiryRefreshTokens != 0 || activeNearExpiryAccessTokens != 0 {
+		t.Fatalf("family-bound access-token revocation = family:%#v activeRefresh:%d activeAccess:%d", nearExpiryFamilyRevokedAt, activeNearExpiryRefreshTokens, activeNearExpiryAccessTokens)
+	}
+
+	for _, credential := range []string{expiredToken, disabledUserToken, disabledClientToken, nearExpiryToken} {
+		if strings.Contains(capturedLogs.String(), credential) {
+			t.Fatalf("refresh token plaintext was written to logs: %q", credential)
+		}
+	}
+}
+
+func TestOAuthConcurrentRefreshAllowsOneRotationThenRevokesFamily(t *testing.T) {
+	resetJavascriptInclude(t)
+	oldDB := db
+	oldDBType := dbType
+	databasePath := filepath.Join(t.TempDir(), "oauth-refresh-concurrency.db")
+	testDB, err := sql.Open("sqlite3", databasePath+"?_foreign_keys=on&_busy_timeout=5000&_journal_mode=WAL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testDB.SetMaxOpenConns(4)
+	testDB.SetMaxIdleConns(4)
+	if err := testDB.Ping(); err != nil {
+		_ = testDB.Close()
+		t.Fatal(err)
+	}
+	db = testDB
+	dbType = "sqlite3"
+	t.Cleanup(func() {
+		_ = testDB.Close()
+		db = oldDB
+		dbType = oldDBType
+	})
+	migrateOAuthTestDatabase(t, testDB)
+
+	firstConnection, err := testDB.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondConnection, err := testDB.Conn(context.Background())
+	if err != nil {
+		_ = firstConnection.Close()
+		t.Fatal(err)
+	}
+	if stats := testDB.Stats(); stats.MaxOpenConnections < 2 || stats.OpenConnections < 2 {
+		_ = secondConnection.Close()
+		_ = firstConnection.Close()
+		t.Fatalf("SQLite pool does not permit concurrent refresh transactions: %#v", stats)
+	}
+	if err := secondConnection.Close(); err != nil {
+		_ = firstConnection.Close()
+		t.Fatal(err)
+	}
+	if err := firstConnection.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	const clientID = "refresh-concurrency-client"
+	if _, err := testDB.Exec(`INSERT INTO oauth_users(id, username, password_hash) VALUES (1, 'refresh-concurrency-user', 'unused')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testDB.Exec(`INSERT INTO oauth_clients(client_id, client_name, token_endpoint_auth_method, grant_types, response_types, scope) VALUES (?, 'Refresh concurrency', 'none', '["authorization_code","refresh_token"]', '["code"]', 'stamps:read offline_access')`, clientID); err != nil {
+		t.Fatal(err)
+	}
+	targetScript := writeTestScript(t, `JSON.stringify({success:true,status:200,result:{}});`)
+	setTestAPISnapshot(t, newOAuthIntegrationTestSnapshot(t, targetScript))
+
+	refreshToken, familyID, _ := seedOAuthRefreshTokenTestRecord(t, testDB, clientID, "concurrent", time.Now().Add(time.Hour).Unix())
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+		"client_id":     {clientID},
+		"resource":      {oauthIntegrationTestResource},
+	}
+	type refreshResult struct {
+		status int
+		body   []byte
+	}
+	results := make(chan refreshResult, 2)
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			request := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			recorder := httptest.NewRecorder()
+			unifiedHandler(recorder, request)
+			results <- refreshResult{status: recorder.Code, body: append([]byte(nil), recorder.Body.Bytes()...)}
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+
+	successes := 0
+	rejections := 0
+	var successfulAccessToken string
+	for result := range results {
+		body := decodeTestJSONObject(t, result.body)
+		switch {
+		case result.status == http.StatusOK:
+			successes++
+			successfulAccessToken, _ = body["access_token"].(string)
+		case result.status == http.StatusBadRequest && body["error"] == "invalid_grant":
+			rejections++
+		default:
+			t.Fatalf("concurrent refresh response = status:%d body:%s", result.status, result.body)
+		}
+	}
+	if successes != 1 || rejections != 1 || successfulAccessToken == "" {
+		t.Fatalf("concurrent refresh outcomes = successes:%d rejections:%d accessToken:%q", successes, rejections, successfulAccessToken)
+	}
+
+	var familyRevokedAt sql.NullInt64
+	if err := testDB.QueryRow(`SELECT revoked_at FROM oauth_refresh_token_families WHERE id = ?`, familyID).Scan(&familyRevokedAt); err != nil {
+		t.Fatal(err)
+	}
+	var activeRefreshTokens int
+	if err := testDB.QueryRow(`SELECT COUNT(*) FROM oauth_refresh_tokens WHERE family_id = ? AND revoked_at IS NULL`, familyID).Scan(&activeRefreshTokens); err != nil {
+		t.Fatal(err)
+	}
+	var activeAccessTokens int
+	if err := testDB.QueryRow(`SELECT COUNT(*) FROM oauth_access_tokens WHERE refresh_family_id = ? AND revoked_at IS NULL`, familyID).Scan(&activeAccessTokens); err != nil {
+		t.Fatal(err)
+	}
+	if !familyRevokedAt.Valid || activeRefreshTokens != 0 || activeAccessTokens != 0 {
+		t.Fatalf("concurrent replay family state = revoked:%#v activeRefresh:%d activeAccess:%d", familyRevokedAt, activeRefreshTokens, activeAccessTokens)
+	}
+	var successfulAccessRevokedAt sql.NullInt64
+	if err := testDB.QueryRow(`SELECT revoked_at FROM oauth_access_tokens WHERE token_hash = ?`, sha256Hash(successfulAccessToken)).Scan(&successfulAccessRevokedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !successfulAccessRevokedAt.Valid {
+		t.Fatal("access token returned by concurrent rotation survived replay detection")
+	}
+}
+
+func TestConfiguredHTTPRateLimitAndAuthorizationHeaderIsolation(t *testing.T) {
+	configuredHTTPRateBuckets.Lock()
+	oldBuckets := configuredHTTPRateBuckets.Buckets
+	oldCleanup := configuredHTTPRateBuckets.LastCleanup
+	configuredHTTPRateBuckets.Buckets = make(map[string]configuredHTTPRateBucket)
+	configuredHTTPRateBuckets.LastCleanup = time.Time{}
+	configuredHTTPRateBuckets.Unlock()
+	t.Cleanup(func() {
+		configuredHTTPRateBuckets.Lock()
+		configuredHTTPRateBuckets.Buckets = oldBuckets
+		configuredHTTPRateBuckets.LastCleanup = oldCleanup
+		configuredHTTPRateBuckets.Unlock()
+	})
+
+	rateLimited := APIConfig{HTTP: &HTTPAPIConfig{RateLimit: &HTTPRateLimitConfig{Requests: 2, Window: "1m"}}}
+	now := time.Date(2026, time.August, 8, 0, 0, 0, 0, time.UTC)
+	if allowed, _ := configuredHTTPRateLimitAllows("oauth_register", rateLimited, "192.0.2.1:1000", now); !allowed {
+		t.Fatal("first rate-limited request was rejected")
+	}
+	if allowed, _ := configuredHTTPRateLimitAllows("oauth_register", rateLimited, "192.0.2.1:2000", now.Add(time.Second)); !allowed {
+		t.Fatal("second request from same IP was rejected")
+	}
+	if allowed, retryAfter := configuredHTTPRateLimitAllows("oauth_register", rateLimited, "192.0.2.1:3000", now.Add(2*time.Second)); allowed || retryAfter <= 0 {
+		t.Fatalf("third request allowed=%t retryAfter=%s", allowed, retryAfter)
+	}
+	if allowed, _ := configuredHTTPRateLimitAllows("oauth_register", rateLimited, "192.0.2.2:1000", now.Add(2*time.Second)); !allowed {
+		t.Fatal("different IP incorrectly shared a rate-limit bucket")
+	}
+	if allowed, _ := configuredHTTPRateLimitAllows("oauth_register", rateLimited, "192.0.2.1:4000", now.Add(time.Minute)); !allowed {
+		t.Fatal("request after rate-limit window was rejected")
+	}
+
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	script := writeTestScript(t, `
+JSON.stringify({
+  status: 200,
+  headers: {"Content-Type":"application/json"},
+  body: {
+    authorizationType: typeof nyanRequest.headers.authorization,
+    visibleHeaderNames: Object.keys(nyanRequest.headers).sort()
+  }
+});
+`)
+	setTestSQLFiles(t, map[string]APIConfig{
+		"header_probe": {
+			Script: script,
+			HTTP: &HTTPAPIConfig{
+				Path:         "/header-probe",
+				Methods:      []string{http.MethodGet},
+				Access:       configuredHTTPAccessAnonymous,
+				ResponseMode: configuredHTTPResponseRaw,
+				RateLimit:    &HTTPRateLimitConfig{Requests: 1, Window: "1m"},
+			},
+		},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/header-probe", nil)
+	req.Header.Set("Authorization", "Bearer must-not-reach-script")
+	req.Header.Set("X-Visible", "yes")
+	rec := httptest.NewRecorder()
+	unifiedHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("header isolation status = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	body := decodeTestJSONObject(t, rec.Body.Bytes())
+	if body["authorizationType"] != "undefined" {
+		t.Fatalf("Authorization header reached raw script: %#v", body)
+	}
+	if !reflect.DeepEqual(body["visibleHeaderNames"], []interface{}{"x-visible"}) {
+		t.Fatalf("visible raw-script headers = %#v", body["visibleHeaderNames"])
+	}
+	limitedReq := httptest.NewRequest(http.MethodGet, "/header-probe", nil)
+	limitedRec := httptest.NewRecorder()
+	unifiedHandler(limitedRec, limitedReq)
+	if limitedRec.Code != http.StatusTooManyRequests || limitedRec.Header().Get("Retry-After") == "" {
+		t.Fatalf("configured HTTP rate-limit response = status:%d headers:%#v body:%s", limitedRec.Code, limitedRec.Header(), limitedRec.Body.String())
+	}
+}
+
+func TestConfiguredHTTPAndMCPOriginPolicies(t *testing.T) {
+	httpConfig := APIConfig{HTTP: &HTTPAPIConfig{
+		AllowedOrigins: []string{"https://chatgpt.com"},
+	}}
+	request := httptest.NewRequest(http.MethodPost, "https://server.example/oauth/token", nil)
+	for _, testCase := range []struct {
+		name    string
+		origin  string
+		allowed bool
+	}{
+		{name: "missing server origin", allowed: true},
+		{name: "same origin", origin: "https://server.example", allowed: true},
+		{name: "configured origin", origin: "https://chatgpt.com", allowed: true},
+		{name: "unconfigured origin", origin: "https://attacker.example", allowed: false},
+		{name: "origin with path", origin: "https://chatgpt.com/callback", allowed: false},
+	} {
+		t.Run("http "+testCase.name, func(t *testing.T) {
+			request.Header.Set("Origin", testCase.origin)
+			if got := configuredHTTPOriginAllowed(request, httpConfig); got != testCase.allowed {
+				t.Fatalf("configuredHTTPOriginAllowed(%q) = %t, want %t", testCase.origin, got, testCase.allowed)
+			}
+		})
+	}
+
+	mcpRequest := httptest.NewRequest(http.MethodPost, "https://server.example/mcp", nil)
+	for _, testCase := range []struct {
+		name    string
+		origin  string
+		allowed bool
+	}{
+		{name: "same origin", origin: "https://server.example", allowed: true},
+		{name: "configured ChatGPT origin", origin: "https://platform.openai.com", allowed: true},
+		{name: "unconfigured loopback", origin: "http://127.0.0.1:3000", allowed: false},
+		{name: "unconfigured origin", origin: "https://attacker.example", allowed: false},
+	} {
+		t.Run("mcp "+testCase.name, func(t *testing.T) {
+			mcpRequest.Header.Set("Origin", testCase.origin)
+			if got := validateMCPOrigin(mcpRequest, "https://server.example/mcp", []string{"https://platform.openai.com"}); got != testCase.allowed {
+				t.Fatalf("validateMCPOrigin(%q) = %t, want %t", testCase.origin, got, testCase.allowed)
+			}
+		})
+	}
+}
+
+func TestAPIConfigRejectsUnknownAndMisplacedSecurityFields(t *testing.T) {
+	_, err := decodeSQLFiles([]byte(`{
+		"endpoint": {
+			"script": "./endpoint.js",
+			"http": {"path":"/endpoint","access":"anonymous","allowedOrigns":[]}
+		}
+	}`), t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), `unsupported field "allowedOrigns"`) {
+		t.Fatalf("unknown security field error = %v", err)
+	}
+
+	definitions, err := decodeSQLFiles([]byte(`{
+		"endpoint": {
+			"script": "./endpoint.js",
+			"allowedOrigins": ["https://chatgpt.com"]
+		}
+	}`), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateConfiguredAPIExtensions(definitions); err == nil || !strings.Contains(err.Error(), "MCP fields are only allowed") {
+		t.Fatalf("misplaced security field error = %v", err)
+	}
+}
+
+func TestOAuthScopeTokenValidation(t *testing.T) {
+	for _, value := range []string{"stamps:read", "a!#$%&'()*+,-./:;<=>?@[]^_`{|}~"} {
+		if !isValidOAuthScopeToken(value) {
+			t.Fatalf("isValidOAuthScopeToken(%q) = false", value)
+		}
+	}
+	for _, value := range []string{"", "stamps read", "quoted\"scope", `back\\slash`, "日本語"} {
+		if isValidOAuthScopeToken(value) {
+			t.Fatalf("isValidOAuthScopeToken(%q) = true", value)
+		}
+	}
+}
+
+func TestVPSAPIConfigurationLoads(t *testing.T) {
+	apiPath := oauthTestAssetPath(t, "api.vps.json")
+	loadResult, err := loadAPIConfigFile(apiPath)
+	if err != nil {
+		t.Fatalf("loadAPIConfigFile(%q): %v", apiPath, err)
+	}
+	if err := validateConfiguredServerTransportSecurity(loadResult.Snapshot, Config{
+		CertPath: "/etc/nyanql/tls/fullchain.pem",
+		KeyPath:  "/etc/nyanql/tls/privkey.pem",
+	}); err != nil {
+		t.Fatalf("VPS transport validation: %v", err)
+	}
+	serverConfig, exists := loadResult.Snapshot.Definitions["server_mcp_http"]
+	if !exists || serverConfig.Resource != "https://stamp.necomori.asia/mcp" || len(serverConfig.AllowedOrigins) != 2 {
+		t.Fatalf("VPS MCP configuration = %#v", serverConfig)
+	}
+	if configuredHTTPAccess(loadResult.Snapshot.Definitions["list"]) != configuredHTTPAccessInternal {
+		t.Fatal("VPS business API is not internal")
+	}
+	protectedConfig := loadResult.Snapshot.Definitions["oauth_protected_resource_metadata"]
+	if !reflect.DeepEqual(protectedConfig.Runtime.Settings["scopes"], []interface{}{"stamps:read", "offline_access"}) {
+		t.Fatalf("VPS protected-resource scopes = %#v", protectedConfig.Runtime.Settings["scopes"])
+	}
+	if protectedConfig.Runtime.Settings["issuer"] != "https://stamp.necomori.asia" ||
+		protectedConfig.Runtime.Settings["resource"] != "https://stamp.necomori.asia/mcp" {
+		t.Fatalf("VPS protected-resource metadata = %#v", protectedConfig.Runtime.Settings)
+	}
+	authorizationServerConfig := loadResult.Snapshot.Definitions["oauth_authorization_server_metadata"]
+	for key, expected := range map[string]string{
+		"issuer":                "https://stamp.necomori.asia",
+		"authorizationEndpoint": "https://stamp.necomori.asia/oauth/authorize",
+		"tokenEndpoint":         "https://stamp.necomori.asia/oauth/token",
+		"registrationEndpoint":  "https://stamp.necomori.asia/oauth/register",
+	} {
+		if authorizationServerConfig.Runtime.Settings[key] != expected {
+			t.Fatalf("VPS authorization-server %s = %#v, want %q", key, authorizationServerConfig.Runtime.Settings[key], expected)
+		}
+	}
+	tokenConfig, exists := loadResult.Snapshot.Definitions["oauth_token"]
+	if !exists || tokenConfig.Runtime.Settings["refreshTokenLifetimeSeconds"] != float64(7776000) {
+		t.Fatalf("VPS OAuth token settings = %#v", tokenConfig.Runtime.Settings)
+	}
+	requiredTokenSQL := map[string]bool{
+		"lock_refresh_token.sql":                     false,
+		"select_refresh_token.sql":                   false,
+		"consume_refresh_token.sql":                  false,
+		"insert_refresh_token.sql":                   false,
+		"insert_refresh_token_family.sql":            false,
+		"revoke_refresh_token_family.sql":            false,
+		"revoke_refresh_tokens_in_family.sql":        false,
+		"revoke_access_tokens_in_refresh_family.sql": false,
+	}
+	for _, sqlPath := range tokenConfig.Runtime.SQLFiles {
+		if _, required := requiredTokenSQL[filepath.Base(sqlPath)]; required {
+			requiredTokenSQL[filepath.Base(sqlPath)] = true
+		}
+	}
+	for name, configured := range requiredTokenSQL {
+		if !configured {
+			t.Fatalf("VPS OAuth token SQL allowlist is missing %q: %#v", name, tokenConfig.Runtime.SQLFiles)
+		}
+	}
+	if _, exists := loadResult.Snapshot.Schedules["oauth_cleanup"]; !exists {
+		t.Fatal("VPS OAuth cleanup schedule is missing")
+	}
+	cleanupConfig := loadResult.Snapshot.Definitions["oauth_cleanup"]
+	cleanupSQL := make(map[string]bool, len(cleanupConfig.Runtime.SQLFiles))
+	for _, sqlPath := range cleanupConfig.Runtime.SQLFiles {
+		cleanupSQL[filepath.Base(sqlPath)] = true
+	}
+	for _, name := range []string{"cleanup_refresh_tokens.sql", "cleanup_refresh_token_families.sql"} {
+		if !cleanupSQL[name] {
+			t.Fatalf("VPS OAuth cleanup SQL allowlist is missing %q: %#v", name, cleanupConfig.Runtime.SQLFiles)
+		}
+	}
+}
+
+func TestVPSServiceCanBindStandardHTTPSPort(t *testing.T) {
+	servicePath := oauthTestAssetPath(t, "ansible", "templates", "nyanql.service.j2")
+	contents, err := os.ReadFile(servicePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := string(contents)
+	for _, required := range []string{
+		"AmbientCapabilities=CAP_NET_BIND_SERVICE",
+		"CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
+		"NoNewPrivileges=true",
+	} {
+		if !strings.Contains(service, required) {
+			t.Fatalf("%s is missing %q", servicePath, required)
+		}
+	}
+}
+
+func TestVPSDeploymentUsesDomainCertificate(t *testing.T) {
+	deployPath := oauthTestAssetPath(t, "ansible", "deploy.yml")
+	deployContents, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploy := string(deployContents)
+	for _, required := range []string{
+		`nyanql_public_hostname: "stamp.necomori.asia"`,
+		`nyanql_public_origin: "https://{{ nyanql_public_hostname }}"`,
+		"- --domains",
+		`- "{{ nyanql_public_hostname }}"`,
+		`- "{{ letsencrypt_cert_name }}"`,
+	} {
+		if !strings.Contains(deploy, required) {
+			t.Fatalf("%s is missing %q", deployPath, required)
+		}
+	}
+	for _, forbidden := range []string{"--ip-address", "preferred-profile", "shortlived"} {
+		if strings.Contains(deploy, forbidden) {
+			t.Fatalf("%s still contains obsolete IP certificate option %q", deployPath, forbidden)
+		}
+	}
+
+	renewPath := oauthTestAssetPath(t, "ansible", "templates", "nyanql-certbot-renew.service.j2")
+	renewContents, err := os.ReadFile(renewPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(renewContents), "renew --cert-name {{ letsencrypt_cert_name }} --quiet") {
+		t.Fatalf("%s does not limit renewal to the configured domain certificate", renewPath)
+	}
+
+	hookPath := oauthTestAssetPath(t, "ansible", "templates", "install-certificate.sh.j2")
+	hookContents, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(hookContents), `expected_lineage="{{ letsencrypt_live_dir }}"`) {
+		t.Fatalf("%s does not reject unrelated certificate lineages", hookPath)
+	}
+}
+
+func TestVPSDeploymentAppliesRefreshMigrationOnlyWhenPending(t *testing.T) {
+	deployPath := oauthTestAssetPath(t, "ansible", "deploy.yml")
+	contents, err := os.ReadFile(deployPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(contents)
+	applyMarker := "    - name: Apply OAuth migration 003"
+	applyStart := strings.Index(text, applyMarker)
+	if applyStart < 0 {
+		t.Fatalf("%s does not define OAuth migration 003 deployment", deployPath)
+	}
+	applyBlock := text[applyStart:]
+	if nextTask := strings.Index(applyBlock[len(applyMarker):], "\n    - name:"); nextTask >= 0 {
+		applyBlock = applyBlock[:len(applyMarker)+nextTask]
+	}
+	for _, required := range []string{
+		".read {{ nyanql_source_dir }}/sql/oauth/003_add_refresh_tokens.sql",
+		`when: "'3' not in oauth_migration_versions.stdout_lines"`,
+	} {
+		if !strings.Contains(applyBlock, required) {
+			t.Fatalf("OAuth migration 003 task is missing %q:\n%s", required, applyBlock)
+		}
+	}
+}
+
+func TestSQLAndMCPResponseSizeLimits(t *testing.T) {
+	testDB := setTestSQLiteDB(t)
+	rows, err := testDB.Query(`SELECT zeroblob(?) AS oversized`, maxSQLJSONBytes+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rowsErr := RowsToJSON(rows)
+	closeErr := rows.Close()
+	if rowsErr == nil || !strings.Contains(rowsErr.Error(), "maximum JSON size") {
+		t.Fatalf("RowsToJSON oversized error = %v", rowsErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+
+	recorder := httptest.NewRecorder()
+	writeMCPResult(recorder, json.RawMessage(`"large"`), map[string]interface{}{
+		"data": strings.Repeat("x", maxConfiguredHTTPResponseBytes+1),
+	})
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("oversized MCP status = %d; body=%s", recorder.Code, recorder.Body.String())
+	}
+	response := decodeTestJSONObject(t, recorder.Body.Bytes())
+	if response["error"].(map[string]interface{})["message"] != "Response is too large" {
+		t.Fatalf("oversized MCP response = %#v", response)
+	}
+}
+
+func TestOAuthCleanupRemovesExpiredStateAndInactiveClient(t *testing.T) {
+	resetJavascriptInclude(t)
+	testDB := setTestSQLiteDB(t)
+	migrateOAuthTestDatabase(t, testDB)
+
+	passwordHash := "$argon2id$v=19$m=65536,t=3,p=2$GbP1xKkH/FbDk3bytDlq1Q$1jcT6iSqZ9N0I3LuX7w/pGjJgWVCTbTr9WhK7r91gV8"
+	if _, err := testDB.Exec(`INSERT INTO oauth_users(id, username, password_hash) VALUES (1, 'cleanup-user', ?)`, passwordHash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testDB.Exec(`INSERT INTO oauth_clients(client_id, client_name, token_endpoint_auth_method, grant_types, response_types, scope, created_at) VALUES ('cleanup-client', 'Cleanup', 'none', '["authorization_code","refresh_token"]', '["code"]', 'stamps:read offline_access', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	challenge := strings.Repeat("A", 43)
+	if _, err := testDB.Exec(`INSERT INTO oauth_authorization_requests(request_hash, csrf_hash, client_id, redirect_uri, resource, scope, code_challenge, code_challenge_method, expires_at) VALUES (?, ?, 'cleanup-client', 'https://chatgpt.com/connector/oauth/cleanup', 'https://server.example/mcp', 'stamps:read', ?, 'S256', 1)`, strings.Repeat("a", 64), strings.Repeat("b", 64), challenge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testDB.Exec(`INSERT INTO oauth_authorization_codes(code_hash, user_id, client_id, redirect_uri, resource, scope, code_challenge, code_challenge_method, expires_at) VALUES (?, 1, 'cleanup-client', 'https://chatgpt.com/connector/oauth/cleanup', 'https://server.example/mcp', 'stamps:read', ?, 'S256', 1)`, strings.Repeat("c", 64), challenge); err != nil {
+		t.Fatal(err)
+	}
+	refreshFamilyResult, err := testDB.Exec(`INSERT INTO oauth_refresh_token_families(user_id, client_id, resource, scope, expires_at, revoked_at) VALUES (1, 'cleanup-client', 'https://server.example/mcp', 'stamps:read offline_access', 1, 1)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshFamilyID, err := refreshFamilyResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testDB.Exec(`INSERT INTO oauth_refresh_tokens(token_hash, family_id, scope, expires_at, revoked_at) VALUES (?, ?, 'stamps:read offline_access', 1, 1)`, strings.Repeat("e", 64), refreshFamilyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testDB.Exec(`INSERT INTO oauth_access_tokens(token_hash, user_id, client_id, resource, scope, expires_at, refresh_family_id) VALUES (?, 1, 'cleanup-client', 'https://server.example/mcp', 'stamps:read', 1, ?)`, strings.Repeat("d", 64), refreshFamilyID); err != nil {
+		t.Fatal(err)
+	}
+
+	runtimeConfig := APIRuntimeConfig{
+		Capabilities: []string{"sql"},
+		SQLFiles: oauthTestSQLAssetPaths(t,
+			"cleanup_authorization_requests.sql",
+			"cleanup_authorization_codes.sql",
+			"cleanup_access_tokens.sql",
+			"cleanup_refresh_tokens.sql",
+			"cleanup_refresh_token_families.sql",
+			"cleanup_clients.sql",
+		),
+		Settings: map[string]interface{}{
+			"retentionDays":       float64(7),
+			"clientRetentionDays": float64(180),
+		},
+	}
+	result, err := runScriptWithRuntimeWithSnapshot(
+		newAPIConfigSnapshot(nil, "", [sha256.Size]byte{}),
+		[]string{oauthTestAssetPath(t, "javascript", "oauth", "cleanup.js")},
+		map[string]interface{}{},
+		runtimeConfig,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("OAuth cleanup: %v", err)
+	}
+	cleanupResult := decodeTestJSONObject(t, []byte(result))
+	for _, key := range []string{"authorizationRequests", "authorizationCodes", "accessTokens", "refreshTokens", "refreshTokenFamilies", "clients"} {
+		if cleanupResult[key] != float64(1) {
+			t.Fatalf("cleanup result[%q] = %#v; result=%#v", key, cleanupResult[key], cleanupResult)
+		}
+	}
+}
+
+const (
+	oauthIntegrationTestIssuer   = "https://server.example"
+	oauthIntegrationTestResource = "https://server.example/mcp"
+)
+
+func newOAuthIntegrationTestSnapshot(t *testing.T, targetScript string) *APIConfigSnapshot {
+	t.Helper()
+	scopes := []interface{}{"stamps:read", "offline_access"}
+	definitions := map[string]APIConfig{
+		"oauth_protected_resource_metadata": {
+			Script: oauthTestAssetPath(t, "javascript", "oauth", "protected_resource_metadata.js"),
+			HTTP:   &HTTPAPIConfig{Path: "/.well-known/oauth-protected-resource/mcp", Methods: []string{http.MethodGet}, Access: configuredHTTPAccessAnonymous, ResponseMode: configuredHTTPResponseRaw},
+			Runtime: APIRuntimeConfig{Settings: map[string]interface{}{
+				"issuer":   oauthIntegrationTestIssuer,
+				"resource": oauthIntegrationTestResource,
+				"scopes":   scopes,
+			}},
+		},
+		"oauth_authorization_server_metadata": {
+			Script: oauthTestAssetPath(t, "javascript", "oauth", "authorization_server_metadata.js"),
+			HTTP:   &HTTPAPIConfig{Path: "/.well-known/oauth-authorization-server", Methods: []string{http.MethodGet}, Access: configuredHTTPAccessAnonymous, ResponseMode: configuredHTTPResponseRaw},
+			Runtime: APIRuntimeConfig{Settings: map[string]interface{}{
+				"issuer":                oauthIntegrationTestIssuer,
+				"authorizationEndpoint": oauthIntegrationTestIssuer + "/oauth/authorize",
+				"tokenEndpoint":         oauthIntegrationTestIssuer + "/oauth/token",
+				"registrationEndpoint":  oauthIntegrationTestIssuer + "/oauth/register",
+				"revocationEndpoint":    oauthIntegrationTestIssuer + "/oauth/revoke",
+				"scopes":                scopes,
+			}},
+		},
+		"oauth_register": {
+			Script: oauthTestAssetPath(t, "javascript", "oauth", "register.js"),
+			HTTP:   &HTTPAPIConfig{Path: "/oauth/register", Methods: []string{http.MethodPost}, Access: configuredHTTPAccessAnonymous, ResponseMode: configuredHTTPResponseRaw},
+			Runtime: APIRuntimeConfig{
+				Capabilities: []string{"sql", "crypto"},
+				SQLFiles: oauthTestSQLAssetPaths(t,
+					"insert_client.sql",
+					"insert_client_redirect_uri.sql",
+				),
+				Settings: map[string]interface{}{
+					"scopes":                 scopes,
+					"redirectURIAllowlist":   []interface{}{"https://chatgpt.com/connector/oauth/integration-callback"},
+					"allowLoopbackRedirects": false,
+					"maxClients":             float64(1),
+				},
+			},
+		},
+		"oauth_authorize": {
+			Script: oauthTestAssetPath(t, "javascript", "oauth", "authorize.js"),
+			HTTP:   &HTTPAPIConfig{Path: "/oauth/authorize", Methods: []string{http.MethodGet, http.MethodPost}, Access: configuredHTTPAccessAnonymous, ResponseMode: configuredHTTPResponseRaw},
+			Runtime: APIRuntimeConfig{
+				Capabilities: []string{"sql", "crypto", "password"},
+				SQLFiles: oauthTestSQLAssetPaths(t,
+					"select_client_redirect_uri.sql",
+					"insert_authorization_request.sql",
+					"select_authorization_request.sql",
+					"consume_authorization_request.sql",
+					"select_user_by_username.sql",
+					"increment_authorization_attempt.sql",
+					"upsert_consent.sql",
+					"insert_authorization_code.sql",
+				),
+				Settings: map[string]interface{}{
+					"resource":                oauthIntegrationTestResource,
+					"authorizationEndpoint":   oauthIntegrationTestIssuer + "/oauth/authorize",
+					"authorizationCookiePath": "/oauth/authorize",
+					"scopes":                  scopes,
+					"redirectURIAllowlist":    []interface{}{"https://chatgpt.com/connector/oauth/integration-callback"},
+					"allowLoopbackRedirects":  false,
+					"dummyPasswordHash":       "$argon2id$v=19$m=65536,t=3,p=2$GbP1xKkH/FbDk3bytDlq1Q$1jcT6iSqZ9N0I3LuX7w/pGjJgWVCTbTr9WhK7r91gV8",
+				},
+			},
+		},
+		"oauth_token": {
+			Script: oauthTestAssetPath(t, "javascript", "oauth", "token.js"),
+			HTTP:   &HTTPAPIConfig{Path: "/oauth/token", Methods: []string{http.MethodPost}, Access: configuredHTTPAccessAnonymous, ResponseMode: configuredHTTPResponseRaw},
+			Runtime: APIRuntimeConfig{
+				Capabilities: []string{"sql", "crypto"},
+				SQLFiles: oauthTestSQLAssetPaths(t,
+					"select_authorization_code.sql",
+					"consume_authorization_code.sql",
+					"insert_access_token.sql",
+					"insert_refresh_token_family.sql",
+					"insert_refresh_token.sql",
+					"lock_refresh_token.sql",
+					"select_refresh_token.sql",
+					"consume_refresh_token.sql",
+					"revoke_refresh_token_family.sql",
+					"revoke_refresh_tokens_in_family.sql",
+					"revoke_access_tokens_in_refresh_family.sql",
+				),
+				Settings: map[string]interface{}{
+					"resource":                    oauthIntegrationTestResource,
+					"accessTokenLifetimeSeconds":  float64(3600),
+					"refreshTokenLifetimeSeconds": float64(2592000),
+				},
+			},
+		},
+		"oauth_revoke": {
+			Script: oauthTestAssetPath(t, "javascript", "oauth", "revoke.js"),
+			HTTP:   &HTTPAPIConfig{Path: "/oauth/revoke", Methods: []string{http.MethodPost}, Access: configuredHTTPAccessAnonymous, ResponseMode: configuredHTTPResponseRaw},
+			Runtime: APIRuntimeConfig{
+				Capabilities: []string{"sql", "crypto"},
+				SQLFiles: oauthTestSQLAssetPaths(t,
+					"revoke_access_token.sql",
+					"select_refresh_token.sql",
+					"revoke_refresh_token_family.sql",
+					"revoke_refresh_tokens_in_family.sql",
+					"revoke_access_tokens_in_refresh_family.sql",
+				),
+			},
+		},
+		"oauth_bootstrap_user": {
+			Script: oauthTestAssetPath(t, "javascript", "oauth", "bootstrap_user.js"),
+			HTTP:   &HTTPAPIConfig{Path: "/oauth/admin/users", Methods: []string{http.MethodPost}, Access: configuredHTTPAccessBasic, ResponseMode: configuredHTTPResponseRaw},
+			Runtime: APIRuntimeConfig{
+				Capabilities: []string{"sql", "password"},
+				SQLFiles:     oauthTestSQLAssetPaths(t, "upsert_user.sql"),
+			},
+		},
+		"oauth_verify_access": {
+			Script: oauthTestAssetPath(t, "javascript", "oauth", "verify_access.js"),
+			HTTP:   &HTTPAPIConfig{Access: configuredHTTPAccessInternal},
+			Runtime: APIRuntimeConfig{
+				Capabilities: []string{"sql", "crypto"},
+				SQLFiles:     oauthTestSQLAssetPaths(t, "select_access_token.sql"),
+				Settings: map[string]interface{}{
+					"resource":                  oauthIntegrationTestResource,
+					"protectedResourceMetadata": oauthIntegrationTestIssuer + "/.well-known/oauth-protected-resource/mcp",
+				},
+			},
+		},
+		"oauth_e2e_target": {
+			Script:      targetScript,
+			Description: "OAuth integration target",
+		},
+	}
+	readOnly := true
+	destructive := false
+	openWorld := false
+	definitions["server_mcp_http"] = APIConfig{
+		Type:             apiTypeMCP,
+		Path:             "/mcp",
+		Transport:        "streamable_http",
+		ProtocolVersions: []string{mcpProtocolVersion20251125},
+		Resource:         oauthIntegrationTestResource,
+		Guard:            MCPGuardConfig{API: "oauth_verify_access"},
+		Tools: []MCPToolConfig{{
+			Name:        "oauth_e2e",
+			API:         "oauth_e2e_target",
+			Title:       "OAuth E2E",
+			Description: "OAuth SQLite integration target",
+			SecuritySchemes: []MCPSecurityScheme{{
+				Type:   "oauth2",
+				Scopes: []string{"stamps:read"},
+			}},
+			Annotations: MCPToolAnnotations{ReadOnlyHint: &readOnly, DestructiveHint: &destructive, OpenWorldHint: &openWorld},
+		}},
+	}
+	return newAPIConfigSnapshot(definitions, "", [sha256.Size]byte{})
+}
+
+func oauthTestAssetPath(t *testing.T, elements ...string) string {
+	t.Helper()
+	pathValue, err := filepath.Abs(filepath.Join(elements...))
+	if err != nil {
+		t.Fatalf("resolve OAuth test asset %v: %v", elements, err)
+	}
+	if info, err := os.Stat(pathValue); err != nil || info.IsDir() {
+		t.Fatalf("OAuth test asset %q is unavailable: info=%#v error=%v", pathValue, info, err)
+	}
+	return pathValue
+}
+
+func oauthTestSQLAssetPaths(t *testing.T, names ...string) []string {
+	t.Helper()
+	paths := make([]string, len(names))
+	for index, name := range names {
+		paths[index] = oauthTestAssetPath(t, "sql", "oauth", name)
+	}
+	return paths
+}
+
+func seedOAuthRefreshTokenTestRecord(t *testing.T, testDB *sql.DB, clientID, label string, expiresAt int64) (string, int64, int64) {
+	t.Helper()
+	result, err := testDB.Exec(`
+		INSERT INTO oauth_refresh_token_families(user_id, client_id, resource, scope, expires_at)
+		VALUES (1, ?, ?, 'stamps:read offline_access', ?)`, clientID, oauthIntegrationTestResource, expiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	familyID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshToken := "nyan_rt_test_" + label + "_" + strings.Repeat("R", 48)
+	result, err = testDB.Exec(`
+		INSERT INTO oauth_refresh_tokens(token_hash, family_id, scope, expires_at)
+		VALUES (?, ?, 'stamps:read offline_access', ?)`, sha256Hash(refreshToken), familyID, expiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshTokenID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return refreshToken, familyID, refreshTokenID
+}
+
+func migrateOAuthTestDatabase(t *testing.T, testDB *sql.DB) {
+	t.Helper()
+	migrationPattern, err := filepath.Abs(filepath.Join("sql", "oauth", "[0-9][0-9][0-9]_*.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrationPaths, err := filepath.Glob(migrationPattern)
+	if err != nil || len(migrationPaths) == 0 {
+		t.Fatalf("find OAuth migrations %q: paths=%v error=%v", migrationPattern, migrationPaths, err)
+	}
+	for _, migrationPath := range migrationPaths {
+		migration, err := os.ReadFile(migrationPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testDB.Exec(string(migration)); err != nil {
+			t.Fatalf("apply OAuth migration %s: %v", migrationPath, err)
+		}
+	}
+	var latestVersion int
+	if err := testDB.QueryRow(`SELECT MAX(version) FROM oauth_schema_migrations`).Scan(&latestVersion); err != nil || latestVersion != 3 {
+		t.Fatalf("OAuth schema version = %d, want 3; error=%v", latestVersion, err)
+	}
+}
+
+func performOAuthTestHTTPRequest(t *testing.T, method, target, contentType, body string, configure func(*http.Request)) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if configure != nil {
+		configure(req)
+	}
+	rec := httptest.NewRecorder()
+	unifiedHandler(rec, req)
+	return rec
+}
+
+func performOAuthTestMCPRequest(t *testing.T, body, authorization string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", mcpProtocolVersion20251125)
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+	rec := httptest.NewRecorder()
+	unifiedHandler(rec, req)
+	return rec
+}
+
+func extractTestHTMLInputValue(t *testing.T, document, name string) string {
+	t.Helper()
+	marker := `name="` + name + `" value="`
+	start := strings.Index(document, marker)
+	if start < 0 {
+		t.Fatalf("HTML input %q not found in %q", name, document)
+	}
+	start += len(marker)
+	end := strings.Index(document[start:], `"`)
+	if end < 0 {
+		t.Fatalf("HTML input %q has no closing quote in %q", name, document)
+	}
+	return document[start : start+end]
+}
+
+func performTestMCPRequest(t *testing.T, snapshot *APIConfigSnapshot, serverConfig APIConfig, body, authorization string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", mcpProtocolVersion20251125)
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
+	rec := httptest.NewRecorder()
+	handleMCPRequestWithSnapshot(snapshot, rec, req, "test_mcp", serverConfig)
+	return rec
+}
+
+func decodeTestJSONObject(t *testing.T, data []byte) map[string]interface{} {
+	t.Helper()
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("decode JSON object %q: %v", string(data), err)
+	}
+	return result
 }
 
 func resetJavascriptInclude(t *testing.T) {
