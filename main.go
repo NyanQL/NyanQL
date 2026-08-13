@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -92,28 +93,34 @@ type LogConfig struct {
 }
 
 type APIConfig struct {
-	SQL              []string             `json:"sql,omitempty"`
-	Script           string               `json:"script,omitempty"`
-	Path             string               `json:"path,omitempty"`
-	ParamCheck       string               `json:"paramCheck,omitempty"`
-	Check            string               `json:"check,omitempty"` // Deprecated: use ParamCheck. Kept as a compatibility alias.
-	OutCheck         string               `json:"outCheck,omitempty"`
-	Push             string               `json:"push,omitempty"`
-	Trigger          TriggerConfig        `json:"trigger,omitempty"`
-	Description      string               `json:"description"`
-	Type             string               `json:"type,omitempty"`
-	ConnectURL       string               `json:"connectURL,omitempty"`
-	HTTP             *HTTPAPIConfig       `json:"http,omitempty"`
-	Runtime          APIRuntimeConfig     `json:"runtime,omitempty"`
-	Transport        string               `json:"transport,omitempty"`
-	ProtocolVersions []string             `json:"protocolVersions,omitempty"`
-	Resource         string               `json:"resource,omitempty"`
-	Guard            MCPGuardConfig       `json:"guard,omitempty"`
-	Tools            []MCPToolConfig      `json:"tools,omitempty"`
-	Instructions     string               `json:"instructions,omitempty"`
-	AllowedOrigins   []string             `json:"allowedOrigins,omitempty"`
-	RateLimit        *HTTPRateLimitConfig `json:"rateLimit,omitempty"`
-	MaxConcurrent    int                  `json:"maxConcurrent,omitempty"`
+	SQL                        []string             `json:"sql,omitempty"`
+	Script                     string               `json:"script,omitempty"`
+	Path                       string               `json:"path,omitempty"`
+	ParamCheck                 string               `json:"paramCheck,omitempty"`
+	Check                      string               `json:"check,omitempty"` // Deprecated: use ParamCheck. Kept as a compatibility alias.
+	OutCheck                   string               `json:"outCheck,omitempty"`
+	Push                       string               `json:"push,omitempty"`
+	Trigger                    TriggerConfig        `json:"trigger,omitempty"`
+	Description                string               `json:"description"`
+	Title                      string               `json:"title,omitempty"`
+	Type                       string               `json:"type,omitempty"`
+	ConnectURL                 string               `json:"connectURL,omitempty"`
+	HTTP                       *HTTPAPIConfig       `json:"http,omitempty"`
+	Runtime                    APIRuntimeConfig     `json:"runtime,omitempty"`
+	Transport                  string               `json:"transport,omitempty"`
+	ProtocolVersions           []string             `json:"protocolVersions,omitempty"`
+	Resource                   string               `json:"resource,omitempty"`
+	Guard                      MCPGuardConfig       `json:"guard,omitempty"`
+	Tools                      []MCPToolConfig      `json:"tools,omitempty"`
+	Instructions               string               `json:"instructions,omitempty"`
+	AllowedOrigins             []string             `json:"allowedOrigins,omitempty"`
+	RateLimit                  *HTTPRateLimitConfig `json:"rateLimit,omitempty"`
+	MaxConcurrent              int                  `json:"maxConcurrent,omitempty"`
+	RedirectURIAllowedPrefixes []string             `json:"redirectURIAllowedPrefixes,omitempty"`
+	OAuth                      MCPOAuthConfig       `json:"oauth,omitempty"`
+	SecuritySchemes            []MCPSecurityScheme  `json:"securitySchemes,omitempty"`
+	Annotations                MCPToolAnnotations   `json:"annotations,omitempty"`
+	Scopes                     []string             `json:"scopes,omitempty"`
 }
 
 type HTTPAPIConfig struct {
@@ -139,6 +146,16 @@ type APIRuntimeConfig struct {
 
 type MCPGuardConfig struct {
 	API string `json:"api,omitempty"`
+}
+
+type MCPOAuthConfig struct {
+	AuthorizationServerMetadata string `json:"authorizationServerMetadata,omitempty"`
+	ProtectedResourceMetadata   string `json:"protectedResourceMetadata,omitempty"`
+	Authorize                   string `json:"authorize,omitempty"`
+	Token                       string `json:"token,omitempty"`
+	Register                    string `json:"register,omitempty"`
+	AdminUser                   string `json:"adminUser,omitempty"`
+	VerifyAccess                string `json:"verifyAccess,omitempty"`
 }
 
 type MCPSecurityScheme struct {
@@ -168,30 +185,36 @@ type TriggerConfig struct {
 
 func (apiConfig *APIConfig) UnmarshalJSON(data []byte) error {
 	type apiConfigJSON struct {
-		SQL              []string             `json:"sql,omitempty"`
-		Script           string               `json:"script,omitempty"`
-		Path             string               `json:"path,omitempty"`
-		ParamCheck       string               `json:"paramCheck,omitempty"`
-		ParamCheckLower  string               `json:"paramcheck,omitempty"`
-		Check            string               `json:"check,omitempty"`
-		OutCheck         string               `json:"outCheck,omitempty"`
-		OutCheckLower    string               `json:"outcheck,omitempty"`
-		Push             string               `json:"push,omitempty"`
-		Trigger          TriggerConfig        `json:"trigger,omitempty"`
-		Description      string               `json:"description"`
-		Type             string               `json:"type,omitempty"`
-		ConnectURL       string               `json:"connectURL,omitempty"`
-		HTTP             *HTTPAPIConfig       `json:"http,omitempty"`
-		Runtime          APIRuntimeConfig     `json:"runtime,omitempty"`
-		Transport        string               `json:"transport,omitempty"`
-		ProtocolVersions []string             `json:"protocolVersions,omitempty"`
-		Resource         string               `json:"resource,omitempty"`
-		Guard            MCPGuardConfig       `json:"guard,omitempty"`
-		Tools            []MCPToolConfig      `json:"tools,omitempty"`
-		Instructions     string               `json:"instructions,omitempty"`
-		AllowedOrigins   []string             `json:"allowedOrigins,omitempty"`
-		RateLimit        *HTTPRateLimitConfig `json:"rateLimit,omitempty"`
-		MaxConcurrent    int                  `json:"maxConcurrent,omitempty"`
+		SQL                        []string             `json:"sql,omitempty"`
+		Script                     string               `json:"script,omitempty"`
+		Path                       string               `json:"path,omitempty"`
+		ParamCheck                 string               `json:"paramCheck,omitempty"`
+		ParamCheckLower            string               `json:"paramcheck,omitempty"`
+		Check                      string               `json:"check,omitempty"`
+		OutCheck                   string               `json:"outCheck,omitempty"`
+		OutCheckLower              string               `json:"outcheck,omitempty"`
+		Push                       string               `json:"push,omitempty"`
+		Trigger                    TriggerConfig        `json:"trigger,omitempty"`
+		Description                string               `json:"description"`
+		Title                      string               `json:"title,omitempty"`
+		Type                       string               `json:"type,omitempty"`
+		ConnectURL                 string               `json:"connectURL,omitempty"`
+		HTTP                       *HTTPAPIConfig       `json:"http,omitempty"`
+		Runtime                    APIRuntimeConfig     `json:"runtime,omitempty"`
+		Transport                  string               `json:"transport,omitempty"`
+		ProtocolVersions           []string             `json:"protocolVersions,omitempty"`
+		Resource                   string               `json:"resource,omitempty"`
+		Guard                      MCPGuardConfig       `json:"guard,omitempty"`
+		Tools                      []string             `json:"tools,omitempty"`
+		Instructions               string               `json:"instructions,omitempty"`
+		AllowedOrigins             []string             `json:"allowedOrigins,omitempty"`
+		RateLimit                  *HTTPRateLimitConfig `json:"rateLimit,omitempty"`
+		MaxConcurrent              int                  `json:"maxConcurrent,omitempty"`
+		RedirectURIAllowedPrefixes []string             `json:"redirectURIAllowedPrefixes,omitempty"`
+		OAuth                      MCPOAuthConfig       `json:"oauth,omitempty"`
+		SecuritySchemes            []MCPSecurityScheme  `json:"securitySchemes,omitempty"`
+		Annotations                MCPToolAnnotations   `json:"annotations,omitempty"`
+		Scopes                     []string             `json:"scopes,omitempty"`
 	}
 
 	var raw apiConfigJSON
@@ -217,6 +240,7 @@ func (apiConfig *APIConfig) UnmarshalJSON(data []byte) error {
 	apiConfig.Push = raw.Push
 	apiConfig.Trigger = raw.Trigger
 	apiConfig.Description = raw.Description
+	apiConfig.Title = raw.Title
 	apiConfig.Type = raw.Type
 	apiConfig.ConnectURL = raw.ConnectURL
 	apiConfig.HTTP = raw.HTTP
@@ -225,11 +249,19 @@ func (apiConfig *APIConfig) UnmarshalJSON(data []byte) error {
 	apiConfig.ProtocolVersions = raw.ProtocolVersions
 	apiConfig.Resource = raw.Resource
 	apiConfig.Guard = raw.Guard
-	apiConfig.Tools = raw.Tools
+	apiConfig.Tools = make([]MCPToolConfig, len(raw.Tools))
+	for index, apiName := range raw.Tools {
+		apiConfig.Tools[index] = MCPToolConfig{Name: apiName, API: apiName}
+	}
 	apiConfig.Instructions = raw.Instructions
 	apiConfig.AllowedOrigins = raw.AllowedOrigins
 	apiConfig.RateLimit = raw.RateLimit
 	apiConfig.MaxConcurrent = raw.MaxConcurrent
+	apiConfig.RedirectURIAllowedPrefixes = raw.RedirectURIAllowedPrefixes
+	apiConfig.OAuth = raw.OAuth
+	apiConfig.SecuritySchemes = raw.SecuritySchemes
+	apiConfig.Annotations = raw.Annotations
+	apiConfig.Scopes = raw.Scopes
 
 	return nil
 }
@@ -356,8 +388,9 @@ type serviceFilePath struct {
 }
 
 type serviceFilePaths struct {
-	API    serviceFilePath
-	Config serviceFilePath
+	API       serviceFilePath
+	Config    serviceFilePath
+	MCPServer string
 }
 
 const (
@@ -423,6 +456,7 @@ func resolveServiceFilePaths(execDir string, args []string) (serviceFilePaths, e
 	flags.SetOutput(io.Discard)
 	apiFlag := flags.String("api", "", "path to api.json")
 	configFlag := flags.String("config", "", "path to config.json")
+	mcpServerFlag := flags.String("mcp-server", "", "MCP API name selected for stdio mode")
 	if err := flags.Parse(args); err != nil {
 		return serviceFilePaths{}, err
 	}
@@ -440,8 +474,9 @@ func resolveServiceFilePaths(execDir string, args []string) (serviceFilePaths, e
 	}
 
 	return serviceFilePaths{
-		API:    serviceFilePath{Path: resolvedAPIPath, Source: apiSource},
-		Config: serviceFilePath{Path: resolvedConfigPath, Source: configSource},
+		API:       serviceFilePath{Path: resolvedAPIPath, Source: apiSource},
+		Config:    serviceFilePath{Path: resolvedConfigPath, Source: configSource},
+		MCPServer: strings.TrimSpace(*mcpServerFlag),
 	}, nil
 }
 
@@ -520,6 +555,16 @@ func main() {
 		log.Fatalf("Invalid server transport configuration: %v", err)
 	}
 	setAPISnapshot(initialLoad.Snapshot)
+	if paths.MCPServer != "" {
+		mcpName, mcpConfig, selectErr := selectMCPStdioServer(initialLoad.Snapshot, paths.MCPServer)
+		if selectErr != nil {
+			log.Fatal(selectErr)
+		}
+		if err := serveMCPStdio(os.Stdin, os.Stdout, initialLoad.Snapshot, mcpName, mcpConfig); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	backgroundRuntimes = newBackgroundRuntimeManager()
 	backgroundRuntimes.reconcile(initialLoad.Snapshot.Schedules, initialLoad.Snapshot.WSClients)
 	if config.APIHotReload.Enabled {
@@ -594,7 +639,11 @@ func NewHub() *Hub {
 
 func unifiedHandler(w http.ResponseWriter, r *http.Request) {
 	snapshot := currentAPISnapshot()
-	if apiName, apiConfig, ok := findMCPServerForPathInSnapshot(snapshot, r.URL.Path); ok {
+	if mcpName, mcpConfig, oauthAPI, role, ok := findMCPOAuthAPIForRequest(snapshot, r); ok {
+		handleMCPOAuthHTTPRequest(snapshot, w, r, mcpName, mcpConfig, oauthAPI, role)
+		return
+	}
+	if apiName, apiConfig, ok := findMCPServerForRequestInSnapshot(snapshot, r); ok {
 		handleMCPRequestWithSnapshot(snapshot, w, r, apiName, apiConfig)
 		return
 	}
@@ -685,16 +734,49 @@ func findConfiguredHTTPAPIForPathInSnapshot(snapshot *APIConfigSnapshot, request
 	return "", APIConfig{}, false
 }
 
-func findMCPServerForPathInSnapshot(snapshot *APIConfigSnapshot, requestPath string) (string, APIConfig, bool) {
+func findMCPServerForRequestInSnapshot(snapshot *APIConfigSnapshot, r *http.Request) (string, APIConfig, bool) {
 	if snapshot == nil {
 		return "", APIConfig{}, false
 	}
+	queryAPI := strings.TrimSpace(r.URL.Query().Get("api"))
 	for apiName, apiConfig := range snapshot.Definitions {
-		if getAPIType(apiConfig) == apiTypeMCP && apiConfig.Path == requestPath {
+		if getAPIType(apiConfig) != apiTypeMCP || apiConfig.Transport != "streamable_http" {
+			continue
+		}
+		endpointPath, err := canonicalAPIEndpointPath(apiName)
+		if err == nil && (r.URL.Path == endpointPath || (r.URL.Path == "/" && queryAPI == apiName)) {
 			return apiName, apiConfig, true
 		}
 	}
 	return "", APIConfig{}, false
+}
+
+func findMCPOAuthAPIForRequest(snapshot *APIConfigSnapshot, r *http.Request) (string, APIConfig, string, string, bool) {
+	if snapshot == nil {
+		return "", APIConfig{}, "", "", false
+	}
+	queryAPI := strings.TrimSpace(r.URL.Query().Get("api"))
+	for mcpName, mcp := range snapshot.Definitions {
+		if getAPIType(mcp) != apiTypeMCP || mcp.Transport != "streamable_http" || !mcpOAuthConfigured(mcp.OAuth) {
+			continue
+		}
+		roles := []struct{ api, role string }{
+			{mcp.OAuth.AuthorizationServerMetadata, "authorizationServerMetadata"},
+			{mcp.OAuth.ProtectedResourceMetadata, "protectedResourceMetadata"},
+			{mcp.OAuth.Authorize, "oauthAuthorize"}, {mcp.OAuth.Token, "oauthToken"},
+			{mcp.OAuth.Register, "oauthRegister"}, {mcp.OAuth.AdminUser, "oauthAdminUser"},
+		}
+		for _, candidate := range roles {
+			if candidate.api == "" {
+				continue
+			}
+			endpointPath, err := canonicalAPIEndpointPath(candidate.api)
+			if err == nil && (r.URL.Path == endpointPath || (r.URL.Path == "/" && queryAPI == candidate.api)) {
+				return mcpName, mcp, candidate.api, candidate.role, true
+			}
+		}
+	}
+	return "", APIConfig{}, "", "", false
 }
 
 func handleConfiguredHTTPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, apiName string, apiConfig APIConfig) {
@@ -1086,6 +1168,18 @@ type MCPGuardDecision struct {
 	Principal interface{}            `json:"principal"`
 }
 
+type mcpRuntimeURLs struct {
+	Origin                      string
+	Issuer                      string
+	Resource                    string
+	AuthorizationServerMetadata string
+	ProtectedResourceMetadata   string
+	AuthorizationEndpoint       string
+	TokenEndpoint               string
+	RegistrationEndpoint        string
+	AdminUserEndpoint           string
+}
+
 type rejectingJSONSchemaLoader struct{}
 
 func (rejectingJSONSchemaLoader) Load(location string) (interface{}, error) {
@@ -1093,12 +1187,22 @@ func (rejectingJSONSchemaLoader) Load(location string) (interface{}, error) {
 }
 
 func handleMCPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, serverName string, serverConfig APIConfig) {
-	if !validateMCPOrigin(r, serverConfig.Resource, serverConfig.AllowedOrigins) {
+	runtimeURLs, err := deriveMCPRuntimeURLs(r, serverName, serverConfig)
+	if err != nil {
+		http.Error(w, "invalid Host", http.StatusMisdirectedRequest)
+		return
+	}
+	if !requestOriginAllowed(r.Header.Get("Origin"), runtimeURLs.Origin, serverConfig.AllowedOrigins) {
 		http.Error(w, "forbidden origin", http.StatusForbidden)
 		return
 	}
+	writeMCPCORSHeaders(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
+		w.Header().Set("Allow", "POST, OPTIONS")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -1137,6 +1241,10 @@ func handleMCPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 	}
 	trimmedBody := bytes.TrimSpace(body)
 	if len(trimmedBody) == 0 || trimmedBody[0] == '[' {
+		writeMCPError(w, nil, -32600, "Invalid Request", nil)
+		return
+	}
+	if err := validateNoDuplicateJSONKeys(trimmedBody); err != nil {
 		writeMCPError(w, nil, -32600, "Invalid Request", nil)
 		return
 	}
@@ -1184,10 +1292,518 @@ func handleMCPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 	case "tools/list":
 		handleMCPToolsList(snapshot, w, request, serverConfig)
 	case "tools/call":
-		handleMCPToolCall(snapshot, w, r, request, serverConfig)
+		handleMCPToolCall(snapshot, w, r, request, serverName, serverConfig, runtimeURLs)
 	default:
 		writeMCPError(w, request.ID, -32601, "Method not found", nil)
 	}
+}
+
+func deriveMCPRuntimeURLs(r *http.Request, serverName string, serverConfig APIConfig) (mcpRuntimeURLs, error) {
+	host := strings.TrimSpace(r.Host)
+	if host == "" || strings.ContainsAny(host, "\\/?#@\r\n\t ") {
+		return mcpRuntimeURLs{}, fmt.Errorf("invalid Host")
+	}
+	if _, _, err := net.SplitHostPort(host); err != nil && strings.Count(host, ":") > 0 && net.ParseIP(strings.Trim(host, "[]")) == nil {
+		return mcpRuntimeURLs{}, fmt.Errorf("invalid Host")
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	origin := scheme + "://" + strings.ToLower(host)
+	pathFor := func(name string) string {
+		if name == "" {
+			return ""
+		}
+		endpointPath, _ := canonicalAPIEndpointPath(name)
+		return origin + endpointPath
+	}
+	return mcpRuntimeURLs{
+		Origin: origin, Issuer: origin, Resource: pathFor(serverName),
+		AuthorizationServerMetadata: pathFor(serverConfig.OAuth.AuthorizationServerMetadata),
+		ProtectedResourceMetadata:   pathFor(serverConfig.OAuth.ProtectedResourceMetadata),
+		AuthorizationEndpoint:       pathFor(serverConfig.OAuth.Authorize),
+		TokenEndpoint:               pathFor(serverConfig.OAuth.Token), RegistrationEndpoint: pathFor(serverConfig.OAuth.Register),
+		AdminUserEndpoint: pathFor(serverConfig.OAuth.AdminUser),
+	}, nil
+}
+
+func writeMCPCORSHeaders(w http.ResponseWriter, r *http.Request) {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Add("Vary", "Origin")
+	}
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization, MCP-Protocol-Version")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Expose-Headers", "WWW-Authenticate, MCP-Protocol-Version, Retry-After")
+}
+
+func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, serverName string, serverConfig APIConfig, apiName, role string) {
+	runtimeURLs, err := deriveMCPRuntimeURLs(r, serverName, serverConfig)
+	if err != nil {
+		http.Error(w, "invalid Host", http.StatusMisdirectedRequest)
+		return
+	}
+	if !requestOriginAllowed(r.Header.Get("Origin"), runtimeURLs.Origin, serverConfig.AllowedOrigins) {
+		http.Error(w, "forbidden origin", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Add("Vary", "Origin")
+	}
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if role == "oauthAdminUser" {
+		remoteHost := r.RemoteAddr
+		if host, _, splitErr := net.SplitHostPort(r.RemoteAddr); splitErr == nil {
+			remoteHost = host
+		}
+		remoteIP := net.ParseIP(strings.TrimSpace(remoteHost))
+		if remoteIP == nil || !remoteIP.IsLoopback() {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		username, password, ok := r.BasicAuth()
+		if !ok || !timingSafeStringEqual(username, config.BasicAuth.Username) || !timingSafeStringEqual(password, config.BasicAuth.Password) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="NyanQL OAuth administration", charset="UTF-8"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+	if role == "authorizationServerMetadata" || role == "protectedResourceMetadata" {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET, OPTIONS")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		scopes := snapshot.Definitions[serverConfig.OAuth.VerifyAccess].Scopes
+		if role == "authorizationServerMetadata" {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"issuer": runtimeURLs.Issuer, "authorization_endpoint": runtimeURLs.AuthorizationEndpoint,
+				"token_endpoint": runtimeURLs.TokenEndpoint, "registration_endpoint": runtimeURLs.RegistrationEndpoint,
+				"response_types_supported": []string{"code"}, "grant_types_supported": []string{"authorization_code", "refresh_token"},
+				"token_endpoint_auth_methods_supported": []string{"none"}, "code_challenge_methods_supported": []string{"S256"}, "scopes_supported": scopes,
+			})
+		} else {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"resource": runtimeURLs.Resource, "authorization_servers": []string{runtimeURLs.Issuer},
+				"scopes_supported": scopes, "bearer_methods_supported": []string{"header"},
+			})
+		}
+		return
+	}
+	if !mcpOAuthMethodAllowed(role, r.Method) {
+		w.Header().Set("Allow", mcpOAuthAllowedMethods(role))
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := validateMCPOAuthContentType(role, r); err != nil {
+		http.Error(w, "unsupported Content-Type", http.StatusUnsupportedMediaType)
+		return
+	}
+	if allowed, retryAfter := configuredRateLimitAllows("mcp:"+serverName+":oauth:"+role, mcpOAuthRateLimit(serverConfig, role), r.RemoteAddr, time.Now()); !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(retryAfter.Seconds())))))
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
+	params, err := mcpOAuthRequestParams(w, r)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "too large") {
+			status = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	release, acquired := acquireMCPExecutionSlot(serverName+":oauth:"+role, mcpOAuthMaxConcurrent(serverConfig, role))
+	if !acquired {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "OAuth endpoint is busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
+	value, err := invokeMCPOAuthHook(snapshot, serverName, serverConfig, runtimeURLs, role, params)
+	if err != nil {
+		log.Printf("OAuth hook %s failed: %v", apiName, err)
+		http.Error(w, "OAuth hook failed", http.StatusInternalServerError)
+		return
+	}
+	response, ok := value.(map[string]interface{})
+	if !ok {
+		http.Error(w, "OAuth hook returned an invalid response", http.StatusInternalServerError)
+		return
+	}
+	status := http.StatusOK
+	if raw, exists := response["status"]; exists {
+		if number, ok := raw.(json.Number); ok {
+			parsed, _ := strconv.Atoi(number.String())
+			status = parsed
+		} else if number, ok := raw.(float64); ok {
+			status = int(number)
+		}
+	}
+	if status < 100 || status > 599 {
+		http.Error(w, "OAuth hook returned an invalid status", http.StatusInternalServerError)
+		return
+	}
+	if headers, ok := response["headers"].(map[string]interface{}); ok {
+		for name, raw := range headers {
+			if !isHTTPToken(name) || isForbiddenScriptResponseHeader(name) {
+				http.Error(w, "OAuth hook returned an invalid header", http.StatusInternalServerError)
+				return
+			}
+			values, err := configuredHTTPHeaderValues(raw)
+			if err != nil {
+				http.Error(w, "OAuth hook returned an invalid header", http.StatusInternalServerError)
+				return
+			}
+			for _, value := range values {
+				if strings.ContainsAny(value, "\r\n") {
+					http.Error(w, "OAuth hook returned an invalid header", http.StatusInternalServerError)
+					return
+				}
+				w.Header().Add(http.CanonicalHeaderKey(name), value)
+			}
+		}
+	}
+	if rawContentType, exists := response["contentType"]; exists {
+		contentType, ok := rawContentType.(string)
+		if !ok {
+			http.Error(w, "OAuth hook returned an invalid content type", http.StatusInternalServerError)
+			return
+		}
+		if _, _, err := mime.ParseMediaType(contentType); err != nil || strings.ContainsAny(contentType, "\r\n") {
+			http.Error(w, "OAuth hook returned an invalid content type", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", contentType)
+	}
+	body, err := configuredHTTPResponseBody(response["body"])
+	if err != nil || len(body) > maxConfiguredHTTPResponseBytes {
+		http.Error(w, "OAuth hook returned an invalid body", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+func mcpOAuthMethodAllowed(role, method string) bool {
+	if role == "oauthAuthorize" {
+		return method == http.MethodGet || method == http.MethodPost
+	}
+	return method == http.MethodPost
+}
+
+func mcpOAuthAllowedMethods(role string) string {
+	if role == "oauthAuthorize" {
+		return "GET, POST, OPTIONS"
+	}
+	return "POST, OPTIONS"
+}
+
+func validateMCPOAuthContentType(role string, r *http.Request) error {
+	if r.Method != http.MethodPost {
+		return nil
+	}
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return err
+	}
+	switch role {
+	case "oauthRegister", "oauthAdminUser":
+		if mediaType != "application/json" {
+			return fmt.Errorf("JSON is required")
+		}
+	case "oauthAuthorize", "oauthToken":
+		if mediaType != "application/x-www-form-urlencoded" {
+			return fmt.Errorf("form data is required")
+		}
+	}
+	return nil
+}
+
+func mcpOAuthRateLimit(serverConfig APIConfig, role string) *HTTPRateLimitConfig {
+	requests := 60
+	switch role {
+	case "oauthAdminUser", "oauthRegister":
+		requests = 10
+	case "oauthAuthorize":
+		requests = 30
+	}
+	if serverConfig.RateLimit != nil && serverConfig.RateLimit.Requests < requests {
+		return serverConfig.RateLimit
+	}
+	return &HTTPRateLimitConfig{Requests: requests, Window: "1m"}
+}
+
+func mcpOAuthMaxConcurrent(serverConfig APIConfig, role string) int {
+	limit := configuredMCPMaxConcurrent(serverConfig)
+	switch role {
+	case "oauthAdminUser":
+		return min(limit, 1)
+	case "oauthAuthorize":
+		return min(limit, 2)
+	default:
+		return limit
+	}
+}
+
+func mcpOAuthRequestParams(w http.ResponseWriter, r *http.Request) (map[string]interface{}, error) {
+	params := map[string]interface{}{
+		"method": r.Method, "request_path": r.URL.Path, "query": urlValuesToInterfaceMap(r.URL.Query()),
+		"authorization": r.Header.Get("Authorization"),
+		"headers":       map[string]interface{}{"Authorization": r.Header.Get("Authorization"), "Content-Type": r.Header.Get("Content-Type"), "Accept": r.Header.Get("Accept"), "Origin": r.Header.Get("Origin")},
+	}
+	cookies := map[string]interface{}{}
+	for _, cookie := range r.Cookies() {
+		cookies[cookie.Name] = cookie.Value
+	}
+	params["cookies"] = cookies
+	if r.Method != http.MethodPost {
+		return params, nil
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxConfiguredHTTPBodyBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, fmt.Errorf("request body is too large")
+	}
+	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mediaType == "application/json" {
+		if err := validateNoDuplicateJSONKeys(body); err != nil {
+			return nil, fmt.Errorf("invalid JSON")
+		}
+		var value interface{}
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.UseNumber()
+		if err := decoder.Decode(&value); err != nil {
+			return nil, fmt.Errorf("invalid JSON")
+		}
+		params["body"] = value
+	} else {
+		values, err := url.ParseQuery(string(body))
+		if err != nil {
+			return nil, fmt.Errorf("invalid form")
+		}
+		params["form"] = urlValuesToInterfaceMap(values)
+	}
+	return params, nil
+}
+
+func selectMCPStdioServer(snapshot *APIConfigSnapshot, requestedName string) (string, APIConfig, error) {
+	if snapshot == nil {
+		return "", APIConfig{}, fmt.Errorf("API configuration is not loaded")
+	}
+	definition, exists := snapshot.Definitions[requestedName]
+	if !exists || getAPIType(definition) != apiTypeMCP {
+		return "", APIConfig{}, fmt.Errorf("MCP API %q is not configured", requestedName)
+	}
+	if definition.Transport != "stdio" {
+		return "", APIConfig{}, fmt.Errorf("MCP API %q does not use stdio", requestedName)
+	}
+	return requestedName, definition, nil
+}
+
+type mcpStdioLifecycle int
+
+const (
+	mcpStdioCreated mcpStdioLifecycle = iota
+	mcpStdioWaitingForInitialized
+	mcpStdioReady
+)
+
+func serveMCPStdio(input io.Reader, output io.Writer, snapshot *APIConfigSnapshot, serverName string, serverConfig APIConfig) error {
+	if serverConfig.Transport != "stdio" {
+		return fmt.Errorf("MCP API %q does not use stdio", serverName)
+	}
+	scanner := bufio.NewScanner(input)
+	scanner.Buffer(make([]byte, 64<<10), maxConfiguredHTTPBodyBytes+1)
+	state := mcpStdioCreated
+	for scanner.Scan() {
+		line := append([]byte(nil), scanner.Bytes()...)
+		response, respond := handleMCPStdioMessage(snapshot, serverName, serverConfig, &state, line)
+		if !respond {
+			continue
+		}
+		encoded, err := json.Marshal(response)
+		if err != nil {
+			return err
+		}
+		if len(encoded) > maxConfiguredHTTPResponseBytes {
+			return fmt.Errorf("stdio MCP response is too large")
+		}
+		encoded = append(encoded, '\n')
+		if _, err := output.Write(encoded); err != nil {
+			return err
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("stdio MCP input failed: %w", err)
+	}
+	return nil
+}
+
+func handleMCPStdioMessage(snapshot *APIConfigSnapshot, serverName string, serverConfig APIConfig, state *mcpStdioLifecycle, message []byte) (map[string]interface{}, bool) {
+	trimmed := bytes.TrimSpace(message)
+	if len(trimmed) == 0 || !json.Valid(trimmed) {
+		return mcpStdioError(nil, -32700, "Parse error"), true
+	}
+	if trimmed[0] != '{' || validateNoDuplicateJSONKeys(trimmed) != nil {
+		return mcpStdioError(nil, -32600, "Invalid Request"), true
+	}
+	var request MCPJSONRPCRequest
+	if json.Unmarshal(trimmed, &request) != nil || request.JSONRPC != "2.0" || strings.TrimSpace(request.Method) == "" {
+		return mcpStdioError(nil, -32600, "Invalid Request"), true
+	}
+	notification := len(request.ID) == 0
+	if request.Method == "notifications/initialized" {
+		if !notification {
+			return mcpStdioError(request.ID, -32600, "notifications/initialized must be a notification"), true
+		}
+		if *state == mcpStdioWaitingForInitialized {
+			*state = mcpStdioReady
+		}
+		return nil, false
+	}
+	if notification {
+		return nil, false
+	}
+	if request.Method == "initialize" {
+		if *state != mcpStdioCreated {
+			return mcpStdioError(request.ID, -32600, "MCP server is already initialized"), true
+		}
+		version, ok := mcpInitializeProtocolVersion(request)
+		if !ok || !containsMCPProtocolVersion(serverConfig.ProtocolVersions, version) {
+			return mcpStdioError(request.ID, -32602, "unsupported or missing protocolVersion"), true
+		}
+		*state = mcpStdioWaitingForInitialized
+		return mcpStdioResult(request.ID, mcpInitializeResult(serverName, serverConfig, version)), true
+	}
+	if *state != mcpStdioReady {
+		return mcpStdioError(request.ID, -32002, "MCP server is not initialized"), true
+	}
+	switch request.Method {
+	case "ping":
+		return mcpStdioResult(request.ID, map[string]interface{}{}), true
+	case "tools/list":
+		tools := make([]map[string]interface{}, 0, len(serverConfig.Tools))
+		for _, toolConfig := range serverConfig.Tools {
+			tool, err := buildMCPToolDefinition(snapshot, toolConfig)
+			if err != nil {
+				return mcpStdioError(request.ID, -32603, "Internal error"), true
+			}
+			delete(tool, "securitySchemes")
+			delete(tool, "_meta")
+			tools = append(tools, tool)
+		}
+		return mcpStdioResult(request.ID, map[string]interface{}{"tools": tools}), true
+	case "tools/call":
+		var params struct {
+			Name      string                 `json:"name"`
+			Arguments map[string]interface{} `json:"arguments"`
+		}
+		if len(request.Params) == 0 || json.Unmarshal(request.Params, &params) != nil || params.Name == "" {
+			return mcpStdioError(request.ID, -32602, "Invalid params"), true
+		}
+		tool, exists := findMCPToolConfig(serverConfig.Tools, params.Name)
+		if !exists {
+			return mcpStdioError(request.ID, -32602, "Unknown tool"), true
+		}
+		if params.Arguments == nil {
+			params.Arguments = map[string]interface{}{}
+		}
+		result, err := executeMCPToolForStdio(snapshot, tool, params.Arguments)
+		if err != nil {
+			return mcpStdioResult(request.ID, mcpToolErrorResult(err.Error(), nil)), true
+		}
+		return mcpStdioResult(request.ID, result), true
+	default:
+		return mcpStdioError(request.ID, -32601, "Method not found"), true
+	}
+}
+
+func mcpInitializeResult(serverName string, serverConfig APIConfig, protocolVersion string) map[string]interface{} {
+	name := strings.TrimSpace(config.Name)
+	if name == "" {
+		name = serverName
+	}
+	version := strings.TrimSpace(config.Version)
+	if version == "" {
+		version = buildVersion
+	}
+	result := map[string]interface{}{"protocolVersion": protocolVersion, "capabilities": map[string]interface{}{"tools": map[string]interface{}{"listChanged": false}}, "serverInfo": map[string]interface{}{"name": name, "version": version}}
+	if serverConfig.Instructions != "" {
+		result["instructions"] = serverConfig.Instructions
+	}
+	return result
+}
+
+func executeMCPToolForStdio(snapshot *APIConfigSnapshot, tool MCPToolConfig, arguments map[string]interface{}) (map[string]interface{}, error) {
+	apiConfig := snapshot.Definitions[tool.API]
+	schema, err := resolveAPISchema(apiConfig)
+	if err != nil {
+		return nil, fmt.Errorf("Tool schema could not be resolved")
+	}
+	if err := validateJSONSchemaValue(normalizedMCPInputSchema(schema.Input), arguments); err != nil {
+		return nil, fmt.Errorf("Tool arguments did not match the input schema")
+	}
+	scopes := apiConfig.Scopes
+	if len(apiConfig.SecuritySchemes) > 0 {
+		scopes = mcpRequiredScopes(apiConfig.SecuritySchemes)
+	}
+	params := cloneParams(arguments)
+	for _, key := range []string{"api", "nyan_guard", "nyan_mode", "nyan_request", "mcp_principal"} {
+		delete(params, key)
+	}
+	params["mcp_principal"] = map[string]interface{}{"user_id": "local-process", "username": "local-process", "client_id": "stdio", "transport": "stdio", "scope": strings.Join(scopes, " "), "scopes": scopes}
+	resultJSON, err := callNyanAPIFromVMWithSnapshot(snapshot, tool.API, params)
+	if err != nil {
+		return nil, fmt.Errorf("Tool execution failed")
+	}
+	if len(resultJSON) > maxConfiguredHTTPResponseBytes/2 {
+		return nil, fmt.Errorf("Tool result is too large")
+	}
+	var structured interface{}
+	if json.Unmarshal([]byte(resultJSON), &structured) != nil {
+		return nil, fmt.Errorf("Tool returned invalid JSON")
+	}
+	if schema.OutputSource != schemaSourceUnknown && validateJSONSchemaValue(schema.Output, structured) != nil {
+		return nil, fmt.Errorf("Tool result did not match its output schema")
+	}
+	result := map[string]interface{}{"content": []map[string]interface{}{{"type": "text", "text": resultJSON}}}
+	if object, ok := structured.(map[string]interface{}); ok {
+		result["structuredContent"] = object
+		if success, ok := object["success"].(bool); ok && !success {
+			result["isError"] = true
+		}
+	}
+	return result, nil
+}
+
+func mcpStdioResult(id json.RawMessage, result interface{}) map[string]interface{} {
+	return map[string]interface{}{"jsonrpc": "2.0", "id": rawMCPID(id), "result": result}
+}
+func mcpStdioError(id json.RawMessage, code int, message string) map[string]interface{} {
+	return map[string]interface{}{"jsonrpc": "2.0", "id": rawMCPID(id), "error": map[string]interface{}{"code": code, "message": message}}
+}
+func rawMCPID(id json.RawMessage) interface{} {
+	if len(id) == 0 {
+		return nil
+	}
+	var value interface{}
+	decoder := json.NewDecoder(bytes.NewReader(id))
+	decoder.UseNumber()
+	if decoder.Decode(&value) != nil {
+		return nil
+	}
+	return value
 }
 
 func configuredMCPMaxConcurrent(serverConfig APIConfig) int {
@@ -1260,7 +1876,7 @@ func canonicalHTTPOrigin(origin string) (string, error) {
 
 func mcpAcceptsJSONAndEventStream(accept string) bool {
 	if strings.TrimSpace(accept) == "" {
-		return true
+		return false
 	}
 	accept = strings.ToLower(accept)
 	return strings.Contains(accept, "application/json") && strings.Contains(accept, "text/event-stream")
@@ -1403,16 +2019,13 @@ func buildMCPToolDefinition(snapshot *APIConfigSnapshot, toolConfig MCPToolConfi
 	if _, err := compileJSONSchema(inputSchema); err != nil {
 		return nil, fmt.Errorf("invalid input schema for API %q: %w", toolConfig.API, err)
 	}
-	title := toolConfig.Title
+	title := apiConfig.Title
 	if title == "" {
-		title = toolConfig.Name
+		title = toolConfig.API
 	}
-	description := toolConfig.Description
-	if description == "" {
-		description = apiConfig.Description
-	}
+	description := apiConfig.Description
 	tool := map[string]interface{}{
-		"name":        toolConfig.Name,
+		"name":        toolConfig.API,
 		"title":       title,
 		"description": description,
 		"inputSchema": inputSchema,
@@ -1423,13 +2036,17 @@ func buildMCPToolDefinition(snapshot *APIConfigSnapshot, toolConfig MCPToolConfi
 		}
 		tool["outputSchema"] = cloneJSONCompatibleValue(apiSchema.Output)
 	}
-	if annotations := mcpAnnotationsMap(toolConfig.Annotations); len(annotations) > 0 {
+	if annotations := mcpAnnotationsMap(apiConfig.Annotations); len(annotations) > 0 {
 		tool["annotations"] = annotations
 	}
-	if len(toolConfig.SecuritySchemes) > 0 {
-		securitySchemes := cloneMCPSecuritySchemes(toolConfig.SecuritySchemes)
+	securitySchemes := apiConfig.SecuritySchemes
+	if len(securitySchemes) == 0 && len(apiConfig.Scopes) > 0 {
+		securitySchemes = []MCPSecurityScheme{{Type: "oauth2", Scopes: append([]string(nil), apiConfig.Scopes...)}}
+	}
+	if len(securitySchemes) > 0 {
+		securitySchemes := cloneMCPSecuritySchemes(securitySchemes)
 		tool["securitySchemes"] = securitySchemes
-		tool["_meta"] = map[string]interface{}{"securitySchemes": cloneMCPSecuritySchemes(toolConfig.SecuritySchemes)}
+		tool["_meta"] = map[string]interface{}{"securitySchemes": cloneJSONCompatibleValue(securitySchemes)}
 	}
 	return tool, nil
 }
@@ -1471,7 +2088,7 @@ func cloneMCPSecuritySchemes(schemes []MCPSecurityScheme) []map[string]interface
 	return result
 }
 
-func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, request MCPJSONRPCRequest, serverConfig APIConfig) {
+func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, request MCPJSONRPCRequest, serverName string, serverConfig APIConfig, runtimeURLs mcpRuntimeURLs) {
 	var params struct {
 		Name      string                 `json:"name"`
 		Arguments map[string]interface{} `json:"arguments"`
@@ -1488,23 +2105,27 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 		writeMCPError(w, request.ID, -32602, "Unknown tool", nil)
 		return
 	}
-	var principal interface{}
-	if mcpToolRequiresAuthorization(toolConfig) {
-		decision, err := runMCPGuard(snapshot, r, serverConfig, toolConfig)
-		if err != nil {
-			log.Printf("MCP guard failed for tool %s: %v", toolConfig.Name, err)
-			writeMCPError(w, request.ID, -32603, "Authorization check failed", nil)
-			return
-		}
-		if !decision.Allow {
-			applyMCPGuardHeaders(w, decision.Headers)
-			writeMCPResultWithStatus(w, request.ID, mcpToolErrorResult("Authentication or authorization is required", decision.MCPMeta), decision.Status)
-			return
-		}
-		principal = decision.Principal
-	}
-
 	apiConfig := snapshot.Definitions[toolConfig.API]
+	requiredScopes := apiConfig.Scopes
+	if len(apiConfig.SecuritySchemes) > 0 {
+		requiredScopes = mcpRequiredScopes(apiConfig.SecuritySchemes)
+	}
+	principal := interface{}(map[string]interface{}{"anonymous": true, "transport": "streamable_http"})
+	if mcpOAuthConfigured(serverConfig.OAuth) {
+		verifiedPrincipal, authenticated, forbidden := validateMCPAccessToken(snapshot, serverName, serverConfig, runtimeURLs, r.Header.Get("Authorization"), toolConfig.API, requiredScopes)
+		if !authenticated {
+			status := http.StatusUnauthorized
+			errorCode := "invalid_token"
+			if forbidden {
+				status, errorCode = http.StatusForbidden, "insufficient_scope"
+			}
+			challenge := mcpOAuthChallenge(runtimeURLs, requiredScopes, errorCode, "Authentication or authorization is required")
+			w.Header().Set("WWW-Authenticate", challenge)
+			writeMCPResultWithStatus(w, request.ID, mcpToolErrorResult("Authentication or authorization is required", map[string]interface{}{"mcp/www_authenticate": []string{challenge}}), status)
+			return
+		}
+		principal = verifiedPrincipal
+	}
 	apiSchema, err := resolveAPISchema(apiConfig)
 	if err != nil {
 		log.Printf("failed to resolve MCP tool schema for %s: %v", toolConfig.Name, err)
@@ -1522,11 +2143,11 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 	}
 
 	executionParams := cloneParams(params.Arguments)
-	for _, reservedName := range []string{"api", "nyan_guard", "nyan_mode", "nyan_request"} {
+	for _, reservedName := range []string{"api", "nyan_guard", "nyan_mode", "nyan_request", "mcp_principal"} {
 		delete(executionParams, reservedName)
 	}
 	if principal != nil {
-		executionParams["nyan_guard"] = cloneJSONCompatibleValue(principal)
+		executionParams["mcp_principal"] = cloneJSONCompatibleValue(principal)
 	}
 	resultJSON, err := callNyanAPIFromVMWithSnapshot(snapshot, toolConfig.API, executionParams)
 	if err != nil {
@@ -1566,7 +2187,7 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 
 func findMCPToolConfig(tools []MCPToolConfig, name string) (MCPToolConfig, bool) {
 	for _, tool := range tools {
-		if tool.Name == name {
+		if tool.API == name {
 			return tool, true
 		}
 	}
@@ -1638,6 +2259,124 @@ func runMCPGuard(snapshot *APIConfigSnapshot, r *http.Request, serverConfig APIC
 		return MCPGuardDecision{}, fmt.Errorf("guard denied access with non-error status %d", decision.Status)
 	}
 	return decision, nil
+}
+
+func validateMCPAccessToken(snapshot *APIConfigSnapshot, serverName string, serverConfig APIConfig, runtimeURLs mcpRuntimeURLs, authorization, tool string, requiredScopes []string) (interface{}, bool, bool) {
+	value, err := invokeMCPOAuthHook(snapshot, serverName, serverConfig, runtimeURLs, "oauthValidateAccessToken", map[string]interface{}{
+		"authorization": authorization, "tool": tool, "required_scopes": requiredScopes,
+	})
+	if err != nil {
+		return nil, false, false
+	}
+	result, ok := value.(map[string]interface{})
+	if !ok {
+		return nil, false, false
+	}
+	authenticated, _ := result["authenticated"].(bool)
+	forbidden, _ := result["forbidden"].(bool)
+	principal := result["principal"]
+	if allow, exists := result["allow"].(bool); exists {
+		authenticated = allow
+		if status, ok := result["status"].(json.Number); ok {
+			forbidden = status.String() == strconv.Itoa(http.StatusForbidden)
+		} else if status, ok := result["status"].(float64); ok {
+			forbidden = int(status) == http.StatusForbidden
+		}
+		if principalMap, ok := principal.(map[string]interface{}); ok {
+			if scopes, exists := result["scopes"]; exists {
+				principalMap["scopes"] = scopes
+				if scopeList, ok := scopes.([]interface{}); ok {
+					parts := make([]string, 0, len(scopeList))
+					for _, scope := range scopeList {
+						if text, ok := scope.(string); ok {
+							parts = append(parts, text)
+						}
+					}
+					principalMap["scope"] = strings.Join(parts, " ")
+				}
+			}
+		}
+	}
+	return principal, authenticated && principal != nil, forbidden
+}
+
+func mcpOAuthChallenge(runtimeURLs mcpRuntimeURLs, scopes []string, errorCode, description string) string {
+	escape := func(value string) string {
+		value = strings.ReplaceAll(value, `\`, `\\`)
+		return strings.ReplaceAll(value, `"`, `\"`)
+	}
+	return fmt.Sprintf(`Bearer resource_metadata="%s", scope="%s", error="%s", error_description="%s"`,
+		escape(runtimeURLs.ProtectedResourceMetadata), escape(strings.Join(scopes, " ")), escape(errorCode), escape(description))
+}
+
+func mcpOAuthAPIForRole(serverConfig APIConfig, role string) string {
+	switch role {
+	case "oauthAuthorize":
+		return serverConfig.OAuth.Authorize
+	case "oauthToken":
+		return serverConfig.OAuth.Token
+	case "oauthRegister":
+		return serverConfig.OAuth.Register
+	case "oauthAdminUser":
+		return serverConfig.OAuth.AdminUser
+	case "oauthValidateAccessToken":
+		return serverConfig.OAuth.VerifyAccess
+	default:
+		return ""
+	}
+}
+
+func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverConfig APIConfig, runtimeURLs mcpRuntimeURLs, role string, extra map[string]interface{}) (interface{}, error) {
+	apiName := mcpOAuthAPIForRole(serverConfig, role)
+	definition, exists := snapshot.Definitions[apiName]
+	if !exists || getAPIType(definition) != apiTypeAPI || definition.Script == "" {
+		return nil, fmt.Errorf("OAuth API is unavailable")
+	}
+	endpointPath, _ := canonicalAPIEndpointPath(apiName)
+	params := map[string]interface{}{
+		"oauth_hook": role, "endpoint": serverName, "mcp_api": serverName, "oauth_api": apiName,
+		"issuer": runtimeURLs.Issuer, "resource": runtimeURLs.Resource, "path": endpointPath,
+		"authorization_server_metadata_url": runtimeURLs.AuthorizationServerMetadata,
+		"protected_resource_metadata_url":   runtimeURLs.ProtectedResourceMetadata,
+		"authorization_endpoint":            runtimeURLs.AuthorizationEndpoint, "token_endpoint": runtimeURLs.TokenEndpoint,
+		"registration_endpoint": runtimeURLs.RegistrationEndpoint, "admin_user_endpoint": runtimeURLs.AdminUserEndpoint,
+		"scopes":                        append([]string(nil), snapshot.Definitions[serverConfig.OAuth.VerifyAccess].Scopes...),
+		"redirect_uri_allowed_prefixes": append([]string(nil), serverConfig.RedirectURIAllowedPrefixes...),
+	}
+	for key, value := range extra {
+		params[key] = value
+	}
+	requestContext := map[string]interface{}{
+		"method": extra["method"], "path": extra["request_path"], "query": extra["query"],
+		"form": extra["form"], "json": extra["body"], "headers": extra["headers"], "cookies": extra["cookies"],
+	}
+	params["nyan_request"] = requestContext
+	runtimeConfig := definition.Runtime
+	if runtimeConfig.Settings == nil {
+		runtimeConfig.Settings = map[string]interface{}{}
+	} else {
+		runtimeConfig.Settings = cloneJSONCompatibleValue(runtimeConfig.Settings).(map[string]interface{})
+	}
+	runtimeConfig.Settings["issuer"] = runtimeURLs.Issuer
+	runtimeConfig.Settings["resource"] = runtimeURLs.Resource
+	runtimeConfig.Settings["authorizationEndpoint"] = runtimeURLs.AuthorizationEndpoint
+	runtimeConfig.Settings["tokenEndpoint"] = runtimeURLs.TokenEndpoint
+	runtimeConfig.Settings["registrationEndpoint"] = runtimeURLs.RegistrationEndpoint
+	runtimeConfig.Settings["protectedResourceMetadata"] = runtimeURLs.ProtectedResourceMetadata
+	runtimeConfig.Settings["authorizationCookiePath"], _ = canonicalAPIEndpointPath(serverConfig.OAuth.Authorize)
+	runtimeConfig.Settings["scopes"] = append([]string(nil), snapshot.Definitions[serverConfig.OAuth.VerifyAccess].Scopes...)
+	runtimeConfig.Settings["redirectURIAllowedPrefixes"] = append([]string(nil), serverConfig.RedirectURIAllowedPrefixes...)
+	result, err := runScriptWithRuntimeWithSnapshot(snapshot, []string{definition.Script}, params, runtimeConfig, true)
+	if err != nil {
+		return nil, err
+	}
+	var value interface{}
+	decoder := json.NewDecoder(strings.NewReader(result))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return nil, fmt.Errorf("decode OAuth hook result: %w", err)
+	}
+	return value, nil
 }
 
 func mcpRequiredScopes(schemes []MCPSecurityScheme) []string {
@@ -2044,15 +2783,38 @@ func decodeAPIConfigDefinition(apiKey string, rawDefinition json.RawMessage, api
 	apiConfig.OutCheck = resolvePathFromBase(apiBaseDir, apiConfig.OutCheck)
 	apiConfig.Transport = strings.TrimSpace(apiConfig.Transport)
 	apiConfig.Resource = strings.TrimSpace(apiConfig.Resource)
+	apiConfig.Title = strings.TrimSpace(apiConfig.Title)
 	for i := range apiConfig.AllowedOrigins {
 		apiConfig.AllowedOrigins[i] = strings.TrimSpace(apiConfig.AllowedOrigins[i])
 	}
 	apiConfig.Guard.API = strings.TrimSpace(apiConfig.Guard.API)
+	apiConfig.OAuth.AuthorizationServerMetadata = strings.TrimSpace(apiConfig.OAuth.AuthorizationServerMetadata)
+	apiConfig.OAuth.ProtectedResourceMetadata = strings.TrimSpace(apiConfig.OAuth.ProtectedResourceMetadata)
+	apiConfig.OAuth.Authorize = strings.TrimSpace(apiConfig.OAuth.Authorize)
+	apiConfig.OAuth.Token = strings.TrimSpace(apiConfig.OAuth.Token)
+	apiConfig.OAuth.Register = strings.TrimSpace(apiConfig.OAuth.Register)
+	apiConfig.OAuth.AdminUser = strings.TrimSpace(apiConfig.OAuth.AdminUser)
+	apiConfig.OAuth.VerifyAccess = strings.TrimSpace(apiConfig.OAuth.VerifyAccess)
+	for index := range apiConfig.RedirectURIAllowedPrefixes {
+		apiConfig.RedirectURIAllowedPrefixes[index] = strings.TrimSpace(apiConfig.RedirectURIAllowedPrefixes[index])
+	}
+	for index := range apiConfig.Scopes {
+		apiConfig.Scopes[index] = strings.TrimSpace(apiConfig.Scopes[index])
+	}
+	for index := range apiConfig.SecuritySchemes {
+		apiConfig.SecuritySchemes[index].Type = strings.ToLower(strings.TrimSpace(apiConfig.SecuritySchemes[index].Type))
+		for scopeIndex := range apiConfig.SecuritySchemes[index].Scopes {
+			apiConfig.SecuritySchemes[index].Scopes[scopeIndex] = strings.TrimSpace(apiConfig.SecuritySchemes[index].Scopes[scopeIndex])
+		}
+	}
 	if apiConfig.RateLimit != nil {
 		apiConfig.RateLimit.Window = strings.TrimSpace(apiConfig.RateLimit.Window)
 	}
 	for i := range apiConfig.ProtocolVersions {
 		apiConfig.ProtocolVersions[i] = strings.TrimSpace(apiConfig.ProtocolVersions[i])
+	}
+	if getAPIType(apiConfig) == apiTypeMCP && len(apiConfig.ProtocolVersions) == 0 {
+		apiConfig.ProtocolVersions = []string{mcpProtocolVersion20251125, mcpProtocolVersion20250618}
 	}
 	for i := range apiConfig.Runtime.Capabilities {
 		apiConfig.Runtime.Capabilities[i] = strings.TrimSpace(apiConfig.Runtime.Capabilities[i])
@@ -2099,9 +2861,9 @@ func decodeAPIConfigDefinition(apiKey string, rawDefinition json.RawMessage, api
 func validateAPIConfigKnownFields(apiKey string, rawDefinition json.RawMessage) error {
 	topLevel, err := decodeKnownJSONObject(rawDefinition, "definition "+strconv.Quote(apiKey), stringSet(
 		"sql", "script", "path", "paramCheck", "paramcheck", "check", "outCheck", "outcheck",
-		"push", "trigger", "description", "type", "connectURL", "http", "runtime", "transport",
-		"protocolVersions", "resource", "guard", "tools", "instructions", "allowedOrigins",
-		"rateLimit", "maxConcurrent",
+		"push", "trigger", "title", "description", "type", "connectURL", "http", "runtime", "transport",
+		"protocolVersions", "tools", "instructions", "allowedOrigins", "redirectURIAllowedPrefixes",
+		"rateLimit", "maxConcurrent", "oauth", "securitySchemes", "annotations", "scopes",
 	))
 	if err != nil {
 		return fmt.Errorf("decode api JSON: %w", err)
@@ -2129,8 +2891,10 @@ func validateAPIConfigKnownFields(apiKey string, rawDefinition json.RawMessage) 
 			return fmt.Errorf("decode api JSON: %w", err)
 		}
 	}
-	if raw, exists := topLevel["guard"]; exists {
-		if _, err := decodeKnownJSONObject(raw, "definition "+strconv.Quote(apiKey)+".guard", stringSet("api")); err != nil {
+	if raw, exists := topLevel["oauth"]; exists {
+		if _, err := decodeKnownJSONObject(raw, "definition "+strconv.Quote(apiKey)+".oauth", stringSet(
+			"authorizationServerMetadata", "protectedResourceMetadata", "authorize", "token", "register", "adminUser", "verifyAccess",
+		)); err != nil {
 			return fmt.Errorf("decode api JSON: %w", err)
 		}
 	}
@@ -2140,33 +2904,24 @@ func validateAPIConfigKnownFields(apiKey string, rawDefinition json.RawMessage) 
 		}
 	}
 	if raw, exists := topLevel["tools"]; exists {
-		var tools []json.RawMessage
+		var tools []string
 		if err := json.Unmarshal(raw, &tools); err != nil {
-			return fmt.Errorf("decode api JSON: definition %q.tools must be an array: %w", apiKey, err)
+			return fmt.Errorf("decode api JSON: definition %q.tools must be an array of API names: %w", apiKey, err)
 		}
-		for toolIndex, rawTool := range tools {
-			contextName := fmt.Sprintf("definition %q.tools[%d]", apiKey, toolIndex)
-			toolFields, err := decodeKnownJSONObject(rawTool, contextName, stringSet(
-				"name", "api", "title", "description", "securitySchemes", "annotations",
-			))
-			if err != nil {
+	}
+	if raw, exists := topLevel["annotations"]; exists {
+		if _, err := decodeKnownJSONObject(raw, "definition "+strconv.Quote(apiKey)+".annotations", stringSet("readOnlyHint", "destructiveHint", "openWorldHint")); err != nil {
+			return fmt.Errorf("decode api JSON: %w", err)
+		}
+	}
+	if raw, exists := topLevel["securitySchemes"]; exists {
+		var schemes []json.RawMessage
+		if err := json.Unmarshal(raw, &schemes); err != nil {
+			return fmt.Errorf("decode api JSON: definition %q.securitySchemes must be an array: %w", apiKey, err)
+		}
+		for index, scheme := range schemes {
+			if _, err := decodeKnownJSONObject(scheme, fmt.Sprintf("definition %q.securitySchemes[%d]", apiKey, index), stringSet("type", "scopes")); err != nil {
 				return fmt.Errorf("decode api JSON: %w", err)
-			}
-			if rawAnnotations, exists := toolFields["annotations"]; exists {
-				if _, err := decodeKnownJSONObject(rawAnnotations, contextName+".annotations", stringSet("readOnlyHint", "destructiveHint", "openWorldHint")); err != nil {
-					return fmt.Errorf("decode api JSON: %w", err)
-				}
-			}
-			if rawSchemes, exists := toolFields["securitySchemes"]; exists {
-				var schemes []json.RawMessage
-				if err := json.Unmarshal(rawSchemes, &schemes); err != nil {
-					return fmt.Errorf("decode api JSON: %s.securitySchemes must be an array: %w", contextName, err)
-				}
-				for schemeIndex, rawScheme := range schemes {
-					if _, err := decodeKnownJSONObject(rawScheme, fmt.Sprintf("%s.securitySchemes[%d]", contextName, schemeIndex), stringSet("type", "scopes")); err != nil {
-						return fmt.Errorf("decode api JSON: %w", err)
-					}
-				}
 			}
 		}
 	}
@@ -2203,6 +2958,7 @@ func decodeKnownJSONObject(raw json.RawMessage, contextName string, allowed map[
 
 func validateConfiguredAPIExtensions(definitions map[string]APIConfig) error {
 	routes := make(map[string]string)
+	oauthOwners := make(map[string]string)
 	reservedRoutes := map[string]struct{}{
 		"/nyan-rpc": {},
 		"/nyan":     {},
@@ -2233,14 +2989,30 @@ func validateConfiguredAPIExtensions(definitions map[string]APIConfig) error {
 			if err := validateMCPServerConfig(apiName, apiConfig, definitions); err != nil {
 				return err
 			}
-			routePath := apiConfig.Path
-			if _, reserved := reservedRoutes[routePath]; reserved {
-				return fmt.Errorf("configuration error for MCP server %q: path %q is reserved", apiName, routePath)
+			if apiConfig.Transport == "streamable_http" {
+				routePath, _ := canonicalAPIEndpointPath(apiName)
+				if previous, exists := routes[routePath]; exists {
+					return fmt.Errorf("configuration error for MCP server %q: path %q conflicts with %q", apiName, routePath, previous)
+				}
+				routes[routePath] = apiName
+				if mcpOAuthConfigured(apiConfig.OAuth) {
+					publicOAuth := []string{apiConfig.OAuth.AuthorizationServerMetadata, apiConfig.OAuth.ProtectedResourceMetadata, apiConfig.OAuth.Authorize, apiConfig.OAuth.Token, apiConfig.OAuth.Register}
+					if apiConfig.OAuth.AdminUser != "" {
+						publicOAuth = append(publicOAuth, apiConfig.OAuth.AdminUser)
+					}
+					for _, oauthAPI := range publicOAuth {
+						if owner, exists := oauthOwners[oauthAPI]; exists && owner != apiName {
+							return fmt.Errorf("configuration error: OAuth API %q is owned by MCP servers %q and %q", oauthAPI, owner, apiName)
+						}
+						oauthOwners[oauthAPI] = apiName
+						oauthPath, _ := canonicalAPIEndpointPath(oauthAPI)
+						if previous, exists := routes[oauthPath]; exists && previous != apiName {
+							return fmt.Errorf("configuration error: OAuth path %q conflicts with %q", oauthPath, previous)
+						}
+						routes[oauthPath] = apiName
+					}
+				}
 			}
-			if previous, exists := routes[routePath]; exists {
-				return fmt.Errorf("configuration error for MCP server %q: path %q conflicts with %q", apiName, routePath, previous)
-			}
-			routes[routePath] = apiName
 		}
 	}
 
@@ -2260,13 +3032,16 @@ func validateConfiguredAPIExtensions(definitions map[string]APIConfig) error {
 
 func validateAPIConfigFieldPlacement(apiName string, apiConfig APIConfig) error {
 	definitionType := getAPIType(apiConfig)
-	hasMCPFields := apiConfig.Transport != "" || len(apiConfig.ProtocolVersions) > 0 || apiConfig.Resource != "" ||
-		apiConfig.Guard.API != "" || len(apiConfig.Tools) > 0 || apiConfig.Instructions != "" ||
-		len(apiConfig.AllowedOrigins) > 0 || apiConfig.RateLimit != nil || apiConfig.MaxConcurrent != 0
+	hasMCPFields := apiConfig.Transport != "" || len(apiConfig.ProtocolVersions) > 0 || len(apiConfig.Tools) > 0 ||
+		apiConfig.Instructions != "" || len(apiConfig.AllowedOrigins) > 0 || apiConfig.RateLimit != nil ||
+		apiConfig.MaxConcurrent != 0 || len(apiConfig.RedirectURIAllowedPrefixes) > 0 || mcpOAuthConfigured(apiConfig.OAuth)
 	if definitionType != apiTypeMCP && hasMCPFields {
 		return fmt.Errorf("configuration error for API %q: MCP fields are only allowed when type is %q", apiName, apiTypeMCP)
 	}
 	if definitionType == apiTypeMCP {
+		if apiConfig.Path != "" || apiConfig.Resource != "" || apiConfig.Guard.API != "" {
+			return fmt.Errorf("configuration error for MCP server %q: path, resource, and guard are not supported; endpoints and OAuth are API-name based", apiName)
+		}
 		if apiConfig.HTTP != nil {
 			return fmt.Errorf("configuration error for MCP server %q: http settings are not allowed; use the MCP top-level path and allowedOrigins fields", apiName)
 		}
@@ -2274,9 +3049,10 @@ func validateAPIConfigFieldPlacement(apiName string, apiConfig APIConfig) error 
 			return fmt.Errorf("configuration error for MCP server %q: API execution fields are not allowed on an MCP server definition", apiName)
 		}
 	}
-	if definitionType == apiTypeAPI && apiConfig.HTTP == nil &&
-		(len(apiConfig.Runtime.Capabilities) > 0 || len(apiConfig.Runtime.SQLFiles) > 0 || len(apiConfig.Runtime.Settings) > 0) {
-		return fmt.Errorf("configuration error for API %q: runtime requires an explicit http configuration", apiName)
+	if definitionType == apiTypeAPI && apiConfig.HTTP == nil {
+		if err := validateRuntimeConfig(apiName, apiConfig.Runtime); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -2347,14 +3123,20 @@ func validateConfiguredHTTPAPI(apiName string, apiConfig APIConfig) error {
 }
 
 func validateMCPServerConfig(apiName string, apiConfig APIConfig, definitions map[string]APIConfig) error {
-	if err := validateConfiguredHTTPPath(apiConfig.Path); err != nil {
+	if _, err := canonicalAPIEndpointPath(apiName); err != nil {
 		return fmt.Errorf("configuration error for MCP server %q: %w", apiName, err)
 	}
-	if apiConfig.Transport != "streamable_http" {
-		return fmt.Errorf("configuration error for MCP server %q: transport must be %q", apiName, "streamable_http")
+	if apiConfig.Transport != "streamable_http" && apiConfig.Transport != "stdio" {
+		if apiConfig.Transport == "" {
+			return fmt.Errorf("configuration error for MCP server %q: transport is required", apiName)
+		}
+		return fmt.Errorf("configuration error for MCP server %q: unsupported transport %q", apiName, apiConfig.Transport)
 	}
 	if err := validateRateLimitConfig("MCP server "+strconv.Quote(apiName), apiConfig.RateLimit); err != nil {
 		return err
+	}
+	if apiConfig.Transport == "streamable_http" && len(apiConfig.AllowedOrigins) == 0 {
+		return fmt.Errorf("configuration error for MCP server %q: allowedOrigins is required", apiName)
 	}
 	if err := validateAllowedOrigins("MCP server "+strconv.Quote(apiName), apiConfig.AllowedOrigins); err != nil {
 		return err
@@ -2362,11 +3144,12 @@ func validateMCPServerConfig(apiName string, apiConfig APIConfig, definitions ma
 	if apiConfig.MaxConcurrent < 0 || apiConfig.MaxConcurrent > 256 {
 		return fmt.Errorf("configuration error for MCP server %q: maxConcurrent must be between 1 and 256 when specified", apiName)
 	}
-	if len(apiConfig.ProtocolVersions) == 0 {
-		return fmt.Errorf("configuration error for MCP server %q: protocolVersions is required", apiName)
+	protocolVersions := apiConfig.ProtocolVersions
+	if len(protocolVersions) == 0 {
+		protocolVersions = []string{mcpProtocolVersion20251125, mcpProtocolVersion20250618}
 	}
 	seenProtocolVersions := make(map[string]struct{}, len(apiConfig.ProtocolVersions))
-	for _, version := range apiConfig.ProtocolVersions {
+	for _, version := range protocolVersions {
 		if version == "" {
 			return fmt.Errorf("configuration error for MCP server %q: protocolVersions cannot contain an empty value", apiName)
 		}
@@ -2378,73 +3161,154 @@ func validateMCPServerConfig(apiName string, apiConfig APIConfig, definitions ma
 		}
 		seenProtocolVersions[version] = struct{}{}
 	}
-	if preferredMCPProtocolVersion(apiConfig.ProtocolVersions) == "" {
+	if preferredMCPProtocolVersion(protocolVersions) == "" {
 		return fmt.Errorf("configuration error for MCP server %q: protocolVersions contains no implemented version", apiName)
 	}
-	resourceURL, err := url.ParseRequestURI(apiConfig.Resource)
-	if err != nil || resourceURL.Scheme == "" || resourceURL.Host == "" {
-		return fmt.Errorf("configuration error for MCP server %q: resource must be an absolute URL", apiName)
+	oauthEnabled := mcpOAuthConfigured(apiConfig.OAuth)
+	if oauthEnabled {
+		if apiConfig.Transport != "streamable_http" {
+			return fmt.Errorf("configuration error for MCP server %q: oauth requires streamable_http", apiName)
+		}
+		if err := validateMCPOAuthConfig(apiName, apiConfig, definitions); err != nil {
+			return err
+		}
 	}
-	if resourceURL.User != nil || resourceURL.RawQuery != "" || resourceURL.ForceQuery || resourceURL.Fragment != "" || resourceURL.RawPath != "" {
-		return fmt.Errorf("configuration error for MCP server %q: resource must not contain user information, an encoded path, query, or fragment", apiName)
-	}
-	if resourceURL.Scheme != "https" && !isLoopbackHostname(resourceURL.Hostname()) {
-		return fmt.Errorf("configuration error for MCP server %q: resource must use HTTPS outside loopback", apiName)
-	}
-	if resourceURL.Path != apiConfig.Path {
-		return fmt.Errorf("configuration error for MCP server %q: resource path %q must match MCP path %q", apiName, resourceURL.Path, apiConfig.Path)
-	}
-	if strings.TrimSpace(apiConfig.Guard.API) == "" {
-		return fmt.Errorf("configuration error for MCP server %q: guard.api is required", apiName)
-	}
-	guardConfig, exists := definitions[apiConfig.Guard.API]
-	if !exists {
-		return fmt.Errorf("configuration error for MCP server %q: guard API %q was not found", apiName, apiConfig.Guard.API)
-	}
-	if getAPIType(guardConfig) != apiTypeAPI || guardConfig.HTTP == nil || configuredHTTPAccess(guardConfig) != configuredHTTPAccessInternal {
-		return fmt.Errorf("configuration error for MCP server %q: guard API %q must be an internal API", apiName, apiConfig.Guard.API)
+	if len(apiConfig.Tools) == 0 {
+		return fmt.Errorf("configuration error for MCP server %q: tools must contain at least one API name", apiName)
 	}
 	seenTools := make(map[string]struct{})
 	for toolIndex, tool := range apiConfig.Tools {
-		if !isValidMCPToolName(tool.Name) {
-			return fmt.Errorf("configuration error for MCP server %q: tools[%d].name %q is invalid", apiName, toolIndex, tool.Name)
+		toolName := strings.TrimSpace(tool.API)
+		if !isValidMCPToolName(toolName) {
+			return fmt.Errorf("configuration error for MCP server %q: tools[%d] API name %q is invalid", apiName, toolIndex, toolName)
 		}
-		if _, exists := seenTools[tool.Name]; exists {
-			return fmt.Errorf("configuration error for MCP server %q: duplicate tool name %q", apiName, tool.Name)
+		if _, exists := seenTools[toolName]; exists {
+			return fmt.Errorf("configuration error for MCP server %q: duplicate tool API %q", apiName, toolName)
 		}
-		seenTools[tool.Name] = struct{}{}
-		target, exists := definitions[tool.API]
-		if !exists || getAPIType(target) != apiTypeAPI {
-			return fmt.Errorf("configuration error for MCP server %q: tool %q references missing API %q", apiName, tool.Name, tool.API)
+		seenTools[toolName] = struct{}{}
+		target, exists := definitions[toolName]
+		if !exists || getAPIType(target) != apiTypeAPI || strings.TrimSpace(target.Script) == "" {
+			return fmt.Errorf("configuration error for MCP server %q: tool references invalid backing API %q", apiName, toolName)
 		}
-		if tool.API == apiConfig.Guard.API {
-			return fmt.Errorf("configuration error for MCP server %q: tool %q cannot expose its guard API", apiName, tool.Name)
+		info, err := os.Stat(target.Script)
+		if err != nil || !info.Mode().IsRegular() {
+			return fmt.Errorf("configuration error for MCP server %q: tool %q script must be a regular file", apiName, toolName)
 		}
-		if target.HTTP != nil && configuredHTTPAccess(target) != configuredHTTPAccessInternal {
-			return fmt.Errorf("configuration error for MCP server %q: tool %q must reference a legacy or internal API", apiName, tool.Name)
+		schema, err := resolveAPISchema(target)
+		if err != nil {
+			return fmt.Errorf("configuration error for MCP server %q: tool %q schema cannot be resolved: %w", apiName, toolName, err)
 		}
-		if len(tool.SecuritySchemes) != 1 {
-			return fmt.Errorf("configuration error for MCP server %q: tool %q must declare exactly one security scheme", apiName, tool.Name)
+		if _, err := compileJSONSchema(normalizedMCPInputSchema(schema.Input)); err != nil {
+			return fmt.Errorf("configuration error for MCP server %q: tool %q input schema is invalid: %w", apiName, toolName, err)
 		}
-		for schemeIndex, scheme := range tool.SecuritySchemes {
-			if scheme.Type != "oauth2" && scheme.Type != "noauth" {
-				return fmt.Errorf("configuration error for MCP server %q: tool %q securitySchemes[%d].type %q is unsupported", apiName, tool.Name, schemeIndex, scheme.Type)
+		if oauthEnabled && len(mcpRequiredScopes(target.SecuritySchemes)) == 0 && len(target.Scopes) == 0 {
+			return fmt.Errorf("configuration error for MCP server %q: OAuth tool %q must define scopes", apiName, toolName)
+		}
+	}
+	return nil
+}
+
+func canonicalAPIEndpointPath(apiName string) (string, error) {
+	if apiName == "" || apiName != strings.TrimSpace(apiName) || strings.HasPrefix(apiName, "/") ||
+		strings.HasSuffix(apiName, "/") || strings.Contains(apiName, "//") || strings.ContainsAny(apiName, "\\?#\r\n\t") {
+		return "", fmt.Errorf("invalid API name %q for endpoint", apiName)
+	}
+	for _, part := range strings.Split(apiName, "/") {
+		if part == "" || part == "." || part == ".." {
+			return "", fmt.Errorf("invalid API name %q for endpoint", apiName)
+		}
+	}
+	endpointPath := "/" + apiName
+	if (&url.URL{Path: endpointPath}).EscapedPath() != endpointPath {
+		return "", fmt.Errorf("API name %q is not a canonical URL path", apiName)
+	}
+	switch endpointPath {
+	case "/", "/favicon.ico", "/nyan", "/nyan-rpc":
+		return "", fmt.Errorf("endpoint path %s is reserved", endpointPath)
+	}
+	return endpointPath, nil
+}
+
+func mcpOAuthConfigured(oauth MCPOAuthConfig) bool {
+	return oauth.AuthorizationServerMetadata != "" || oauth.ProtectedResourceMetadata != "" || oauth.Authorize != "" ||
+		oauth.Token != "" || oauth.Register != "" || oauth.AdminUser != "" || oauth.VerifyAccess != ""
+}
+
+func validateMCPOAuthConfig(mcpName string, mcp APIConfig, definitions map[string]APIConfig) error {
+	if len(mcp.RedirectURIAllowedPrefixes) == 0 {
+		return fmt.Errorf("configuration error for MCP server %q: redirectURIAllowedPrefixes is required when oauth is configured", mcpName)
+	}
+	for _, prefix := range mcp.RedirectURIAllowedPrefixes {
+		parsed, err := url.Parse(prefix)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" ||
+			parsed.Fragment != "" || parsed.Path == "" || !strings.HasSuffix(parsed.Path, "/") || parsed.EscapedPath() != parsed.Path {
+			return fmt.Errorf("configuration error for MCP server %q: invalid redirect URI prefix %q", mcpName, prefix)
+		}
+	}
+	references := []struct {
+		label    string
+		name     string
+		metadata bool
+	}{
+		{"authorizationServerMetadata", mcp.OAuth.AuthorizationServerMetadata, true},
+		{"protectedResourceMetadata", mcp.OAuth.ProtectedResourceMetadata, true},
+		{"authorize", mcp.OAuth.Authorize, false},
+		{"token", mcp.OAuth.Token, false},
+		{"register", mcp.OAuth.Register, false},
+		{"verifyAccess", mcp.OAuth.VerifyAccess, false},
+	}
+	if mcp.OAuth.AdminUser != "" {
+		references = append(references, struct {
+			label, name string
+			metadata    bool
+		}{"adminUser", mcp.OAuth.AdminUser, false})
+	}
+	seen := map[string]string{}
+	for _, reference := range references {
+		if reference.name == "" {
+			return fmt.Errorf("configuration error for MCP server %q: oauth.%s API name is required", mcpName, reference.label)
+		}
+		if _, err := canonicalAPIEndpointPath(reference.name); err != nil {
+			return fmt.Errorf("configuration error for MCP server %q: oauth.%s: %w", mcpName, reference.label, err)
+		}
+		if previous, exists := seen[reference.name]; exists {
+			return fmt.Errorf("configuration error for MCP server %q: oauth.%s and oauth.%s reference the same API %q", mcpName, reference.label, previous, reference.name)
+		}
+		seen[reference.name] = reference.label
+		definition, exists := definitions[reference.name]
+		if !exists || getAPIType(definition) != apiTypeAPI {
+			return fmt.Errorf("configuration error for MCP server %q: oauth.%s references invalid API %q", mcpName, reference.label, reference.name)
+		}
+		if !reference.metadata {
+			info, err := os.Stat(definition.Script)
+			if err != nil || !info.Mode().IsRegular() {
+				return fmt.Errorf("configuration error for MCP server %q: oauth.%s API %q must have a regular JavaScript file", mcpName, reference.label, reference.name)
 			}
-			if scheme.Type == "noauth" && len(scheme.Scopes) > 0 {
-				return fmt.Errorf("configuration error for MCP server %q: noauth tool %q cannot declare scopes", apiName, tool.Name)
-			}
-			if scheme.Type == "oauth2" && len(scheme.Scopes) == 0 {
-				return fmt.Errorf("configuration error for MCP server %q: OAuth tool %q must declare at least one scope", apiName, tool.Name)
-			}
-			seenScopes := make(map[string]struct{})
-			for _, scope := range scheme.Scopes {
-				if !isValidOAuthScopeToken(scope) {
-					return fmt.Errorf("configuration error for MCP server %q: tool %q contains invalid scope %q", apiName, tool.Name, scope)
-				}
-				if _, exists := seenScopes[scope]; exists {
-					return fmt.Errorf("configuration error for MCP server %q: tool %q contains duplicate scope %q", apiName, tool.Name, scope)
-				}
-				seenScopes[scope] = struct{}{}
+		}
+	}
+	verify := definitions[mcp.OAuth.VerifyAccess]
+	if len(verify.Scopes) == 0 {
+		return fmt.Errorf("configuration error for MCP server %q: oauth.verifyAccess API %q must define scopes", mcpName, mcp.OAuth.VerifyAccess)
+	}
+	serverScopes := map[string]struct{}{}
+	for _, scope := range verify.Scopes {
+		if !isValidOAuthScopeToken(scope) {
+			return fmt.Errorf("configuration error for MCP server %q: invalid OAuth scope %q", mcpName, scope)
+		}
+		if _, duplicate := serverScopes[scope]; duplicate {
+			return fmt.Errorf("configuration error for MCP server %q: duplicate OAuth scope %q", mcpName, scope)
+		}
+		serverScopes[scope] = struct{}{}
+	}
+	for _, tool := range mcp.Tools {
+		target := definitions[tool.API]
+		scopes := target.Scopes
+		if len(target.SecuritySchemes) > 0 {
+			scopes = mcpRequiredScopes(target.SecuritySchemes)
+		}
+		for _, scope := range scopes {
+			if _, exists := serverScopes[scope]; !exists {
+				return fmt.Errorf("configuration error for MCP server %q: tool %q requires unknown OAuth scope %q", mcpName, tool.API, scope)
 			}
 		}
 	}
@@ -2954,6 +3818,16 @@ func cloneAPIConfig(apiConfig APIConfig) APIConfig {
 	}
 	cloned.ProtocolVersions = append([]string(nil), apiConfig.ProtocolVersions...)
 	cloned.AllowedOrigins = append([]string(nil), apiConfig.AllowedOrigins...)
+	cloned.RedirectURIAllowedPrefixes = append([]string(nil), apiConfig.RedirectURIAllowedPrefixes...)
+	cloned.Scopes = append([]string(nil), apiConfig.Scopes...)
+	cloned.SecuritySchemes = make([]MCPSecurityScheme, len(apiConfig.SecuritySchemes))
+	for index, scheme := range apiConfig.SecuritySchemes {
+		cloned.SecuritySchemes[index] = scheme
+		cloned.SecuritySchemes[index].Scopes = append([]string(nil), scheme.Scopes...)
+	}
+	cloned.Annotations.ReadOnlyHint = cloneBoolPointer(apiConfig.Annotations.ReadOnlyHint)
+	cloned.Annotations.DestructiveHint = cloneBoolPointer(apiConfig.Annotations.DestructiveHint)
+	cloned.Annotations.OpenWorldHint = cloneBoolPointer(apiConfig.Annotations.OpenWorldHint)
 	cloned.Runtime.Capabilities = append([]string(nil), apiConfig.Runtime.Capabilities...)
 	cloned.Runtime.SQLFiles = append([]string(nil), apiConfig.Runtime.SQLFiles...)
 	if apiConfig.Runtime.Settings != nil {
@@ -3241,21 +4115,6 @@ func loadAndPublishAPIConfigAttempt(apiFilePath string) (*apiConfigLoadResult, m
 }
 
 func validateConfiguredServerTransportSecurity(snapshot *APIConfigSnapshot, serverConfig Config) error {
-	if snapshot == nil {
-		return nil
-	}
-	for apiName, apiConfig := range snapshot.Definitions {
-		if getAPIType(apiConfig) != apiTypeMCP {
-			continue
-		}
-		resourceURL, err := url.Parse(apiConfig.Resource)
-		if err != nil || isLoopbackHostname(resourceURL.Hostname()) {
-			continue
-		}
-		if strings.TrimSpace(serverConfig.CertPath) == "" || strings.TrimSpace(serverConfig.KeyPath) == "" {
-			return fmt.Errorf("MCP server %q uses a non-loopback resource and requires both certPath and keyPath", apiName)
-		}
-	}
 	return nil
 }
 
@@ -6552,7 +7411,15 @@ func runScriptWithRuntimeWithSnapshot(snapshot *APIConfigSnapshot, scriptPaths [
 	}
 
 	committed = true
-	return value.String(), nil
+	exported := value.Export()
+	if text, ok := exported.(string); ok {
+		return text, nil
+	}
+	encoded, err := json.Marshal(exported)
+	if err != nil {
+		return "", fmt.Errorf("encode script result: %w", err)
+	}
+	return string(encoded), nil
 }
 
 func runtimeHasCapability(runtimeConfig APIRuntimeConfig, target string) bool {
@@ -6574,6 +7441,8 @@ func restrictNyanRuntimeCapabilities(vm *goja.Runtime, capabilities []string) {
 	}
 	if _, ok := allowed["crypto"]; !ok {
 		vm.Set("nyanCrypto", goja.Undefined())
+		vm.Set("nyanRandomBase64URL", goja.Undefined())
+		vm.Set("nyanSHA256Base64URL", goja.Undefined())
 		vm.Set("sha256", goja.Undefined())
 		vm.Set("nyanBase64Encode", goja.Undefined())
 		vm.Set("nyanBase64Decode", goja.Undefined())
@@ -6581,6 +7450,8 @@ func restrictNyanRuntimeCapabilities(vm *goja.Runtime, capabilities []string) {
 	vm.Set("sha1", goja.Undefined())
 	if _, ok := allowed["password"]; !ok {
 		vm.Set("nyanPassword", goja.Undefined())
+		vm.Set("nyanArgon2idHash", goja.Undefined())
+		vm.Set("nyanArgon2idVerify", goja.Undefined())
 	}
 	for _, functionName := range []string{
 		"nyanGetAPI",
@@ -7931,6 +8802,25 @@ func registerNyanCryptographicFunctions(vm *goja.Runtime) {
 			}
 			return vm.ToValue(valid)
 		},
+	})
+	vm.Set("nyanRandomBase64URL", func(call goja.FunctionCall) goja.Value {
+		value, err := secureRandomBase64URL(int(call.Argument(0).ToInteger()))
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(value)
+	})
+	vm.Set("nyanSHA256Base64URL", func(call goja.FunctionCall) goja.Value { return vm.ToValue(sha256Base64URL(call.Argument(0).String())) })
+	vm.Set("nyanArgon2idHash", func(call goja.FunctionCall) goja.Value {
+		value, err := hashPasswordArgon2ID(call.Argument(0).String())
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(value)
+	})
+	vm.Set("nyanArgon2idVerify", func(call goja.FunctionCall) goja.Value {
+		valid, _ := verifyPasswordArgon2ID(call.Argument(0).String(), call.Argument(1).String())
+		return vm.ToValue(valid)
 	})
 }
 
