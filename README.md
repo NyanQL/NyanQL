@@ -17,6 +17,7 @@ NyanQLは、主に次のような用途に向いています。
 - INSERT、UPDATE、DELETEなどの更新処理をAPI化する
 - 複数のSQLを1つのトランザクションとしてまとめて実行する
 - JavaScriptで、SQLだけでは書きにくい一連の処理をまとめる
+- `api.json` をincludeして、API定義を複数ファイル・複数階層に分割する
 - WebSocketを使って、API実行後の結果を別の画面へPush配信する
 - `/nyan` で、利用できるAPIの情報を取得する
 
@@ -122,7 +123,7 @@ go build -o nyanql
 - `config.json`
 - `api.json`
 
-SQLファイルやJavaScriptファイルも、`api.json` から参照できる場所に置いてください。
+SQLファイルやJavaScriptファイルも、`api.json` から参照できる場所に置いてください。API定義を分割する場合は、ルートの `api.json` からinclude先を相対パスまたは絶対パスで指定します。
 
 デフォルトでは、NyanQLは実行ファイルと同じ場所にある `config.json` と `api.json` を読み込みます。起動時オプションや環境変数による指定は必須ではありません。別の場所に置きたい場合だけ、追加で指定できます。
 
@@ -181,6 +182,10 @@ Windowsでは、ビルド済みの実行ファイルをダブルクリックし�
     "Username": "admin",
     "Password": "secret"
   },
+  "APIHotReload": {
+    "Enabled": true,
+    "Interval": "1s"
+  },
   "log": {
     "Filename": "./logs/nyanql.log",
     "MaxSize": 5,
@@ -207,9 +212,58 @@ Windowsでは、ビルド済みの実行ファイルをダブルクリックし�
 | `DBType` | `mysql`、`postgres`、`sqlite`、`duckdb` のいずれかを指定します。 |
 | `DBName` | データベース名、またはSQLite/DuckDBのファイルパスです。 |
 | `BasicAuth` | API呼び出し時のBasic認証ユーザ名とパスワードです。 |
+| `APIHotReload` | `api.json` の定期的な変更確認を設定します。省略時も有効です。 |
 | `javascript_include` | `check` や `script` の実行前に読み込む共通JavaScriptです。 |
 
 `config.json` 内の相対パスは、`config.json` がある場所を基準にして扱われます。対象は `CertPath`、`KeyPath`、SQLite/DuckDB の `DBName`、`log.Filename`、`javascript_include` です。
+
+### api.jsonのホットリロード
+
+NyanQLは既定で、ルートの `api.json` と、そこから `type: "include"` で読み込まれるすべてのJSONファイルの変更を定期的に確認します。`APIHotReload` を省略した場合は、`Enabled: true`、`Interval: "1s"` として動作します。外部のファイル監視ライブラリは使わず、Go標準ライブラリによる定期確認を行います。
+
+```json
+{
+  "APIHotReload": {
+    "Enabled": true,
+    "Interval": "1s"
+  }
+}
+```
+
+ホットリロードを無効にする場合だけ、`Enabled` に `false` を指定します。
+
+`Interval` はリロードの実行間隔ではなく、変更の確認間隔です。`1s`、`500ms` など、Goのduration形式で0より大きい値を指定します。`APIHotReload` または `Interval` の省略時は `1s` です。
+
+主な指定例は次のとおりです。
+
+| 確認間隔 | 設定値 |
+|---|---|
+| 500ミリ秒 | `"500ms"` |
+| 1秒 | `"1s"` |
+| 1分 | `"1m"` |
+| 1時間 | `"1h"` |
+| 1日 | `"24h"` |
+
+Goのduration形式には日を表す `d` 単位がないため、1日は `"1d"` ではなく `"24h"` と指定します。`"1h30m"` のような複合指定も可能です。
+
+確認時刻はNyanQLを起動した時点を基準にします。たとえば `"24h"` は起動後24時間ごとの確認であり、「毎日午前0時」のような固定時刻での確認ではありません。間隔を長くすると、`api.json` の変更反映にも最大でその間隔と同程度の時間がかかります。
+
+確認のたびに監視対象ごとのファイル内容のSHA-256を比較し、いずれかが変わった場合はルートからincludeグラフ全体を1回再構築します。子ファイルだけを部分的に差し替えることはありません。
+
+includeの追加・変更・削除に成功すると、監視対象も同時に追加・削除されます。参照中のincludeファイルが削除された場合や、候補設定のinclude先がまだ存在しない場合は、現在稼働中の正常な設定を維持したまま、そのパスの確認を続けます。ファイルが再作成または修正されると、次の変更確認時に再読み込みします。
+
+不正なJSON、循環参照、名前競合、scheduleやws_clientの設定エラーなどがある場合は、候補全体を採用しません。同じファイル状態とエラーについて、確認間隔ごとに同じログを繰り返し記録することもありません。すべての検証に成功した場合だけ、通常API、public API、API一覧、schedule、ws_client、監視対象を新しい設定へ交換します。
+
+通常API、public API、`/nyan/`、JSON-RPC、`schedule`、`ws_client`が参照する定義を更新できます。
+
+| 定義 | 追加 | 変更 | 削除 |
+|---|---|---|---|
+| `schedule` | 新しいジョブを開始 | 次回実行から新しいscript／cronを使用 | 次回以降の実行を停止 |
+| `ws_client` | 新しく接続 | script／descriptionは接続を維持して更新し、connectURLは再接続 | 接続と再接続処理を停止 |
+
+不正なcron式や必須項目の不足がある場合は変更全体を採用せず、現在稼働中の定義を維持します。接続先WebSocketサーバーが停止しているだけの場合は定義を採用し、通常のバックオフ処理で再接続を続けます。
+
+`config.json`、SQL、JavaScript、public配下のファイル自体は監視しません。ただしAPI実行時のSQL・JavaScript本体と、`/nyan/{API名}` で表示するスキーマは、それぞれのリクエスト時にファイルを読み直します。そのためSQL、script、paramCheck、outCheck内のスキーマ記述は、ファイル保存後の次のAPI詳細取得から反映され、NyanQLの再起動や `api.json` の更新は不要です。`Enabled: false` の場合は、ルートとincludeファイルのどちらも監視しません。
 
 ---
 
@@ -217,7 +271,60 @@ Windowsでは、ビルド済みの実行ファイルをダブルクリックし�
 
 `api.json` には、API名と、実行するSQLまたはJavaScriptの対応を書きます。
 
-`api.json` 内の相対パスは、`api.json` がある場所を基準にして扱われます。対象は `sql`、`script`、`paramCheck`、`outCheck`、public API の `path` です。
+各 `api.json` 内の相対パスは、その定義が書かれているJSONファイルの場所を基準にして扱われます。対象はincludeの `path`、`sql`、`script`、`paramCheck`、`outCheck`、public APIの `path` です。
+
+### api.jsonを複数ファイルに分ける
+
+`type: "include"` を使うと、API定義を複数ファイルへ分割できます。include定義のJSONキーがmount名になり、`path` に読み込むJSONファイルを指定します。
+
+ルートの `api.json`：
+
+```json
+{
+  "health": {
+    "sql": ["./sql/health.sql"],
+    "description": "稼働確認"
+  },
+  "sub": {
+    "type": "include",
+    "path": "./sub/api.json"
+  }
+}
+```
+
+`sub/api.json`：
+
+```json
+{
+  "getItem": {
+    "sql": ["./sql/getItem.sql"],
+    "description": "商品を取得します"
+  },
+  "admin": {
+    "type": "include",
+    "path": "./admin/api.json"
+  }
+}
+```
+
+`sub/admin/api.json`：
+
+```json
+{
+  "getUser": {
+    "sql": ["./sql/getUser.sql"],
+    "description": "ユーザーを取得します"
+  }
+}
+```
+
+展開後の完全API名は、それぞれ `health`、`sub/getItem`、`sub/admin/getUser` です。includeの階層数は固定されていません。include先には通常APIだけでなく、`public`、`schedule`、`ws_client`、さらに別のincludeも記述できます。
+
+include定義で使用できる項目は `type` と `path` だけです。`sql`、`script`、`trigger`、`connectURL`、`description` などを混在させると設定エラーになります。mount名は空文字、`.`、`..`、`/` を含む名前、前後に空白がある名前を使用できません。
+
+同じ階層にmount `sub` がある場合、直接定義されたAPI名 `sub` と `sub/...` はmount名前空間と競合するためエラーになります。includeを使用しない既存API名の `/` は一律禁止されず、mountと競合しなければ従来どおり利用できます。
+
+循環参照は正規化した絶対パスを使って検出され、エラーにはincludeの参照経路が表示されます。同じファイルを異なるmountから読み込むことはできますが、現在処理中のinclude経路へ同じ物理ファイルが再登場すると循環参照になります。
 
 ### SQLを実行するAPI
 
@@ -276,6 +383,8 @@ Windowsでは、ビルド済みの実行ファイルをダブルクリックし�
 
 この例では `./public/app.js` を `http://localhost:8080/public/app.js` で取得できます。空パス、存在しないファイル、ディレクトリへのアクセスは 404 になります。ディレクトリ一覧や `index.html` の自動探索は行いません。
 
+public定義がmount `sub` のinclude先にある場合、公開エンドポイントも完全名になり、`sub/assets` なら `/sub/assets/app.js` で取得します。`path` の相対パスは、そのpublic定義が書かれたJSONファイルを基準に解決されます。
+
 `type: "public"` はBasic認証を通さずに配信します。認証や認可が必要なファイル公開では、`paramCheck` を指定してください。`paramCheck` と `outCheck` では、公開エンドポイント名とリクエストされた相対パスを参照できます。
 
 ```js
@@ -307,6 +416,22 @@ curl -u admin:secret \
 ```
 
 URLのパスにAPI名を書いた場合、NyanQLはそのパスをAPI名として扱います。たとえば `/getItem?id=1` は、`api=getItem` として扱われます。
+
+mount配下のAPIは完全API名を指定します。たとえば `sub/getItem` は、次のいずれの形式でも呼び出せます。
+
+```bash
+curl -u admin:secret "http://localhost:8080/sub/getItem?id=1"
+curl -u admin:secret "http://localhost:8080/?api=sub/getItem&id=1"
+```
+
+```json
+{
+  "api": "sub/getItem",
+  "id": 1
+}
+```
+
+JSON-RPCの `method`、`nyanCallMe` の `api`、`push` の参照先にも同じ完全API名を指定します。mount内からの相対API参照は行わないため、`getItem` が `sub/getItem` に自動補正されることはありません。
 
 ---
 
@@ -460,15 +585,26 @@ curl -u admin:secret "http://localhost:8080/nyan/"
     },
     "getItem": {
       "description": "商品を1件取得します"
+    },
+    "sub/admin/getUser": {
+      "description": "ユーザーを取得します"
     }
   }
 }
 ```
 
+`apis` は通常APIだけを完全API名のキーで示すフラットな一覧です。include定義、public、schedule、ws_clientは一覧に含まれません。
+
 ### APIごとの詳細を見る
 
 ```bash
 curl -u admin:secret "http://localhost:8080/nyan/getItem"
+```
+
+mount配下のAPIも完全API名で取得できます。
+
+```bash
+curl -u admin:secret "http://localhost:8080/nyan/sub/admin/getUser"
 ```
 
 返り値の例です。
@@ -480,7 +616,41 @@ curl -u admin:secret "http://localhost:8080/nyan/getItem"
   "nyanAcceptedParams": {
     "id": 1
   },
-  "nyanOutputColumns": []
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "integer",
+        "examples": [1]
+      }
+    },
+    "required": ["id"],
+    "additionalProperties": true
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "success": {"const": true},
+      "status": {"const": 200},
+      "result": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {}
+          },
+          "required": ["id"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": ["success", "status", "result"],
+    "additionalProperties": false
+  },
+  "schemaSource": {
+    "input": "sql",
+    "output": "sql"
+  }
 }
 ```
 
@@ -495,9 +665,158 @@ const nyanAcceptedParams = {
     { item_id: 1, quantity: 2 }
   ]
 };
-
-const nyanOutputColumns = ["order_id", "order_no"];
 ```
+
+旧形式の `nyanOutputColumns` は廃止しました。JavaScript内に宣言しても解析されず、`/nyan/{API名}` のレスポンスにも含まれません。script APIの出力スキーマを公開する場合は、`outCheck` に `nyanOutputSchema` を定義してください。
+
+現在の `test2` は、入力スキーマを `paramCheck`、出力スキーマを `outCheck` に分けた例です。
+
+```json
+{
+  "test2": {
+    "paramCheck": "./javascript/check_test1.js",
+    "script": "./javascript/script.js",
+    "outCheck": "./javascript/out_check_test2.js",
+    "description": "paramCheckが実行されscriptが動くサンプルです。"
+  }
+}
+```
+
+- `check_test1.js` の `nyanInputSchema` が入力仕様を表します。
+- `out_check_test2.js` の `nyanOutputSchema` が正常レスポンス全体の出力仕様を表します。
+- `out_check_test2.js` の実行部分は、scriptの実際の出力を確認します。
+
+`/nyan/test2` を取得すると、`schemaSource.input` は `paramCheck`、`schemaSource.output` は `outCheck` になります。
+
+```bash
+curl -u admin:secret "http://localhost:8080/nyan/test2"
+```
+
+`nyanOutputSchema` の公開と `outCheck` による実行時チェックは別の役割です。NyanQLは公開したJSON Schemaを使って自動検証しないため、実際の出力を拒否したい条件は `outCheck` のJavaScriptにも記述してください。
+
+### 入出力スキーマを明示する
+
+入力スキーマは `paramCheck` ファイルのトップレベルに `nyanInputSchema` として定義します。出力スキーマは `outCheck` ファイルのトップレベルに `nyanOutputSchema` として定義します。どちらもJSON Schema Draft 2020-12形式のオブジェクトを想定しています。
+
+```js
+const nyanInputSchema = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  properties: {
+    id: {
+      type: "integer",
+      minimum: 1,
+      description: "取得する商品ID",
+      examples: [1]
+    },
+    include_deleted: {
+      type: "boolean",
+      default: false
+    }
+  },
+  required: ["id"],
+  additionalProperties: false
+};
+
+if (!nyanAllParams.id) {
+  ({success: false, status: 400, error: {message: "idを指定してください"}});
+} else {
+  ({success: true, status: 200, error: null});
+}
+```
+
+```js
+const nyanOutputSchema = {
+  type: "object",
+  properties: {
+    success: {const: true},
+    status: {const: 200},
+    result: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: {type: "integer"},
+          name: {type: "string"}
+        },
+        required: ["id", "name"],
+        additionalProperties: false
+      }
+    }
+  },
+  required: ["success", "status", "result"],
+  additionalProperties: false
+};
+
+const output = JSON.parse(nyanAllParams.nyan_output.body);
+({success: output.success === true, status: output.success === true ? 200 : 500});
+```
+
+`nyanOutputSchema` は `result` の中身だけではなく、NyanQLが返す正常レスポンス全体を表します。`$schema` は任意です。記載した場合はそのまま公開され、省略した場合にNyanQLが自動追加することはありません。
+
+現時点では、これらのスキーマは `/nyan/{API名}` からの公開用です。NyanQLはJSON Schemaによるリクエスト値・レスポンス値の実行時検証や、Draft 2020-12メタスキーマに対する完全検証を行いません。業務ルールの確認は従来どおり `paramCheck` / `outCheck` のJavaScriptで行います。
+
+### スキーマの取得優先順位
+
+入力スキーマは次の順で決まります。
+
+1. `paramCheck` 内の `nyanInputSchema`
+2. SQLファイルからの自動生成
+3. API本体のscript内にある `nyanAcceptedParams`
+4. 型不明の空スキーマ `{}`
+
+出力スキーマは次の順で決まります。
+
+1. `outCheck` 内の `nyanOutputSchema`
+2. SQLファイルからの自動生成
+3. 型不明の空スキーマ `{}`
+
+`paramCheck` や `outCheck` が設定されていても、対象の明示スキーマが書かれていなければ次の候補へ進みます。`schemaSource.input` には `paramCheck`、`sql`、`scriptLegacy`、`unknown` のいずれか、`schemaSource.output` には `outCheck`、`sql`、`unknown` のいずれかが入ります。`scriptLegacy` は、入力をscript内の `nyanAcceptedParams` から取得したことを表します。
+
+スキーマはAPI設定のスナップショットには保存せず、`/nyan/{API名}` を取得するたびに関連ファイルから解決します。`/nyan/` のAPI一覧取得ではスキーマファイルを読みません。
+
+`paramCheck` 内に明示的な `nyanInputSchema` がある場合、API詳細では新しい `inputSchema` を正として扱い、旧形式の `nyanAcceptedParams` は省略します。明示スキーマがない場合は、SQLコメントやscript内の `nyanAcceptedParams` から取得できた従来の値を引き続き `nyanAcceptedParams` に表示します。SQLまたはlegacyから自動生成した `inputSchema` も、これまでどおり同時に公開します。
+
+### SQLから自動生成されるスキーマ
+
+入力では、2way-SQLのテスト値から次の型を推測します。
+
+| SQL記述 | 推測結果 |
+|---|---|
+| `/*id*/1` | `integer` |
+| `/*price*/1.5` | `number` |
+| `/*name*/'cat'` | `string` |
+| `/*enabled*/true` | `boolean` |
+| `IN (/*ids*/1)` | `array`、要素は `integer` |
+| `IN (/*codes*/'A')` | `array`、要素は `string` |
+
+コメント後の値はAPIの既定値ではなくSQL単体実行用のテスト値なので、`default` ではなく `examples` に入ります。`/*IF ...*/` の外にあるパラメータは必須、IF内だけにあるパラメータは任意です。`/*BEGIN*/` の内側という理由だけでは任意になりません。複数SQLでは、入力パラメータをすべてのファイルから統合します。同名パラメータの型が競合した場合は、誤った型を断定せずそのプロパティを `{}` にします。SQL由来の入力スキーマは、SQL以外で使われる追加パラメータを拒否しないよう `additionalProperties: true` になります。
+
+出力では、`SELECT` または `RETURNING` の列名を取得し、各列の型は確定せず `{}` とします。明示的な `AS` 別名と単純な列参照を安全に取得できた場合だけ列を限定します。`SELECT *`、別名のない式、条件で変化する列などを含む場合は、実際のレスポンスを過度に制限しないスキーマへフォールバックします。行を返さない更新SQLの `result` は空オブジェクトです。複数SQLでは、実際のレスポンスに使われる最後のSQLから出力スキーマを生成します。
+
+### 静的スキーマ定義の制約
+
+明示スキーマはJavaScriptを実行せず、構文木から静的に読み取ります。使用できる値は、オブジェクト、配列、文字列、数値、真偽値、`null` と、それらのネストです。
+
+次のような動的な定義は対象外です。
+
+```js
+const nyanInputSchema = createSchema();
+```
+
+```js
+const nyanInputSchema = {
+  ...commonSchema
+};
+```
+
+```js
+const nyanInputSchema = {
+  type: schemaType
+};
+```
+
+同一ファイル内の別の `const` を参照する場合も、現時点では動的な参照として扱います。明示スキーマが動的、非オブジェクト、重複宣言などで静的に取得できない場合でも、API設定の読み込みは妨げません。対象の `/nyan/{API名}` を取得したときにスキーマ解決エラーを返します。ファイルを修正すれば、次の詳細取得から正常なスキーマが返ります。なお、スキーマ抽出とは別に、paramCheckやoutCheckのJavaScript本体は従来どおり実行可能なコードである必要があります。
 
 ---
 
@@ -710,7 +1029,7 @@ ws.onmessage = function (event) {
 };
 ```
 
-NyanQLのWebSocketサーバでは、URLパスの末尾がチャネル名になります。上の例では、`listItems` がチャネル名です。
+NyanQLのWebSocketサーバでは、先頭の `/` を除いたURLパス全体がチャネル名になります。上の例では、`listItems` がチャネル名です。mount配下の `sub/listItems` をpush先にする場合は、WebSocketも `/sub/listItems` へ接続してください。
 
 ### Pushで配信される内容
 
@@ -753,7 +1072,11 @@ NyanQLは、WebSocketサーバとしてPushを配信するだけでなく、Nyan
 }
 ```
 
-この設定を書くと、NyanQLは起動時に `connectURL` へ接続します。接続が切れた場合は、時間をあけながら再接続を試みます。
+この設定を書くと、NyanQLは起動時またはホットリロードでの追加時に `connectURL` へ接続します。接続が切れた場合は、時間をあけながら再接続を試みます。
+
+ws_clientがinclude先にある場合、内部名と `nyanAllParams.ws_client` には `sub/receiveExternalMessage` のような完全名が入ります。mountを削除すると、その配下の接続と再接続処理も停止します。
+
+ホットリロードで `script` または `description` だけを変更した場合は、現在の接続を維持し、次に受信するメッセージから新しい設定を使用します。`connectURL` を変更した場合は現在の接続を閉じ、新しい接続先へ接続します。切り替え中に接続先から送信されたメッセージの受信は保証されません。
 
 受信したメッセージは、`script` に渡されます。scriptの中では、次の値を `nyanAllParams` から参照できます。
 
@@ -782,13 +1105,13 @@ scriptが空文字を返した場合、接続先へ返信しません。空で�
 }
 ```
 
-この場合、起動時に `NYANQL_WS_URL` の値を接続先として使います。
+この場合、起動時または `api.json` の再読み込み時に `NYANQL_WS_URL` の値を接続先として使います。
 
 ---
 
 ## 定期実行ジョブ
 
-`api.json` で `type: "schedule"` を指定すると、NyanQLの起動時に定期実行ジョブとして登録されます。
+`api.json` で `type: "schedule"` を指定すると、NyanQLの起動時またはホットリロードでの追加時に定期実行ジョブとして登録されます。
 
 ```json
 {
@@ -805,6 +1128,8 @@ scriptが空文字を返した場合、接続先へ返信しません。空で�
 ```
 
 この例では、毎日10:00に `./javascript/daily_job.js` が実行されます。`type: "schedule"` の定義はHTTP APIとしては公開されないため、外部リクエストから直接実行されません。
+
+scheduleがinclude先にある場合、ジョブ名と `nyanAllParams.nyan_job_name` には `sub/dailyJob` のような完全名が入ります。mountを削除すると、その配下のジョブも次回以降実行されません。
 
 cronは5フィールド形式です。
 
@@ -823,6 +1148,8 @@ cronは5フィールド形式です。
 | `0 9-18 * * *` | 9時から18時まで毎時0分 |
 
 現在の実装では秒単位の指定には対応していません。最短の実行間隔は1分です。`*/10` は「起動してから10分ごと」ではなく、crontabと同じく時計の分が `00, 10, 20, 30, 40, 50` のタイミングで実行されます。
+
+ホットリロードでscriptまたはcronを変更すると、待機中のtimerを停止し、新しいcronから次回時刻を計算します。script実行中に変更または削除された場合、その実行は途中で強制終了せず最後まで継続します。同じschedule名を変更前後で同時実行することはなく、実行中に過ぎた発火時刻を後からまとめて実行することもありません。
 
 scheduleのscript内では、通常のscriptと同じように `nyanAllParams` や `nyanRunSQL()` などを使えます。加えて、次の値が `nyanAllParams` に入ります。
 
