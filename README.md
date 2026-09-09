@@ -192,7 +192,8 @@ Windowsでは、ビルド済みの実行ファイルをダブルクリックし�
     "MaxBackups": 3,
     "MaxAge": 7,
     "Compress": true,
-    "EnableLogging": true
+    "EnableLogging": true,
+    "Level": "info"
   },
   "javascript_include": [
     "./javascript/common.js"
@@ -216,6 +217,27 @@ Windowsでは、ビルド済みの実行ファイルをダブルクリックし�
 | `javascript_include` | `check` や `script` の実行前に読み込む共通JavaScriptです。 |
 
 `config.json` 内の相対パスは、`config.json` がある場所を基準にして扱われます。対象は `CertPath`、`KeyPath`、SQLite/DuckDB の `DBName`、`log.Filename`、`javascript_include` です。
+
+### ログ
+
+ログは1行につき1つのJSONとして記録します。`time`、`level`、`msg`（処理名）に加え、API名、ファイル名、件数など、処理に応じた項目が付きます。従来のテキスト形式でログを解析している場合は、JSON形式への対応が必要です。
+
+- `log.EnableLogging: true` は指定ファイルへの出力です。`Filename`、`MaxSize`、`MaxBackups`、`MaxAge`、`Compress` のローテーション設定は従来どおり使えます。
+- `log.EnableLogging: false` は標準エラーへの出力です。ログ自体の無効化ではありません。設定読み込み前の起動エラーも標準エラーに出ます。
+- 標準出力にはサービスのログを出しません。MCPのstdioモードではJSON-RPC応答専用です。
+- `log.Level` は `debug`、`info`、`warn`、`error` から選びます。省略時は `info` で、指定以上の重大度のログを出します。不正な値では起動を中止します。
+
+通常の `info` では、起動、設定変更、ジョブ完了、接続状態、警告、エラーを記録します。SQL全文、チェック用JavaScript全文、API設定全体、リクエスト・WebSocket・Push・ジョブ結果の本文は自動出力しません。WebSocket接続先は資格情報・パス・クエリ・フラグメントを除いたschemeとhostだけを記録します。エラーには処理名と型、取得できる場合はSQLSTATEやWebSocket終了コードを記録します。
+
+正常なAPI呼び出しを毎回記録するアクセスログはなく、すべてのリクエストのURL・ステータス・処理時間を出力するものではありません。ジョブ完了ログの `result_bytes` は結果文字列のバイト数で、結果本文やDBの行数ではありません。以下はログの出力例です。
+
+```json
+{"time":"2026-09-09T12:00:00+09:00","level":"INFO","msg":"schedule_completed","job":"daily_update","result_bytes":128}
+```
+
+`debug` では、SQL更新件数、Pushや受信メッセージのバイト数、ジョブの次回実行時刻も記録します。さらに、**エラーの詳細文字列と、通常のJavaScriptの `console.log(...)` が出力されます**。これらにはパラメータや認証情報が含まれ得るため、調査時に限って有効にしてください。詳細文字列・consoleメッセージはそれぞれ4096バイトまでとし、改行はJSON内でエスケープします。制限付きJavaScriptのconsoleは、debugでも引数の個数だけを記録します。
+
+`debug` にしてもSQL全文や結合したJavaScript全文の自動出力は行いません。`log.Level` を変更した場合は再起動が必要です。
 
 ### api.jsonのホットリロード
 
@@ -416,6 +438,8 @@ curl -u admin:secret \
 ```
 
 URLのパスにAPI名を書いた場合、NyanQLはそのパスをAPI名として扱います。たとえば `/getItem?id=1` は、`api=getItem` として扱われます。
+
+`http.path` で公開パスを設定したAPIでは、そのパスに対応するAPIだけを実行します。クエリ・フォーム・JSON本文に別の `api` を指定しても実行先は変わらず、`paramCheck` やスクリプトに渡す `nyanAllParams.api` も公開パスに対応するAPI名になります。これは `http.responseMode: "nyan"`（省略時も同じ）と `"raw"` に共通です。`http.access: "internal"` のAPIを、この方法で外部から呼び出すことはできません。
 
 mount配下のAPIは完全API名を指定します。たとえば `sub/getItem` は、次のいずれの形式でも呼び出せます。
 

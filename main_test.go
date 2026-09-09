@@ -3839,6 +3839,79 @@ func TestConfiguredHTTPInternalAPICannotUseLegacyHTTPRoute(t *testing.T) {
 	}
 }
 
+func TestConfiguredHTTPNyanDispatchKeepsAuthorizedAPI(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	oldConfig := config
+	config.BasicAuth = BasicAuthConfig{Username: "nyan", Password: "secret"}
+	t.Cleanup(func() { config = oldConfig })
+	script := writeTestScript(t, `({api:nyanAllParams.api, value:nyanAllParams.value || "none"})`)
+	check := writeTestScript(t, `({success:nyanAllParams.api === "sub/open", status:nyanAllParams.api === "sub/open" ? 200 : 403})`)
+	for _, access := range []string{configuredHTTPAccessAnonymous, configuredHTTPAccessBasic} {
+		t.Run(access, func(t *testing.T) {
+			setTestSQLFiles(t, map[string]APIConfig{
+				"sub/open": {Script: script, ParamCheck: check, HTTP: &HTTPAPIConfig{Path: "/open", Access: access, ResponseMode: configuredHTTPResponseNyan}},
+				"internal": {Script: script, HTTP: &HTTPAPIConfig{Access: configuredHTTPAccessInternal}},
+				"private":  {Script: script, HTTP: &HTTPAPIConfig{Path: "/private", Access: configuredHTTPAccessBasic}},
+				"legacy":   {Script: script},
+			})
+			for _, target := range []string{"internal", "private", "legacy", "missing"} {
+				for _, source := range []string{"query", "form", "json"} {
+					t.Run(target+"/"+source, func(t *testing.T) {
+						method, requestURL, contentType, body := http.MethodGet, "/open?api="+target+"&value=kept", "", ""
+						if source == "form" {
+							method, requestURL, contentType, body = http.MethodPost, "/open", "application/x-www-form-urlencoded", "api="+target+"&value=kept"
+						} else if source == "json" {
+							method, requestURL, contentType, body = http.MethodPost, "/open", "application/json", fmt.Sprintf(`{"api":%q,"value":"kept"}`, target)
+						}
+						req := httptest.NewRequest(method, requestURL, strings.NewReader(body))
+						req.Header.Set("Content-Type", contentType)
+						if access == configuredHTTPAccessBasic {
+							req.SetBasicAuth("nyan", "secret")
+						}
+						rec := httptest.NewRecorder()
+						unifiedHandler(rec, req)
+						if rec.Code != http.StatusOK {
+							t.Fatalf("status = %d; body=%s", rec.Code, rec.Body.String())
+						}
+						result := decodeTestJSONObject(t, rec.Body.Bytes())
+						if result["api"] != "sub/open" || result["value"] != "kept" {
+							t.Fatalf("dispatch changed API or lost parameters: %#v", result)
+						}
+					})
+				}
+			}
+			if access == configuredHTTPAccessBasic {
+				rec := httptest.NewRecorder()
+				unifiedHandler(rec, httptest.NewRequest(http.MethodGet, "/open?api=internal", nil))
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("dispatch bypassed entry authentication: status=%d", rec.Code)
+				}
+			}
+		})
+	}
+}
+
+func TestConfiguredHTTPNyanDispatchIgnoresUntrustedAPIValues(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	script := writeTestScript(t, `({api:nyanAllParams.api})`)
+	setTestSQLFiles(t, map[string]APIConfig{
+		"open": {Script: script, HTTP: &HTTPAPIConfig{Path: "/open", Access: configuredHTTPAccessAnonymous}},
+	})
+	for _, body := range []string{`{}`, `null`, `{"api":null}`, `{"api":42}`, `{"api":["internal","open"]}`, `{"api":"open"}`} {
+		t.Run(body, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/open?api=internal&api=private", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			unifiedHandler(rec, req)
+			if rec.Code != http.StatusOK || decodeTestJSONObject(t, rec.Body.Bytes())["api"] != "open" {
+				t.Fatalf("untrusted api value changed dispatch: status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestConfiguredHTTPResponseRejectsUnsafeValues(t *testing.T) {
 	tests := []struct {
 		name     string

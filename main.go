@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"math"
 	"mime"
 	"net"
@@ -90,6 +91,7 @@ type LogConfig struct {
 	MaxAge        int    `json:"MaxAge"`
 	Compress      bool   `json:"Compress"`
 	EnableLogging bool   `json:"EnableLogging"`
+	Level         string `json:"Level,omitempty"`
 }
 
 type APIConfig struct {
@@ -510,68 +512,73 @@ func resolveExistingServiceFilePath(pathValue, label, source string) (string, er
 
 // main
 func main() {
+	// stdout is reserved for the MCP stdio protocol, including during startup.
+	log.SetOutput(os.Stderr)
+	log.SetFlags(0)
 	execDir, err := os.Executable()
 	if err != nil {
-		log.Fatalf("Failed to get executable path: %v", err)
+		fatalServiceError("executable_path_failed", err)
 	}
 	execDir = filepath.Dir(execDir)
 
 	paths, err := resolveServiceFilePaths(execDir, os.Args[1:])
 	if err != nil {
-		log.Fatal(err)
+		fatalServiceError("startup_failed", err)
 	}
 
 	configFile, err := os.Open(paths.Config.Path)
 	if err != nil {
-		log.Fatalf("Failed to open config file: %v", err)
+		fatalServiceError("config_open_failed", err, "file", paths.Config.Path)
 	}
 	defer configFile.Close()
 	applyConfigDefaults(&config)
 	if err = json.NewDecoder(configFile).Decode(&config); err != nil {
-		log.Fatalf("Failed to decode config JSON: %v", err)
+		fatalServiceError("config_decode_failed", err, "file", paths.Config.Path)
 	}
 	apiHotReloadInterval, err := parseAPIHotReloadInterval(config.APIHotReload.Interval)
 	if err != nil {
-		log.Fatalf("Invalid APIHotReload.Interval: %v", err)
+		fatalServiceError("Invalid APIHotReload.Interval: expected a positive duration", err)
 	}
 	configBaseDir := filepath.Dir(paths.Config.Path)
 	adjustPaths(configBaseDir, &config)
-	setupLogger(configBaseDir)
-	log.Printf("Binary version: %s", buildVersion)
-	log.Printf("Go runtime version: %s", runtime.Version())
-	log.Printf("Config file: %s (source: %s)", paths.Config.Path, paths.Config.Source)
-	log.Printf("API file: %s (source: %s)", paths.API.Path, paths.API.Source)
-	log.Printf("Config version: %s", config.Version)
+	if err := setupLogger(configBaseDir); err != nil {
+		fatalServiceError("Invalid log.Level: expected debug, info, warn, or error", err)
+	}
+	serviceLog(slog.LevelInfo, "starting", "binary_version", buildVersion, "go_version", runtime.Version(), "config_version", config.Version)
+	serviceLog(slog.LevelInfo, "config_loaded", "file", paths.Config.Path, "source", paths.Config.Source)
 
 	db, err = connectDB(config)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		fatalServiceError("database_connect_failed", err, "database_type", config.DatabaseType)
 	}
 	initialLoad, err := loadAPIConfigFile(paths.API.Path)
 	if err != nil {
-		log.Fatalf("Failed to load API file: %v", err)
+		fatalServiceError("api_config_load_failed", err, "file", paths.API.Path)
 	}
 	if err := validateConfiguredServerTransportSecurity(initialLoad.Snapshot, config); err != nil {
-		log.Fatalf("Invalid server transport configuration: %v", err)
+		fatalServiceError("server_transport_invalid", err)
 	}
 	setAPISnapshot(initialLoad.Snapshot)
+	serviceLog(slog.LevelInfo, "api_config_loaded", "file", paths.API.Path, "source", paths.API.Source, "api_count", len(initialLoad.Snapshot.Definitions))
 	if paths.MCPServer != "" {
 		mcpName, mcpConfig, selectErr := selectMCPStdioServer(initialLoad.Snapshot, paths.MCPServer)
 		if selectErr != nil {
-			log.Fatal(selectErr)
+			fatalServiceError("mcp_stdio_selection_failed", selectErr, "api", paths.MCPServer)
 		}
+		serviceLog(slog.LevelInfo, "mcp_stdio_starting", "api", mcpName)
 		if err := serveMCPStdio(os.Stdin, os.Stdout, initialLoad.Snapshot, mcpName, mcpConfig); err != nil {
-			log.Fatal(err)
+			fatalServiceError("mcp_stdio_failed", err, "api", mcpName)
 		}
+		serviceLog(slog.LevelInfo, "mcp_stdio_stopped", "api", mcpName)
 		return
 	}
 	backgroundRuntimes = newBackgroundRuntimeManager()
 	backgroundRuntimes.reconcile(initialLoad.Snapshot.Schedules, initialLoad.Snapshot.WSClients)
 	if config.APIHotReload.Enabled {
-		log.Printf("API hot reload enabled: file=%s check_interval=%s", paths.API.Path, apiHotReloadInterval)
+		serviceLog(slog.LevelInfo, "api_hot_reload_enabled", "file", paths.API.Path, "interval", apiHotReloadInterval.String())
 		go watchAPIFile(paths.API.Path, apiHotReloadInterval, initialLoad.Snapshot.Files)
 	} else {
-		log.Printf("API hot reload disabled")
+		serviceLog(slog.LevelInfo, "api_hot_reload_disabled")
 	}
 
 	corsHandler := cors.New(cors.Options{
@@ -600,11 +607,11 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 	if config.CertPath != "" && config.KeyPath != "" {
-		log.Printf("Server starting on HTTPS port %d\n", config.Port)
-		log.Fatal(server.ListenAndServeTLS(config.CertPath, config.KeyPath))
+		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "https", "port", config.Port)
+		fatalServiceError("http_server_stopped", server.ListenAndServeTLS(config.CertPath, config.KeyPath))
 	} else {
-		log.Printf("Server starting on HTTP port %d\n", config.Port)
-		log.Fatal(server.ListenAndServe())
+		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "http", "port", config.Port)
+		fatalServiceError("http_server_stopped", server.ListenAndServe())
 	}
 }
 
@@ -801,7 +808,7 @@ func handleConfiguredHTTPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		if configuredHTTPResponseMode(apiConfig) == configuredHTTPResponseNyan {
-			clonedRequest := r.Clone(context.WithValue(r.Context(), configuredAPIDispatchContextKey{}, true))
+			clonedRequest := r.Clone(context.WithValue(r.Context(), configuredAPIDispatchContextKey{}, apiName))
 			clonedURL := *r.URL
 			clonedURL.Path = "/" + strings.TrimPrefix(apiName, "/")
 			clonedRequest.URL = &clonedURL
@@ -885,18 +892,18 @@ func handleRawScriptHTTPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.
 			sendJSONError(w, "configured API is busy", http.StatusServiceUnavailable)
 			return
 		}
-		log.Printf("configured HTTP API %s failed: %v", apiName, err)
+		logServiceError(slog.LevelError, "http_script_failed", err, "api", apiName)
 		sendJSONError(w, "configured API execution failed", http.StatusInternalServerError)
 		return
 	}
 	response, err := parseConfiguredHTTPResponse(scriptResult)
 	if err != nil {
-		log.Printf("configured HTTP API %s returned an invalid response: %v", apiName, err)
+		logServiceError(slog.LevelError, "http_script_response_invalid", err, "api", apiName)
 		sendJSONError(w, "configured API returned an invalid response", http.StatusInternalServerError)
 		return
 	}
 	if err := writeConfiguredHTTPResponse(w, r, response); err != nil {
-		log.Printf("configured HTTP API %s response rejected: %v", apiName, err)
+		logServiceError(slog.LevelError, "http_script_response_rejected", err, "api", apiName)
 		sendJSONError(w, "configured API returned an invalid response", http.StatusInternalServerError)
 	}
 }
@@ -1432,7 +1439,7 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	defer release()
 	value, err := invokeMCPOAuthHook(snapshot, serverName, serverConfig, runtimeURLs, role, params)
 	if err != nil {
-		log.Printf("OAuth hook %s failed: %v", apiName, err)
+		logServiceError(slog.LevelError, "oauth_hook_failed", err, "api", apiName, "role", role)
 		http.Error(w, "OAuth hook failed", http.StatusInternalServerError)
 		return
 	}
@@ -1994,7 +2001,7 @@ func handleMCPToolsList(snapshot *APIConfigSnapshot, w http.ResponseWriter, requ
 	for _, toolConfig := range serverConfig.Tools {
 		tool, err := buildMCPToolDefinition(snapshot, toolConfig)
 		if err != nil {
-			log.Printf("failed to build MCP tool %s: %v", toolConfig.Name, err)
+			logServiceError(slog.LevelError, "mcp_tool_definition_failed", err, "tool", toolConfig.Name)
 			writeMCPError(w, request.ID, -32603, "Internal error", nil)
 			return
 		}
@@ -2128,7 +2135,7 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 	}
 	apiSchema, err := resolveAPISchema(apiConfig)
 	if err != nil {
-		log.Printf("failed to resolve MCP tool schema for %s: %v", toolConfig.Name, err)
+		logServiceError(slog.LevelError, "mcp_tool_schema_failed", err, "tool", toolConfig.Name)
 		writeMCPError(w, request.ID, -32603, "Internal error", nil)
 		return
 	}
@@ -2151,7 +2158,7 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 	}
 	resultJSON, err := callNyanAPIFromVMWithSnapshot(snapshot, toolConfig.API, executionParams)
 	if err != nil {
-		log.Printf("MCP tool %s execution failed: %v", toolConfig.Name, err)
+		logServiceError(slog.LevelError, "mcp_tool_execution_failed", err, "tool", toolConfig.Name)
 		writeMCPResult(w, request.ID, mcpToolErrorResult("Tool execution failed", nil))
 		return
 	}
@@ -2166,7 +2173,7 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 	}
 	if apiSchema.OutputSource != schemaSourceUnknown {
 		if err := validateJSONSchemaValue(apiSchema.Output, result); err != nil {
-			log.Printf("MCP tool %s output schema validation failed: %v", toolConfig.Name, err)
+			logServiceError(slog.LevelError, "mcp_tool_output_invalid", err, "tool", toolConfig.Name)
 			writeMCPResult(w, request.ID, mcpToolErrorResult("Tool result did not match its output schema", nil))
 			return
 		}
@@ -2485,7 +2492,7 @@ func writeMCPJSONRPCResponse(w http.ResponseWriter, response MCPJSONRPCResponse)
 func writeMCPJSONRPCResponseWithStatus(w http.ResponseWriter, response MCPJSONRPCResponse, status int) {
 	body, err := json.Marshal(response)
 	if err != nil {
-		log.Printf("failed to encode MCP response: %v", err)
+		logServiceError(slog.LevelError, "mcp_response_failed", err)
 		http.Error(w, "failed to encode MCP response", http.StatusInternalServerError)
 		return
 	}
@@ -2509,7 +2516,7 @@ func writeMCPJSONRPCResponseWithStatus(w http.ResponseWriter, response MCPJSONRP
 	w.WriteHeader(status)
 	body = append(body, '\n')
 	if _, err := w.Write(body); err != nil {
-		log.Printf("failed to encode MCP response: %v", err)
+		logServiceError(slog.LevelError, "mcp_response_failed", err)
 	}
 }
 
@@ -2569,7 +2576,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("WebSocketアップグレードエラー: %v", err)
+		logServiceError(slog.LevelWarn, "websocket_upgrade_failed", err, "channel", channel)
 		return
 	}
 	defer conn.Close()
@@ -2607,10 +2614,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("WebSocket read error: %v", err)
+			logWebSocketDisconnect("websocket_disconnected", channel, err)
 			break
 		}
-		log.Printf("Received WebSocket message on channel [%s]: bytes=%d", channel, len(msg))
+		serviceLog(slog.LevelDebug, "websocket_message_received", "channel", channel, "bytes", len(msg))
 	}
 }
 
@@ -4169,14 +4176,14 @@ func watchAPIFile(apiFilePath string, interval time.Duration, initialFiles map[s
 		if err != nil {
 			errorKey := fmt.Sprintf("%x:%s", apiFileStatesFingerprint(observedFiles), err.Error())
 			if errorKey != lastReloadError {
-				log.Printf("API hot reload failed: %v; current API configuration remains active", err)
+				logServiceError(slog.LevelError, "api_hot_reload_failed", err, "file", apiFilePath, "active_config_retained", true)
 			}
 			lastReloadError = errorKey
 			continue
 		}
 		lastReloadError = ""
 		if reloaded {
-			log.Printf("API hot reload succeeded: api_count=%d", len(currentSQLFiles()))
+			serviceLog(slog.LevelInfo, "api_hot_reload_completed", "api_count", len(currentSQLFiles()))
 		}
 	}
 }
@@ -4271,7 +4278,7 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 		} else if err := json.Unmarshal(body, &data); err != nil {
 			return nil, fmt.Errorf("error parsing JSON data: %v", err)
 		}
-		log.Printf("Received JSON request: keys=%d", len(data))
+
 		return data, nil
 	}
 
@@ -4342,14 +4349,14 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 	if checkScriptPath != "" {
 		success, statusCode, errorObj, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, nil)
 		if err != nil {
-			log.Printf("Public paramCheck script error: %v", err)
+			logServiceError(slog.LevelError, "public_param_check_failed", err, "api", apiKey)
 			sendJSONError(w, err.Error(), statusCode)
 			return
 		}
 		allowed := success && statusCode == http.StatusOK
 		if isCheckOnlyMode(params) || !allowed {
 			if !success && errorObj != nil {
-				log.Printf("Public paramCheck rejected %s/%s: %v", apiKey, requestedPath, errorObj)
+				serviceLog(slog.LevelInfo, "public_param_check_rejected", "api", apiKey, "status", statusCode)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
@@ -4389,7 +4396,7 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 	contentType := http.DetectContentType(fileContent)
 	if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, contentType, fileContent); handled {
 		if err != nil {
-			log.Printf("Public outCheck script error: %v", err)
+			logServiceError(slog.LevelError, "public_out_check_failed", err, "api", apiKey)
 			sendJSONError(w, err.Error(), outStatusCode)
 			return
 		}
@@ -4477,7 +4484,7 @@ func (manager *backgroundRuntimeManager) reconcile(schedules map[string]schedule
 			continue
 		}
 		if _, changed := runtime.update(nil); changed {
-			log.Printf("Stopping schedule job %s", name)
+			serviceLog(slog.LevelInfo, "schedule_stopping", "job", name)
 		}
 	}
 	for name, cfg := range schedules {
@@ -4485,14 +4492,14 @@ func (manager *backgroundRuntimeManager) reconcile(schedules map[string]schedule
 			accepted, changed := runtime.update(&cfg)
 			if accepted {
 				if changed {
-					log.Printf("Updated schedule job %s with cron %q", name, cfg.trigger.Value)
+					serviceLog(slog.LevelInfo, "schedule_updated", "job", name, "cron", cfg.trigger.Value)
 				}
 				continue
 			}
 		}
 		runtime := newScheduleRuntime(cfg)
 		manager.schedules[name] = runtime
-		log.Printf("Starting schedule job %s with cron %q", name, cfg.trigger.Value)
+		serviceLog(slog.LevelInfo, "schedule_starting", "job", name, "cron", cfg.trigger.Value)
 		go manager.runSchedule(name, runtime)
 	}
 
@@ -4501,7 +4508,7 @@ func (manager *backgroundRuntimeManager) reconcile(schedules map[string]schedule
 			continue
 		}
 		if _, changed, _ := runtime.update(nil); changed {
-			log.Printf("Stopping WebSocket client %s", name)
+			serviceLog(slog.LevelInfo, "ws_client_stopping", "client", name)
 		}
 	}
 	for name, cfg := range wsClients {
@@ -4509,14 +4516,14 @@ func (manager *backgroundRuntimeManager) reconcile(schedules map[string]schedule
 			accepted, changed, reconnect := runtime.update(&cfg)
 			if accepted {
 				if changed {
-					log.Printf("Updated WebSocket client %s reconnect=%t", name, reconnect)
+					serviceLog(slog.LevelInfo, "ws_client_updated", "client", name, "reconnect", reconnect)
 				}
 				continue
 			}
 		}
 		runtime := newWSClientRuntime(cfg)
 		manager.wsClients[name] = runtime
-		log.Printf("Starting WebSocket client %s -> %s", name, cfg.connectURL)
+		serviceLog(slog.LevelInfo, "ws_client_starting", "client", name, "origin", logURLOrigin(cfg.connectURL))
 		go manager.runWSClient(name, runtime)
 	}
 }
@@ -4833,12 +4840,12 @@ func (runtime *scheduleRuntime) run() {
 		}
 		next := cfg.schedule.next(time.Now())
 		if next.IsZero() {
-			log.Printf("Schedule job %s has no next run time", cfg.name)
+			serviceLog(slog.LevelWarn, "schedule_no_next_run", "job", cfg.name)
 			<-runtime.wake
 			continue
 		}
 
-		log.Printf("Schedule job %s next run at %s", cfg.name, next.Format(time.RFC3339))
+		serviceLog(slog.LevelDebug, "schedule_next_run", "job", cfg.name, "next_run", next.Format(time.RFC3339))
 		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-runtime.wake:
@@ -4871,10 +4878,10 @@ func (runtime *scheduleRuntime) run() {
 			result, err = runScript([]string{latest.scriptPath}, params)
 		}
 		if err != nil {
-			log.Printf("Schedule job %s failed: %v", latest.name, err)
+			logServiceError(slog.LevelError, "schedule_failed", err, "job", latest.name)
 			continue
 		}
-		log.Printf("Schedule job %s completed: %s", latest.name, result)
+		serviceLog(slog.LevelInfo, "schedule_completed", "job", latest.name, "result_bytes", len(result))
 	}
 }
 
@@ -5066,7 +5073,7 @@ func (runtime *wsClientRuntime) run() {
 			continue
 		}
 		if err != nil {
-			log.Printf("WebSocket client %s disconnected: %v", cfg.name, err)
+			logWebSocketDisconnect("ws_client_disconnected", cfg.name, err)
 		}
 
 		timer := time.NewTimer(backoff)
@@ -5107,7 +5114,7 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 	defer runtime.clearConnection(conn)
 	defer conn.Close()
 
-	log.Printf("WebSocket client %s connected", cfg.name)
+	serviceLog(slog.LevelInfo, "ws_client_connected", "client", cfg.name)
 
 	for {
 		msgType, data, err := conn.ReadMessage()
@@ -5119,7 +5126,7 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 			return fmt.Errorf("close message received: %s", string(data))
 		}
 
-		log.Printf("ws_client %s received %s: %s", cfg.name, websocketMessageTypeLabel(msgType), string(data))
+		serviceLog(slog.LevelDebug, "ws_client_message_received", "client", cfg.name, "message_type", websocketMessageTypeLabel(msgType), "bytes", len(data))
 
 		latest, active := runtime.currentConfig()
 		if !active || latest.connectURL != cfg.connectURL {
@@ -5148,7 +5155,7 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 
 		result, err := runScript([]string{latest.scriptPath}, allParams)
 		if err != nil {
-			log.Printf("ws_client %s script error: %v", latest.name, err)
+			logServiceError(slog.LevelError, "ws_client_script_failed", err, "client", latest.name)
 			continue
 		}
 
@@ -5180,7 +5187,90 @@ func websocketMessageTypeLabel(t int) string {
 	}
 }
 
-func setupLogger(configBaseDir string) {
+var serviceLogLevel slog.LevelVar // INFO unless configured otherwise.
+var serviceLogger = slog.New(slog.NewJSONHandler(serviceLogWriter{}, &slog.HandlerOptions{Level: &serviceLogLevel}))
+
+// Keep the standard logger's synchronized writer so file rotation and output
+// capture use the same destination. The JSON handler escapes untrusted strings.
+type serviceLogWriter struct{}
+
+func (serviceLogWriter) Write(data []byte) (int, error) {
+	err := log.Output(3, strings.TrimSuffix(string(data), "\n"))
+	return len(data), err
+}
+
+func serviceLog(level slog.Level, event string, fields ...interface{}) {
+	serviceLogger.Log(context.Background(), level, event, fields...)
+}
+
+func logServiceError(level slog.Level, event string, err error, fields ...interface{}) {
+	if err != nil {
+		cause := err
+		for errors.Unwrap(cause) != nil {
+			cause = errors.Unwrap(cause)
+		}
+		fields = append(fields, "error_type", fmt.Sprintf("%T", cause))
+		var state interface{ SQLState() string }
+		if errors.As(err, &state) {
+			fields = append(fields, "sqlstate", state.SQLState())
+		}
+		var closeError *websocket.CloseError
+		if errors.As(err, &closeError) {
+			fields = append(fields, "close_code", closeError.Code)
+		}
+		// Driver errors and JavaScript exceptions can contain request values.
+		// Full diagnostic text is an explicit debug-only choice, even on errors.
+		if serviceLogLevel.Level() <= slog.LevelDebug {
+			fields = append(fields, "error_detail", boundedLogText(err.Error()))
+		}
+	}
+	serviceLog(level, event, fields...)
+}
+
+func fatalServiceError(event string, err error, fields ...interface{}) {
+	logServiceError(slog.LevelError, event, err, fields...)
+	os.Exit(1)
+}
+
+func logWebSocketDisconnect(event, name string, err error) {
+	level := slog.LevelWarn
+	var closeError *websocket.CloseError
+	if errors.Is(err, net.ErrClosed) || (errors.As(err, &closeError) && (closeError.Code == websocket.CloseNormalClosure || closeError.Code == websocket.CloseGoingAway)) {
+		level = slog.LevelDebug
+	}
+	logServiceError(level, event, err, "endpoint", name)
+}
+
+func boundedLogText(value string) string {
+	const maxLogTextBytes = 4096
+	if len(value) > maxLogTextBytes {
+		return value[:maxLogTextBytes] + "...[truncated]"
+	}
+	return value
+}
+
+func logURLOrigin(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "ws" && parsed.Scheme != "wss") {
+		return "[invalid URL]"
+	}
+	// Userinfo, paths, queries and fragments can all contain credentials.
+	return parsed.Scheme + "://" + parsed.Host
+}
+
+func setupLogger(configBaseDir string) error {
+	level := slog.LevelInfo
+	switch strings.ToLower(strings.TrimSpace(config.Log.Level)) {
+	case "", "info":
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		return errors.New("log.Level must be debug, info, warn, or error")
+	}
 	logFilePath := resolvePathFromBase(configBaseDir, config.Log.Filename)
 	if config.Log.EnableLogging {
 		log.SetOutput(&lumberjack.Logger{
@@ -5191,8 +5281,12 @@ func setupLogger(configBaseDir string) {
 			Compress:   config.Log.Compress,
 		})
 	} else {
-		log.SetOutput(os.Stdout)
+		log.SetOutput(os.Stderr)
 	}
+	log.SetFlags(0)
+	log.SetPrefix("")
+	serviceLogLevel.Set(level)
+	return nil
 }
 
 func connectDB(config Config) (*sql.DB, error) {
@@ -5275,7 +5369,15 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		sendJSONError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if r.URL.Path != "/" {
+	dispatchedAPI, _ := r.Context().Value(configuredAPIDispatchContextKey{}).(string)
+	if dispatchedAPI != "" {
+		// The router has already checked this API's access policy. Request
+		// parameters must not select a different API or affect paramCheck's API.
+		if params == nil {
+			params = make(map[string]interface{})
+		}
+		params["api"] = dispatchedAPI
+	} else if r.URL.Path != "/" {
 		apiName := strings.TrimPrefix(r.URL.Path, "/")
 		if apiName != "" {
 			if _, exists := params["api"]; !exists {
@@ -5298,14 +5400,14 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		return
 	}
 	if apiConfig.HTTP != nil {
-		if dispatched, _ := r.Context().Value(configuredAPIDispatchContextKey{}).(bool); !dispatched {
+		if dispatchedAPI != apiKey || configuredHTTPAccess(apiConfig) == configuredHTTPAccessInternal {
 			sendJSONError(w, "API not found", http.StatusNotFound)
 			return
 		}
 	}
 	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
 	if err != nil {
-		log.Printf("Failed to get accepted params keys: %v", err)
+		logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiKey)
 		acceptedKeys = []string{}
 	}
 	nyanMode, _ := params["nyan_mode"].(string)
@@ -5317,7 +5419,7 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	if checkScriptPath != "" {
 		success, statusCode, errorObj, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, acceptedKeys)
 		if err != nil {
-			log.Printf("Check script error: %v", err)
+			logServiceError(slog.LevelError, "param_check_failed", err, "api", apiKey)
 			sendJSONError(w, err.Error(), statusCode)
 			return
 		}
@@ -5354,14 +5456,14 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	if apiConfig.Script != "" {
 		scriptResult, err := runScriptWithSnapshot(snapshot, []string{apiConfig.Script}, params)
 		if err != nil {
-			log.Printf("Script execution error: %v", err)
+			logServiceError(slog.LevelError, "script_execution_failed", err, "api", apiKey)
 			sendJSONError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		body := []byte(scriptResult)
 		if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", body); handled {
 			if err != nil {
-				log.Printf("outCheck script error: %v", err)
+				logServiceError(slog.LevelError, "out_check_failed", err, "api", apiKey)
 				sendJSONError(w, err.Error(), outStatusCode)
 				return
 			}
@@ -5381,30 +5483,30 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	if len(apiConfig.SQL) > 1 {
 		tx, err = db.Begin()
 		if err != nil {
-			log.Printf("Failed to start transaction: %v", err)
+			logServiceError(slog.LevelError, "transaction_begin_failed", err, "api", apiKey)
 			sendJSONError(w, "Failed to start transaction", http.StatusInternalServerError)
 			return
 		}
 		defer tx.Rollback()
-		log.Print("Transaction started")
+		serviceLog(slog.LevelDebug, "transaction_started", "api", apiKey)
 	}
 
 	var lastJSON []byte
 	for _, sqlPath := range apiConfig.SQL {
 		query, err := os.ReadFile(sqlPath)
 		if err != nil {
-			log.Printf("Failed to read SQL file: %v", err)
+			logServiceError(slog.LevelError, "sql_file_read_failed", err, "api", apiKey, "file", sqlPath)
 			sendJSONError(w, "Error reading SQL file", http.StatusInternalServerError)
 			return
 		}
-		log.Print(string(query))
+
 		// まず、外側ブロック（-- BEGIN -- ～ -- END --）を処理
 		processed := processWhereBlock(string(query), params)
 		// 次に、従来のIFブロック（/*IF ...*/ ... /*END*/）も処理
 		processed = processConditionals(processed, params)
-		log.Print("Processed SQL: ", processed)
+
 		queryStr, args := prepareQueryWithParams(processed, params)
-		log.Print("Final Query: ", queryStr)
+
 		if isSelectQuery(queryStr) || isReturningQuery(queryStr) {
 			var rows *sql.Rows
 			if tx != nil {
@@ -5413,14 +5515,14 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 				rows, err = db.Query(queryStr, args...)
 			}
 			if err != nil {
-				log.Printf("Failed to execute SQL query: %v", err)
+				logServiceError(slog.LevelError, "sql_execution_failed", err, "api", apiKey, "file", sqlPath)
 				sendJSONError(w, "Error executing SQL query", http.StatusInternalServerError)
 				return
 			}
 			defer rows.Close()
 			lastJSON, err = RowsToJSON(rows)
 			if err != nil {
-				log.Printf("Failed to convert rows to JSON: %v", err)
+				logServiceError(slog.LevelError, "sql_result_encode_failed", err, "api", apiKey)
 				sendJSONError(w, "Error formatting results", http.StatusInternalServerError)
 				return
 			}
@@ -5432,25 +5534,24 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 				result, err = db.Exec(queryStr, args...)
 			}
 			if err != nil {
-				log.Printf("Failed to execute SQL query: %v", err)
+				logServiceError(slog.LevelError, "sql_execution_failed", err, "api", apiKey, "file", sqlPath)
 				sendJSONError(w, "Error executing SQL query", http.StatusInternalServerError)
 				return
 			}
 			rowsAffected, err := result.RowsAffected()
 			if err != nil {
-				log.Printf("Failed to retrieve rows affected: %v", err)
+				logServiceError(slog.LevelError, "sql_rows_affected_failed", err, "api", apiKey)
 				sendJSONError(w, "Error retrieving rows affected", http.StatusInternalServerError)
 				return
 			}
-			log.Printf("Rows affected: %d", rowsAffected)
+			serviceLog(slog.LevelDebug, "sql_mutation_completed", "api", apiKey, "file", sqlPath, "rows_affected", rowsAffected)
 			lastJSON = []byte("{}")
 		}
 	}
 
 	if tx != nil {
-		log.Print("End transaction. Commit")
 		if err := tx.Commit(); err != nil {
-			log.Printf("Failed to commit transaction: %v", err)
+			logServiceError(slog.LevelError, "transaction_commit_failed", err, "api", apiKey)
 			sendJSONError(w, "Failed to commit transaction", http.StatusInternalServerError)
 			return
 		}
@@ -5473,13 +5574,13 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	}
 	body, err := json.Marshal(response)
 	if err != nil {
-		log.Printf("Failed to marshal JSON: %v", err)
+		logServiceError(slog.LevelError, "response_encode_failed", err, "api", apiKey)
 		sendJSONError(w, "Error formatting results", http.StatusInternalServerError)
 		return
 	}
 	if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", body); handled {
 		if err != nil {
-			log.Printf("outCheck script error: %v", err)
+			logServiceError(slog.LevelError, "out_check_failed", err, "api", apiKey)
 			sendJSONError(w, err.Error(), outStatusCode)
 			return
 		}
@@ -5827,7 +5928,7 @@ func handleNyanWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, 
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
-		log.Printf("Failed to encode JSON: %v", err)
+		logServiceError(slog.LevelError, "response_encode_failed", err)
 		sendJSONError(w, "Internal server error", http.StatusInternalServerError)
 	}
 }
@@ -5879,7 +5980,7 @@ func handleNyanDetailWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 	}
 	paramsMap, err := parseSQLParams(apiConfig.SQL)
 	if err != nil {
-		log.Printf("Failed to parse SQL comments: %v", err)
+		logServiceError(slog.LevelError, "sql_metadata_parse_failed", err, "api", apiName)
 		sendJSONError(w, "Failed to parse SQL comments", http.StatusInternalServerError)
 		return
 	}
@@ -5887,7 +5988,7 @@ func handleNyanDetailWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 	if apiConfig.Script != "" {
 		acceptedParamsFromScript, err = parseScriptAcceptedParams(apiConfig.Script)
 		if err != nil {
-			log.Printf("Failed to parse script constants: %v", err)
+			logServiceError(slog.LevelWarn, "script_metadata_parse_failed", err, "api", apiName)
 		} else {
 			for k, v := range acceptedParamsFromScript {
 				paramsMap[k] = v
@@ -5896,7 +5997,7 @@ func handleNyanDetailWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 	}
 	apiSchema, err := resolveAPISchema(apiConfig)
 	if err != nil {
-		log.Printf("Failed to resolve API schemas for %s: %v", apiName, err)
+		logServiceError(slog.LevelError, "api_schema_resolve_failed", err, "api", apiName)
 		sendJSONError(w, err, http.StatusInternalServerError)
 		return
 	}
@@ -5917,7 +6018,7 @@ func handleNyanDetailWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.Printf("Failed to encode JSON: %v", err)
+		logServiceError(slog.LevelError, "response_encode_failed", err)
 		sendJSONError(w, "Internal server error", http.StatusInternalServerError)
 	}
 }
@@ -6992,7 +7093,7 @@ func sendJSONError(w http.ResponseWriter, message interface{}, statusCode int) {
 	}
 
 	if err := json.NewEncoder(w).Encode(response); err != nil {
-		log.Printf("Failed to encode JSON error response: %v", err)
+		logServiceError(slog.LevelError, "error_response_encode_failed", err)
 	}
 }
 
@@ -7105,16 +7206,13 @@ func nyanRunSQLHandlerWithExecer(vm *goja.Runtime, call goja.FunctionCall, exece
 		panic(vm.ToValue(fmt.Sprintf("failed to read SQL file %s: %v", sqlFilePath, err)))
 	}
 	normalizedSQL := normalizeSQL(string(sqlContent))
-	log.Print(normalizedSQL)
 
 	// 外側ブロックと IF ブロックの処理
 	processedSQL := processWhereBlock(normalizedSQL, params)
 	processedSQL = processConditionals(processedSQL, params)
-	log.Print("Processed SQL: ", processedSQL)
 
 	// パラメータ置換
 	queryStr, args := prepareQueryWithParams(processedSQL, params)
-	log.Print("Final Query: ", queryStr)
 
 	if execer == nil {
 		execer = db
@@ -7180,7 +7278,7 @@ func runCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiCheckScriptPath 
 	}
 	combinedScript.Write(checkContent)
 	combinedScript.WriteString("\n")
-	log.Printf("Combined check script:\n%s", combinedScript.String())
+
 	vm := goja.New()
 	registerNyanFuncs(vm, snapshot, params, acceptedParamsKeys)
 
@@ -7320,7 +7418,7 @@ func runScriptWithRuntimeWithSnapshot(snapshot *APIConfigSnapshot, scriptPaths [
 		// committed=false のままなら rollback（成功時や commit 後は rollback しない）
 		if !committed {
 			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-				log.Printf("transaction rollback error: %v", rbErr)
+				logServiceError(slog.LevelError, "transaction_rollback_failed", rbErr)
 			}
 		}
 	}()
@@ -7466,7 +7564,7 @@ func restrictNyanRuntimeCapabilities(vm *goja.Runtime, capabilities []string) {
 	}
 	vm.Set("console", map[string]interface{}{
 		"log": func(call goja.FunctionCall) goja.Value {
-			log.Printf("[JS:restricted] message suppressed (%d argument(s))", len(call.Arguments))
+			serviceLog(slog.LevelDebug, "script_console_suppressed", "argument_count", len(call.Arguments))
 			return goja.Undefined()
 		},
 	})
@@ -7498,7 +7596,7 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 
 	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
 	if err != nil {
-		log.Printf("Failed to get accepted params keys: %v", err)
+		logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiName)
 		acceptedKeys = []string{}
 	}
 	nyanMode, _ := params["nyan_mode"].(string)
@@ -7622,7 +7720,7 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 			if err != nil {
 				return "", fmt.Errorf("failed to get rows affected for API %s: %v", apiName, err)
 			}
-			log.Printf("Rows affected: %d", rowsAffected)
+			serviceLog(slog.LevelDebug, "sql_mutation_completed", "api", apiName, "file", sqlPath, "rows_affected", rowsAffected)
 			lastJSON = []byte("{}")
 		}
 	}
@@ -7836,7 +7934,7 @@ func (h *Hub) Broadcast(channel string, message []byte) {
 	defer h.mu.Unlock()
 	clients, ok := h.clients[channel]
 	if !ok {
-		log.Printf("Channel [%s] に接続しているクライアントがありません", channel)
+		serviceLog(slog.LevelDebug, "push_no_subscribers", "channel", channel)
 		return
 	}
 	for conn := range clients {
@@ -7845,7 +7943,7 @@ func (h *Hub) Broadcast(channel string, message []byte) {
 			continue
 		}
 		if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
-			log.Printf("チャネル [%s] への送信エラー: %v", channel, err)
+			logServiceError(slog.LevelWarn, "push_send_failed", err, "channel", channel)
 		}
 	}
 }
@@ -8255,7 +8353,7 @@ func respondJSONRPCResultJSON(w http.ResponseWriter, id interface{}, statusCode 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	if err := json.NewEncoder(w).Encode(rpcResp); err != nil {
-		log.Printf("Failed to encode JSON-RPC response: %v", err)
+		logServiceError(slog.LevelError, "jsonrpc_response_encode_failed", err)
 	}
 }
 
@@ -8304,7 +8402,6 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	}
 
 	apiConfig, exists := snapshot.Definitions[apiKey]
-	fmt.Print(apiConfig)
 	if !exists {
 		respondJSONRPCError(w, rpcReq.ID, -32601, "SQL files not found", nil)
 		return
@@ -8322,7 +8419,7 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	nyanMode, _ := allParams["nyan_mode"].(string)
 	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
 	if err != nil {
-		log.Printf("Failed to get accepted params keys: %v", err)
+		logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiKey)
 		acceptedKeys = []string{}
 	}
 	checkScriptPath := getParamCheckScriptPath(apiConfig)
@@ -8427,7 +8524,7 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 					respondJSONRPCError(w, rpcReq.ID, -32603, "Error retrieving rows affected", err.Error())
 					return
 				}
-				log.Printf("Rows affected: %d", rowsAffected)
+				serviceLog(slog.LevelDebug, "sql_mutation_completed", "api", apiKey, "file", sqlPath, "rows_affected", rowsAffected)
 				lastJSON = []byte("{}")
 			}
 		}
@@ -8488,7 +8585,7 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	if err := json.NewEncoder(w).Encode(rpcResp); err != nil {
-		log.Printf("Failed to encode JSON-RPC response: %v", err)
+		logServiceError(slog.LevelError, "jsonrpc_response_encode_failed", err)
 	}
 }
 
@@ -8501,14 +8598,14 @@ func performPush(snapshot *APIConfigSnapshot, apiConfig APIConfig, allParams map
 			if pushConfig.Script != "" {
 				s, err := runScriptWithSnapshot(snapshot, []string{pushConfig.Script}, allParams)
 				if err != nil {
-					log.Printf("Push script error: %v", err)
+					logServiceError(slog.LevelError, "push_script_failed", err, "api", apiConfig.Push)
 				} else {
 					pushResult = []byte(s)
 				}
 			} else {
 				pushResult, err = executeAPIConfigWithSnapshot(snapshot, pushConfig)
 				if err != nil {
-					log.Printf("Push API execution error: %v", err)
+					logServiceError(slog.LevelError, "push_api_failed", err, "api", apiConfig.Push)
 				} else {
 					type SQLResponse struct {
 						Success bool            `json:"success"`
@@ -8522,16 +8619,16 @@ func performPush(snapshot *APIConfigSnapshot, apiConfig APIConfig, allParams map
 					}
 					pushResult, err = json.Marshal(response)
 					if err != nil {
-						log.Printf("Push response JSON marshal error: %v", err)
+						logServiceError(slog.LevelError, "push_response_encode_failed", err, "api", apiConfig.Push)
 					}
 				}
 			}
 			if pushResult != nil {
-				log.Printf("Broadcasting push result to channel [%s]: %s", apiConfig.Push, pushResult)
+				serviceLog(slog.LevelDebug, "push_broadcast", "channel", apiConfig.Push, "bytes", len(pushResult))
 				hub.Broadcast(apiConfig.Push, pushResult)
 			}
 		} else {
-			log.Printf("Push API config [%s] not found", apiConfig.Push)
+			serviceLog(slog.LevelWarn, "push_api_missing", "api", apiConfig.Push)
 		}
 	}
 }
@@ -8567,11 +8664,14 @@ func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map
 	}
 	vm.Set("console", map[string]interface{}{
 		"log": func(call goja.FunctionCall) goja.Value {
+			if serviceLogLevel.Level() > slog.LevelDebug {
+				return goja.Undefined()
+			}
 			var args []string
 			jsonStringifyVal := vm.Get("JSON").ToObject(vm).Get("stringify")
 			jsonStringify, ok := goja.AssertFunction(jsonStringifyVal)
 			if !ok {
-				log.Println("JSON.stringify is not a function")
+				serviceLog(slog.LevelWarn, "script_console_stringify_unavailable")
 				return goja.Undefined()
 			}
 			for _, arg := range call.Arguments {
@@ -8588,7 +8688,7 @@ func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map
 					args = append(args, arg.String())
 				}
 			}
-			log.Println("[JS:check]", strings.Join(args, " "))
+			serviceLog(slog.LevelDebug, "script_console", "message", boundedLogText(strings.Join(args, " ")))
 			return goja.Undefined()
 		},
 	})
