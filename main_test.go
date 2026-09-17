@@ -475,8 +475,8 @@ func TestLoadAPIConfigFileExpandsOneLevelInclude(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		state, exists := result.Snapshot.Files[identity]
-		if !exists || !state.Exists || state.Path != identity {
+		state, exists := result.Snapshot.Files[path]
+		if !exists || !state.Exists || state.Path != path || state.Identity != identity {
 			t.Fatalf("file state for %s = %#v, exists=%t", identity, state, exists)
 		}
 	}
@@ -1268,11 +1268,7 @@ func TestReloadAPIConfigGraphPublishesChangedSourceWithSameDefinitions(t *testin
 	if got := currentAPISnapshot().Sources["sub/item"]; got != secondPath {
 		t.Fatalf("source = %q, want %q", got, secondPath)
 	}
-	canonicalSecond, err := canonicalExistingAPIFilePath(secondPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, exists := observed[canonicalSecond]; !exists {
+	if _, exists := observed[secondPath]; !exists {
 		t.Fatal("new include file is not in the watched set")
 	}
 }
@@ -1388,11 +1384,7 @@ func TestReloadAPIConfigGraphWatchesInvalidCandidateIncludeUntilCorrected(t *tes
 	if err == nil || reloaded {
 		t.Fatalf("invalid include reload: reloaded=%t err=%v", reloaded, err)
 	}
-	canonicalChild, canonicalErr := canonicalExistingAPIFilePath(childPath)
-	if canonicalErr != nil {
-		t.Fatal(canonicalErr)
-	}
-	invalidState, exists := observed[canonicalChild]
+	invalidState, exists := observed[childPath]
 	if !exists || !invalidState.Exists || invalidState.Hash == ([sha256.Size]byte{}) {
 		t.Fatalf("invalid include state = %#v, exists=%t", invalidState, exists)
 	}
@@ -1461,6 +1453,13 @@ func TestAPIFileStatesFingerprintIsDeterministicAndStateSensitive(t *testing.T) 
 	changed["/b.json"] = APIFileState{Path: "/b.json", Exists: true, Hash: [sha256.Size]byte{2}}
 	if apiFileStatesFingerprint(first) == apiFileStatesFingerprint(changed) {
 		t.Fatal("fingerprint did not change with file state")
+	}
+	retargeted := cloneAPIFileStates(first)
+	state := retargeted["/a.json"]
+	state.Identity = "/new-target.json"
+	retargeted["/a.json"] = state
+	if apiFileStatesFingerprint(first) == apiFileStatesFingerprint(retargeted) {
+		t.Fatal("fingerprint did not change with symlink target")
 	}
 }
 

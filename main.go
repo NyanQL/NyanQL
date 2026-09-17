@@ -295,10 +295,11 @@ type APIDetails struct {
 // APIFileState represents the observed state of a file used to build an API
 // configuration snapshot.
 type APIFileState struct {
-	Path   string
-	Exists bool
-	Hash   [sha256.Size]byte
-	Error  string
+	Path     string // Absolute reference path to watch, before resolving symlinks.
+	Identity string // Resolved path used to detect include cycles and target changes.
+	Exists   bool
+	Hash     [sha256.Size]byte
+	Error    string
 }
 
 const (
@@ -323,7 +324,7 @@ type APIConfigSnapshot struct {
 	Definitions map[string]APIConfig
 	APIs        map[string]APIDetails
 	Sources     map[string]string
-	Files       map[string]APIFileState
+	Files       map[string]APIFileState // Keyed by reference path, not resolved identity.
 	Schedules   map[string]scheduleJobConfig
 	WSClients   map[string]wsClientConfig
 }
@@ -685,8 +686,9 @@ func webSocketEndpointConfigured(snapshot *APIConfigSnapshot, requestPath string
 	if snapshot == nil {
 		return false
 	}
-	apiName := strings.Trim(requestPath, "/")
-	if apiName != "" && !strings.Contains(apiName, "/") {
+	// Match the full channel name used by handleWebSocket, including include mounts.
+	apiName := strings.TrimPrefix(requestPath, "/")
+	if apiName != "" {
 		if apiConfig, exists := snapshot.Definitions[apiName]; exists && getAPIType(apiConfig) == apiTypeAPI && apiConfig.HTTP == nil {
 			return true
 		}
@@ -2659,13 +2661,12 @@ func loadAPIConfigFileAttempt(apiFilePath string) (*apiConfigLoadResult, map[str
 	if err != nil {
 		return nil, nil, err
 	}
-	identity, state, data, err := inspectAPIFile(normalizedPath)
-	discovered := map[string]APIFileState{identity: state}
+	_, state, data, err := inspectAPIFile(normalizedPath)
+	discovered := map[string]APIFileState{state.Path: state}
 	if err != nil {
 		return nil, discovered, fmt.Errorf("read api file %s: %w", normalizedPath, err)
 	}
-	result, files, err := loadAPIConfigDataAttempt(normalizedPath, data)
-	return result, files, err
+	return loadAPIConfigStateAttempt(state, data)
 }
 
 func loadAPIConfigData(apiFilePath string, data []byte) (*apiConfigLoadResult, error) {
@@ -2678,18 +2679,28 @@ func loadAPIConfigDataAttempt(apiFilePath string, data []byte) (*apiConfigLoadRe
 	if err != nil {
 		return nil, nil, err
 	}
-	files, sources, fileStates, err := expandAPIConfigGraph(normalizedPath, data)
+	identity, err := canonicalExistingAPIFilePath(normalizedPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return loadAPIConfigStateAttempt(APIFileState{
+		Path: normalizedPath, Identity: identity, Exists: true, Hash: sha256.Sum256(data),
+	}, data)
+}
+
+func loadAPIConfigStateAttempt(rootState APIFileState, data []byte) (*apiConfigLoadResult, map[string]APIFileState, error) {
+	files, sources, fileStates, err := expandAPIConfigGraph(rootState, data)
 	if err != nil {
 		return nil, fileStates, err
 	}
 	if err := validateConfiguredAPIExtensions(files); err != nil {
 		return nil, fileStates, err
 	}
-	schedules, err := buildScheduleJobConfigs(files, filepath.Dir(normalizedPath))
+	schedules, err := buildScheduleJobConfigs(files, filepath.Dir(rootState.Path))
 	if err != nil {
 		return nil, fileStates, err
 	}
-	wsClients, err := buildWSClientConfigs(files, filepath.Dir(normalizedPath))
+	wsClients, err := buildWSClientConfigs(files, filepath.Dir(rootState.Path))
 	if err != nil {
 		return nil, fileStates, err
 	}
@@ -3489,28 +3500,25 @@ type apiIncludeFrame struct {
 	Identity string
 }
 
-func expandAPIConfigGraph(rootPath string, rootData []byte) (map[string]APIConfig, map[string]string, map[string]APIFileState, error) {
-	canonicalRoot, err := canonicalExistingAPIFilePath(rootPath)
-	if err != nil {
-		return nil, nil, nil, err
-	}
+func expandAPIConfigGraph(rootState APIFileState, rootData []byte) (map[string]APIConfig, map[string]string, map[string]APIFileState, error) {
 	loader := &apiGraphLoader{
 		definitions: make(map[string]APIConfig),
 		sources:     make(map[string]string),
 		fileStates:  make(map[string]APIFileState),
 	}
-	if err := loader.loadFile(rootPath, canonicalRoot, rootData, "", nil); err != nil {
+	if err := loader.loadFile(rootState, rootData, "", nil); err != nil {
 		return loader.definitions, loader.sources, loader.fileStates, err
 	}
 	return loader.definitions, loader.sources, loader.fileStates, nil
 }
 
-func (loader *apiGraphLoader) loadFile(filePath, identity string, data []byte, mountPrefix string, stack []apiIncludeFrame) error {
+func (loader *apiGraphLoader) loadFile(state APIFileState, data []byte, mountPrefix string, stack []apiIncludeFrame) error {
+	filePath, identity := state.Path, state.Identity
 	if cycleStart := includeFrameIndex(stack, identity); cycleStart >= 0 {
 		return includeCycleError(stack, filePath)
 	}
 	stack = append(stack, apiIncludeFrame{Path: filePath, Identity: identity})
-	loader.fileStates[identity] = APIFileState{Path: identity, Exists: true, Hash: sha256.Sum256(data)}
+	loader.fileStates[filePath] = state
 	rawDefinitions, err := decodeRawAPIDefinitions(data)
 	if err != nil {
 		return fmt.Errorf("API file %s: %w", filePath, err)
@@ -3545,14 +3553,14 @@ func (loader *apiGraphLoader) loadFile(filePath, identity string, data []byte, m
 			return fmt.Errorf("include %q in %s: %w", name, filePath, err)
 		}
 		canonicalPath, state, includeData, err := inspectAPIFile(resolvedPath)
-		loader.fileStates[canonicalPath] = state
+		loader.fileStates[resolvedPath] = state
 		if err != nil {
 			return fmt.Errorf("include %q in %s: %w", name, filePath, err)
 		}
 		if cycleStart := includeFrameIndex(stack, canonicalPath); cycleStart >= 0 {
 			return includeCycleError(stack, resolvedPath)
 		}
-		if err := loader.loadFile(resolvedPath, canonicalPath, includeData, joinAPIName(mountPrefix, name), stack); err != nil {
+		if err := loader.loadFile(state, includeData, joinAPIName(mountPrefix, name), stack); err != nil {
 			return err
 		}
 	}
@@ -3704,12 +3712,15 @@ func inspectAPIFile(path string) (string, APIFileState, []byte, error) {
 		state := APIFileState{Path: normalizedPath, Exists: true, Error: "invalid_path"}
 		return normalizedPath, state, nil, err
 	}
-	data, err := os.ReadFile(normalizedPath)
+	// Read the resolved target so the identity and contents describe the same
+	// file even if the reference is retargeted during loading. Publication
+	// rechecks the reference path through verifyAPIFileStates.
+	data, err := os.ReadFile(identity)
 	if err != nil {
-		state := APIFileState{Path: identity, Exists: true, Error: "read_error"}
+		state := APIFileState{Path: normalizedPath, Identity: identity, Exists: true, Error: "read_error"}
 		return identity, state, nil, fmt.Errorf("file cannot be read: %s: %w", normalizedPath, err)
 	}
-	state := APIFileState{Path: identity, Exists: true, Hash: sha256.Sum256(data)}
+	state := APIFileState{Path: normalizedPath, Identity: identity, Exists: true, Hash: sha256.Sum256(data)}
 	return identity, state, data, nil
 }
 
@@ -3912,9 +3923,10 @@ func newAPIConfigSnapshot(files map[string]APIConfig, sourcePath string, sourceH
 	fileStates := make(map[string]APIFileState)
 	if sourcePath != "" {
 		fileStates[sourcePath] = APIFileState{
-			Path:   sourcePath,
-			Exists: true,
-			Hash:   sourceHash,
+			Path:     sourcePath,
+			Identity: sourcePath,
+			Exists:   true,
+			Hash:     sourceHash,
 		}
 	}
 
@@ -4059,6 +4071,8 @@ func apiFileStatesFingerprint(states map[string]APIFileState) [sha256.Size]byte 
 		_, _ = io.WriteString(hasher, identity)
 		_, _ = hasher.Write([]byte{0})
 		_, _ = io.WriteString(hasher, state.Path)
+		_, _ = hasher.Write([]byte{0})
+		_, _ = io.WriteString(hasher, state.Identity)
 		_, _ = hasher.Write([]byte{0})
 		if state.Exists {
 			_, _ = hasher.Write([]byte{1})
