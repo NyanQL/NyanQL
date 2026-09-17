@@ -3,8 +3,6 @@ const nyanAcceptedParams = {
   message: "from_check"
 }
 
-const nyanOutputColumns = ["called_api", "echo"]
-
 function main () {
   return JSON.stringify({
     success: true,

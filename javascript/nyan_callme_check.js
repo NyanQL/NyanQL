@@ -2,14 +2,6 @@ const nyanAcceptedParams = {
   message: "from_request"
 }
 
-const nyanOutputColumns = [
-  "hasNyanCallMe",
-  "nyanCallMeType",
-  "calledApi",
-  "callResult",
-  "callError"
-]
-
 function main () {
   const nyanCallMeType = typeof nyanCallMe
   const hasNyanCallMe = nyanCallMeType === "function"
