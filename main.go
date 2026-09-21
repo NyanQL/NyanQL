@@ -8604,47 +8604,89 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 }
 
 func performPush(snapshot *APIConfigSnapshot, apiConfig APIConfig, allParams map[string]interface{}) {
-	if apiConfig.Push != "" {
-		pushConfig, exists := snapshot.Definitions[apiConfig.Push]
-		if exists {
-			var pushResult []byte
-			var err error
-			if pushConfig.Script != "" {
-				s, err := runScriptWithSnapshot(snapshot, []string{pushConfig.Script}, allParams)
-				if err != nil {
-					logServiceError(slog.LevelError, "push_script_failed", err, "api", apiConfig.Push)
-				} else {
-					pushResult = []byte(s)
-				}
-			} else {
-				pushResult, err = executeAPIConfigWithSnapshot(snapshot, pushConfig)
-				if err != nil {
-					logServiceError(slog.LevelError, "push_api_failed", err, "api", apiConfig.Push)
-				} else {
-					type SQLResponse struct {
-						Success bool            `json:"success"`
-						Status  int             `json:"status"`
-						Result  json.RawMessage `json:"result"`
-					}
-					response := SQLResponse{
-						Success: true,
-						Status:  200,
-						Result:  pushResult,
-					}
-					pushResult, err = json.Marshal(response)
-					if err != nil {
-						logServiceError(slog.LevelError, "push_response_encode_failed", err, "api", apiConfig.Push)
-					}
-				}
-			}
-			if pushResult != nil {
-				serviceLog(slog.LevelDebug, "push_broadcast", "channel", apiConfig.Push, "bytes", len(pushResult))
-				hub.Broadcast(apiConfig.Push, pushResult)
-			}
-		} else {
-			serviceLog(slog.LevelWarn, "push_api_missing", "api", apiConfig.Push)
+	if apiConfig.Push == "" {
+		return
+	}
+	// Push failures must not interrupt the originating API, including JavaScript
+	// exceptions raised while exporting a script or check result.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logServiceError(slog.LevelError, "push_execution_panicked", fmt.Errorf("push execution panic: %v", recovered), "api", apiConfig.Push)
+		}
+	}()
+	pushConfig, exists := snapshot.Definitions[apiConfig.Push]
+	if !exists {
+		serviceLog(slog.LevelWarn, "push_api_missing", "api", apiConfig.Push)
+		return
+	}
+	// Copy JSON request parameters so Push scripts cannot mutate their caller.
+	// Encoding also rejects cycles introduced by scripts without recursive copying.
+	encodedParams, err := json.Marshal(allParams)
+	if err != nil {
+		logServiceError(slog.LevelError, "push_params_copy_failed", err, "api", apiConfig.Push)
+		return
+	}
+	params := make(map[string]interface{})
+	if err := json.Unmarshal(encodedParams, &params); err != nil {
+		logServiceError(slog.LevelError, "push_params_copy_failed", err, "api", apiConfig.Push)
+		return
+	}
+	if params == nil {
+		params = make(map[string]interface{})
+	}
+	params["api"] = apiConfig.Push
+	if checkScriptPath := getParamCheckScriptPath(pushConfig); checkScriptPath != "" {
+		acceptedKeys, err := getAcceptedParamsKeys(pushConfig.SQL)
+		if err != nil {
+			logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiConfig.Push)
+			acceptedKeys = []string{}
+		}
+		success, statusCode, _, _, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, acceptedKeys)
+		if err != nil {
+			logServiceError(slog.LevelError, "push_param_check_failed", err, "api", apiConfig.Push)
+			return
+		}
+		if !success {
+			serviceLog(slog.LevelWarn, "push_param_check_rejected", "api", apiConfig.Push, "status", statusCode)
+			return
 		}
 	}
+
+	var pushResult []byte
+	if pushConfig.Script != "" {
+		s, err := runScriptWithSnapshot(snapshot, []string{pushConfig.Script}, params)
+		if err != nil {
+			logServiceError(slog.LevelError, "push_script_failed", err, "api", apiConfig.Push)
+			return
+		}
+		pushResult = []byte(s)
+	} else {
+		result, err := executeAPIConfigWithSnapshot(snapshot, pushConfig)
+		if err != nil {
+			logServiceError(slog.LevelError, "push_api_failed", err, "api", apiConfig.Push)
+			return
+		}
+		response := SQLResponse{
+			Success: true,
+			Status:  http.StatusOK,
+			Result:  json.RawMessage(result),
+		}
+		pushResult, err = json.Marshal(response)
+		if err != nil {
+			logServiceError(slog.LevelError, "push_response_encode_failed", err, "api", apiConfig.Push)
+			return
+		}
+	}
+	if handled, statusCode, _, err := runOutCheckScriptWithSnapshot(snapshot, pushConfig, params, http.StatusOK, "application/json", pushResult); handled {
+		if err != nil {
+			logServiceError(slog.LevelError, "push_out_check_failed", err, "api", apiConfig.Push)
+		} else {
+			serviceLog(slog.LevelWarn, "push_out_check_rejected", "api", apiConfig.Push, "status", statusCode)
+		}
+		return
+	}
+	serviceLog(slog.LevelDebug, "push_broadcast", "channel", apiConfig.Push, "bytes", len(pushResult))
+	hub.Broadcast(apiConfig.Push, pushResult)
 }
 
 // saveBase64ToFile decodes a Base64 string and writes it to destPath.

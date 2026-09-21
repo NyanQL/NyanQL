@@ -1071,6 +1071,10 @@ NyanQLのWebSocketサーバでは、先頭の `/` を除いたURLパス全体が
 
 `push` の参照先がscript APIの場合は、そのscriptが返した文字列をそのまま配信します。script側でJSON文字列を返すようにしておくと扱いやすくなります。
 
+Push先に `paramCheck`・`outCheck` が設定されている場合は、`paramCheck` → 本体のscript／SQL → `outCheck` → 配信の順に実行します。Push処理には元APIのパラメータをコピーして渡し、`nyanAllParams.api` はPush先のAPI名に設定します。`outCheck` の `nyan_output.body` には配信予定の本文が入ります。
+
+チェックで拒否された場合や、チェック・本体処理でエラーが発生した場合は、ログに記録してそのPush配信を中止します。チェックの拒否結果やエラーを元APIの応答に置き換えることはなく、元APIで完了した更新も取り消しません。Push処理は引き続き同期実行するため、その処理時間は元APIの応答までの時間に含まれます。
+
 ### Pushでよくある勘違い
 
 `push` は、呼び出したAPI自身の結果をそのまま配信する機能ではありません。`push` に指定した別APIを実行し、その結果を指定チャネルへ配信する機能です。
