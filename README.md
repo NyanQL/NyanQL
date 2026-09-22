@@ -439,7 +439,7 @@ curl -u admin:secret \
 
 URLのパスにAPI名を書いた場合、NyanQLはそのパスをAPI名として扱います。たとえば `/getItem?id=1` は、`api=getItem` として扱われます。
 
-`http.path` で公開パスを設定したAPIでは、そのパスに対応するAPIだけを実行します。クエリ・フォーム・JSON本文に別の `api` を指定しても実行先は変わらず、`paramCheck` やスクリプトに渡す `nyanAllParams.api` も公開パスに対応するAPI名になります。これは `http.responseMode: "nyan"`（省略時も同じ）と `"raw"` に共通です。`http.access: "internal"` のAPIを、この方法で外部から呼び出すことはできません。
+通常APIの公開パスはAPI名から決まります。`api.json` のAPI定義に `http` 設定は指定できません。ファイルの公開には `type: "public"` を使います。
 
 mount配下のAPIは完全API名を指定します。たとえば `sub/getItem` は、次のいずれの形式でも呼び出せます。
 
@@ -873,7 +873,7 @@ if (!nyanAllParams.id) {
 
 ### checkだけを実行する
 
-`nyan_mode=checkOnly` を指定すると、`paramCheck` だけを実行できます。`check` で指定した古い設定も、`paramCheck` として同じように実行されます。
+通常HTTP・JSON-RPC・`nyanCallMe()`・WebSocketからのAPI呼び出しで `nyan_mode=checkOnly` を指定すると、`paramCheck` だけを実行し、その結果を返します。本体のscript／SQL・`outCheck`・Pushは実行しません。`check` で指定した古い設定も、`paramCheck` として同じように実行されます。`paramCheck`（または `check`）が未設定の場合は、本体を実行せずエラーを返します。
 
 ```bash
 curl -u admin:secret "http://localhost:8080/getItem?id=1&nyan_mode=checkOnly"
@@ -965,18 +965,24 @@ JSON.stringify({
 |---|---|
 | `nyanAllParams` | リクエストで受け取ったパラメータ全体です。 |
 | `nyanAcceptedParamsKeys` | SQLコメントから拾った受け付けパラメータ名です。主にcheckで使います。 |
-| `nyanRunSQL(path, params)` | SQLファイルを実行します。scriptでは同じトランザクション内で実行されます。 |
+| `nyanRunSQL(path, params)` | 一番親の `api.json` のフォルダを基準にSQLファイルを実行します。scriptでは同じトランザクション内で実行されます。 |
 | `nyanGetAPI(url, user, pass)` | 外部APIへGETリクエストを送ります。 |
 | `nyanJsonAPI(url, jsonText, user, pass, headers)` | 外部APIへJSONをPOSTします。 |
 | `nyanCallAPI(...)` | `nyanJsonAPI` と同じ動きをする別名です。 |
 | `nyanCallMe(params)` | `api.json` に定義した別のAPIを内部呼び出しします。 |
-| `nyanGetFile(path)` | 実行ファイルの場所を基準にファイルを読みます。存在しない場合は `null` を返します。 |
+| `nyanGetFile(path)` | 一番親の `api.json` のフォルダを基準にファイルを読みます。存在しない場合やフォルダの場合は `null` を返します。 |
 | `nyanBase64Encode(text)` | 文字列をBase64に変換します。 |
 | `nyanBase64Decode(base64)` | Base64を文字列に戻します。 |
-| `nyanSaveFile(base64, path)` | Base64文字列をデコードしてファイルに保存します。 |
+| `nyanSaveFile(base64, path)` | Base64文字列をデコードし、一番親の `api.json` のフォルダを基準に保存します。 |
 | `sha256(text)` | SHA-256のハッシュ文字列を返します。 |
 | `sha1(text)` | SHA-1のハッシュ文字列を返します。 |
 | `nyanHostExec(command)` | OSのコマンドを実行します。利用する場合は十分に注意してください。 |
+
+`nyanSaveFile()`・`nyanGetFile()`・`nyanRunSQL()` に渡す相対パスは、起動時に指定した一番親の `api.json` があるフォルダを基準にします。include先のAPIや `nyanCallMe()` で呼び出したAPI、`paramCheck`・`outCheck` の中でも同じ基準です。絶対パスはそのまま使用します。
+
+たとえば、一番親が `/srv/app/api.json` の場合、`nyanSaveFile(data, "./files/result.txt")` の保存先は `/srv/app/files/result.txt` です。保存先のフォルダがなければ作成します。以前の実行ファイルのフォルダやカレントディレクトリを基準にしていたスクリプトは、この基準に合わせてパスを調整してください。
+
+`api.json` 内の `script`・`sql`・`paramCheck`・`outCheck` などの設定値は、その定義を書いたJSONファイルのフォルダ基準です。JavaScript関数に渡すパスとは区別してください。
 
 `nyanHostExec` は、サーバ上でOSコマンドを実行できる強い機能です。公開環境や、外部から入力を受ける処理では、安易に使わないでください。
 
@@ -1054,6 +1060,20 @@ ws.onmessage = function (event) {
 ```
 
 NyanQLのWebSocketサーバでは、先頭の `/` を除いたURLパス全体がチャネル名になります。上の例では、`listItems` がチャネル名です。mount配下の `sub/listItems` をpush先にする場合は、WebSocketも `/sub/listItems` へ接続してください。
+
+### WebSocketからAPIを呼び出す
+
+接続後、`api` に実行対象を指定したJSONオブジェクトをテキストメッセージとして送信できます。その他の項目はAPIのパラメータになります。
+
+```json
+{"api":"getItem","id":1}
+```
+
+呼び出しごとに、対象APIの `paramCheck` → 本体のscript／SQL → `outCheck` → 応答送信の順に実行します。設定されていないチェックは省略します。`paramCheck` が拒否した場合は本体を実行せず、`outCheck` が拒否した場合は本体の結果を送らず、それぞれのチェック結果を呼び出した接続だけに返します。`outCheck` では通常HTTPと同じ `nyan_output.body` などで送信予定の本文を確認できます。チェックや本体処理で例外が発生した場合も、その呼び出しのエラーを返し、次の呼び出しを受け付けます。
+
+API実行には通常HTTPと同じBasic認証が必要です。接続時のHTTPリクエストに認証情報を含めてください。接続先のチャネル名と実行対象の `api` は別に指定でき、mount配下のAPIには `sub/getItem` のような完全API名を使います。対象は `type: "api"`（省略時を含む）のAPIです。内部コンテキスト用の `nyan_request`・`nyan_guard`・`mcp_principal` はメッセージに指定できません。
+
+`nyan_mode: "checkOnly"` を指定した呼び出しでは `paramCheck` だけを実行し、本体処理・`outCheck`・Pushは実行しません。接続しただけではAPIは実行せず、`api` を含まないJSONオブジェクトやバイナリメッセージもAPI実行の対象にはしません。既存のPush購読は引き続き利用できます。
 
 ### Pushで配信される内容
 
