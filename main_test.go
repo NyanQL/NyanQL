@@ -3662,33 +3662,6 @@ const nyanAcceptedParams = {"name":"default"};
 	}
 }
 
-func TestExecuteAPIConfigSupportsSQLAndScript(t *testing.T) {
-	setTestSQLiteDB(t)
-	resetJavascriptInclude(t)
-	sqlPath := filepath.Join(t.TempDir(), "select.sql")
-	writeTestFile(t, sqlPath, `SELECT 'sql' AS source`)
-	sqlResult, err := executeAPIConfig(APIConfig{SQL: []string{sqlPath}})
-	if err != nil {
-		t.Fatalf("executeAPIConfig(SQL) error = %v", err)
-	}
-	var rows []map[string]interface{}
-	if err := json.Unmarshal(sqlResult, &rows); err != nil || len(rows) != 1 || rows[0]["source"] != "sql" {
-		t.Fatalf("SQL result = %q, error = %v", sqlResult, err)
-	}
-
-	scriptPath := writeTestScript(t, `JSON.stringify({source: "script"});`)
-	scriptResult, err := executeAPIConfig(APIConfig{Script: scriptPath})
-	if err != nil {
-		t.Fatalf("executeAPIConfig(script) error = %v", err)
-	}
-	if string(scriptResult) != `{"source":"script"}` {
-		t.Fatalf("script result = %q", scriptResult)
-	}
-	if _, err := executeAPIConfig(APIConfig{}); err == nil {
-		t.Fatal("executeAPIConfig(empty) error = nil")
-	}
-}
-
 func TestExecCommandReportsSuccessAndFailure(t *testing.T) {
 	result, err := execCommand("echo nyan")
 	if err != nil {
@@ -4288,6 +4261,621 @@ func TestMCPHTTPToolCallWithoutHTTPMode(t *testing.T) {
 	result := response["result"].(map[string]interface{})
 	if result["isError"] == true || result["structuredContent"].(map[string]interface{})["value"] != "ok" {
 		t.Fatalf("MCP tool result=%#v", result)
+	}
+}
+
+func TestMCPCheckOnlyAcrossTransports(t *testing.T) {
+	for _, transport := range []string{"streamable_http", "stdio"} {
+		for _, test := range []struct {
+			name, arguments, check         string
+			wantError, wantCheck, wantBody bool
+		}{
+			{name: "check_only", arguments: `{"id":1,"nyan_mode":"checkOnly"}`, wantCheck: true},
+			{name: "normal", arguments: `{"id":1}`, wantCheck: true, wantBody: true},
+			{name: "rejected", arguments: `{"id":1,"nyan_mode":"checkOnly"}`, check: `({success:false,status:403,error:"denied"});`, wantCheck: true, wantError: true},
+			{name: "exception", arguments: `{"id":1,"nyan_mode":"checkOnly"}`, check: `throw new Error("check failed");`, wantCheck: true, wantError: true},
+			{name: "invalid_type", arguments: `{"id":"1","nyan_mode":"checkOnly"}`, wantError: true},
+			{name: "missing_required", arguments: `{"nyan_mode":"checkOnly"}`, wantError: true},
+			{name: "unknown_property", arguments: `{"id":1,"extra":true,"nyan_mode":"checkOnly"}`, wantError: true},
+			{name: "unknown_mode", arguments: `{"id":1,"nyan_mode":"checkOnyl"}`, wantError: true},
+			{name: "null_mode", arguments: `{"id":1,"nyan_mode":null}`, wantError: true},
+			{name: "array_mode", arguments: `{"id":1,"nyan_mode":["checkOnly"]}`, wantError: true},
+			{name: "empty_mode", arguments: `{"id":1,"nyan_mode":""}`, wantError: true},
+		} {
+			t.Run(transport+"/"+test.name, func(t *testing.T) {
+				resetJavascriptInclude(t)
+				setTestSQLiteDB(t)
+				oldHub := hub
+				hub = NewHub()
+				t.Cleanup(func() { hub = oldHub })
+				dir := t.TempDir()
+				mark := func(stage string) string {
+					return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"), %q);`, filepath.Join(dir, stage))
+				}
+				const allow = `({success:true,status:200,result:{checked:true}});`
+				check := test.check
+				if check == "" {
+					check = allow
+				}
+				input := writeTestScript(t, `const nyanInputSchema={type:"object",properties:{id:{type:"integer"}},required:["id"],additionalProperties:false};`+mark("param")+check)
+				snapshot := newAPIConfigSnapshot(map[string]APIConfig{
+					"tool":   {ParamCheck: input, Script: writeTestScript(t, mark("body")+`({success:true,status:200,result:{executed:true}});`), OutCheck: writeTestScript(t, mark("out")+allow), Push: "events"},
+					"events": {ParamCheck: writeTestScript(t, mark("push_param")+allow), Script: writeTestScript(t, mark("push_body")+allow), OutCheck: writeTestScript(t, mark("push_out")+allow)},
+				}, "", [sha256.Size]byte{})
+				server := APIConfig{Type: apiTypeMCP, Transport: transport, ProtocolVersions: []string{mcpProtocolVersion20251125}, Tools: []MCPToolConfig{{API: "tool"}}}
+				call := func(message string) map[string]interface{} {
+					t.Helper()
+					if transport == "stdio" {
+						state := mcpStdioReady
+						response, reply := handleMCPStdioMessage(snapshot, "test_mcp", server, &state, []byte(message))
+						if !reply {
+							t.Fatal("stdio did not reply")
+						}
+						return response
+					}
+					rec := performTestMCPRequest(t, snapshot, server, message, "")
+					if rec.Code != http.StatusOK {
+						t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+					}
+					return decodeTestJSONObject(t, rec.Body.Bytes())
+				}
+				listed := call(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+				encoded, err := json.Marshal(listed)
+				if err != nil {
+					t.Fatal(err)
+				}
+				listed = decodeTestJSONObject(t, encoded)
+				published := listed["result"].(map[string]interface{})["tools"].([]interface{})[0].(map[string]interface{})["inputSchema"].(map[string]interface{})
+				arguments := decodeTestJSONObject(t, []byte(test.arguments))
+				// Client-visible schema and execution must agree on the control
+				// parameter without weakening required/type/additionalProperties.
+				wantSchemaError := !test.wantCheck
+				if err := validateJSONSchemaValue(published, arguments); (err != nil) != wantSchemaError {
+					t.Fatalf("published schema validation=%v, want error=%v", err, wantSchemaError)
+				}
+				response := call(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tool","arguments":` + test.arguments + `}}`)
+				if response["error"] != nil {
+					t.Fatalf("protocol error: %#v", response)
+				}
+				result := response["result"].(map[string]interface{})
+				if (result["isError"] == true) != test.wantError {
+					t.Fatalf("result=%#v, want error=%v", result, test.wantError)
+				}
+				if !test.wantError {
+					want := `{"success":true,"status":200,"result":{"checked":true}}`
+					if test.wantBody {
+						want = `{"success":true,"status":200,"result":{"executed":true}}`
+					}
+					if !reflect.DeepEqual(result["structuredContent"], decodeTestJSONObject(t, []byte(want))) {
+						t.Fatalf("wrong result: %#v", result)
+					}
+				}
+				for _, stage := range []string{"param", "body", "out", "push_param", "push_body", "push_out"} {
+					_, err := os.Stat(filepath.Join(dir, stage))
+					if err != nil && !os.IsNotExist(err) {
+						t.Fatal(err)
+					}
+					want := test.wantBody || stage == "param" && test.wantCheck
+					if (err == nil) != want {
+						t.Errorf("%s executed=%v, want %v", stage, err == nil, want)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestMCPCheckOnlyStillAuthenticates(t *testing.T) {
+	for _, test := range []struct {
+		name, token string
+		status      int
+	}{
+		{name: "missing_token", status: http.StatusUnauthorized},
+		{name: "invalid_token", token: "Bearer invalid", status: http.StatusUnauthorized},
+		{name: "insufficient_scope", token: "Bearer forbidden", status: http.StatusForbidden},
+		{name: "authenticated", token: "Bearer good", status: http.StatusOK},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetJavascriptInclude(t)
+			setTestSQLiteDB(t)
+			marker := filepath.Join(t.TempDir(), "checked")
+			verify := writeTestScript(t, `
+if (nyanAllParams.nyan_mode !== undefined) throw new Error("checkOnly reached authentication");
+({authenticated:nyanAllParams.authorization === "Bearer good", forbidden:nyanAllParams.authorization === "Bearer forbidden", principal:{user_id:"verified"}});`)
+			input := writeTestScript(t, fmt.Sprintf(`
+const nyanInputSchema={type:"object",properties:{id:{type:"integer"}},required:["id"],additionalProperties:false};
+if (nyanAllParams.mcp_principal.user_id !== "verified") throw new Error("missing verified principal");
+nyanSaveFile(nyanBase64Encode("checked"), %q);
+({success:true,status:200,result:{checked:true}});`, marker))
+			snapshot := newAPIConfigSnapshot(map[string]APIConfig{
+				"verify": {Script: verify, Scopes: []string{"tool:read"}},
+				"tool":   {ParamCheck: input, Script: writeTestScript(t, `throw new Error("body must not run");`), Scopes: []string{"tool:read"}},
+			}, "", [sha256.Size]byte{})
+			server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", Tools: []MCPToolConfig{{API: "tool"}}, OAuth: MCPOAuthConfig{VerifyAccess: "verify"}}
+			rec := performTestMCPRequest(t, snapshot, server, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":{"id":1,"nyan_mode":"checkOnly"}}}`, test.token)
+			if rec.Code != test.status {
+				t.Fatalf("status=%d, want %d: %s", rec.Code, test.status, rec.Body.String())
+			}
+			result := decodeTestJSONObject(t, rec.Body.Bytes())["result"].(map[string]interface{})
+			if (result["isError"] == true) != (test.status != http.StatusOK) {
+				t.Fatalf("result=%#v", result)
+			}
+			_, err := os.Stat(marker)
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			if (err == nil) != (test.status == http.StatusOK) {
+				t.Fatalf("paramCheck execution did not follow authentication: %v", err)
+			}
+		})
+	}
+}
+
+func TestMCPOutputValidationUsesOutCheck(t *testing.T) {
+	for _, transport := range []string{"streamable_http", "stdio"} {
+		for _, test := range []struct {
+			name, check string
+			wantError   bool
+		}{
+			{name: "allowed_despite_schema_mismatch", check: `({success:true,status:200});`},
+			{name: "rejected_by_javascript", check: `({success:false,status:409,error:"output denied by JavaScript"});`, wantError: true},
+			{name: "javascript_exception", check: `throw new Error("output check failed");`, wantError: true},
+		} {
+			t.Run(transport+"/"+test.name, func(t *testing.T) {
+				resetJavascriptInclude(t)
+				setTestSQLiteDB(t)
+				marker := filepath.Join(t.TempDir(), "out-checked")
+				const originalBody = `{"actual":"kept"}`
+				input := writeTestScript(t, `
+const nyanInputSchema = {type:"object",properties:{id:{type:"integer"}},required:["id"]};
+nyanAllParams.checked = true;
+({success:true,status:200});`)
+				script := writeTestScript(t, fmt.Sprintf(`
+if (!nyanAllParams.checked) throw new Error("paramCheck was skipped");
+%q;`, originalBody))
+				output := writeTestScript(t, fmt.Sprintf(`
+const nyanOutputSchema = {type:"object",properties:{expected:{type:"integer"}},required:["expected"],additionalProperties:false};
+if (nyanAllParams.nyan_output.body !== %q) throw new Error("wrong original output");
+nyanSaveFile(nyanBase64Encode("checked"), %q);
+`, originalBody, marker)+test.check)
+				snapshot := newAPIConfigSnapshot(map[string]APIConfig{
+					"tool": {Type: apiTypeAPI, Script: script, ParamCheck: input, OutCheck: output},
+				}, "", [sha256.Size]byte{})
+				server := APIConfig{Type: apiTypeMCP, Transport: transport, ProtocolVersions: []string{mcpProtocolVersion20251125}, Tools: []MCPToolConfig{{Name: "tool", API: "tool"}}}
+				call := func(message string) map[string]interface{} {
+					t.Helper()
+					if transport == "stdio" {
+						state := mcpStdioReady
+						response, reply := handleMCPStdioMessage(snapshot, "test_mcp", server, &state, []byte(message))
+						if !reply {
+							t.Fatal("stdio did not reply")
+						}
+						return response
+					}
+					rec := performTestMCPRequest(t, snapshot, server, message, "")
+					if rec.Code != http.StatusOK {
+						t.Fatalf("HTTP status=%d body=%s", rec.Code, rec.Body.String())
+					}
+					return decodeTestJSONObject(t, rec.Body.Bytes())
+				}
+				// Publishing the schema must remain available even though the API
+				// output is accepted or rejected by JavaScript, not by this schema.
+				listed := call(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
+				encoded, err := json.Marshal(listed)
+				if err != nil || !bytes.Contains(encoded, []byte(`"outputSchema"`)) || !bytes.Contains(encoded, []byte(`"expected"`)) {
+					t.Fatalf("output schema was not published: %s err=%v", encoded, err)
+				}
+				response := call(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tool","arguments":{"id":1}}}`)
+				if response["error"] != nil {
+					t.Fatalf("MCP protocol error: %#v", response)
+				}
+				result := response["result"].(map[string]interface{})
+				if (result["isError"] == true) != test.wantError {
+					t.Fatalf("MCP result=%#v, want error=%v", result, test.wantError)
+				}
+				data, err := os.ReadFile(marker)
+				if err != nil || string(data) != "checked" {
+					t.Fatalf("outCheck did not run: marker=%q err=%v", data, err)
+				}
+				encoded, err = json.Marshal(result)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if test.name == "allowed_despite_schema_mismatch" {
+					if !reflect.DeepEqual(result["structuredContent"], decodeTestJSONObject(t, []byte(originalBody))) {
+						t.Fatalf("original output was replaced: %#v", result)
+					}
+				} else if test.name == "rejected_by_javascript" {
+					if !bytes.Contains(encoded, []byte("output denied by JavaScript")) {
+						t.Fatalf("JavaScript rejection was replaced: %s", encoded)
+					}
+				}
+			})
+		}
+	}
+}
+
+func newOAuthChecksFixture(t *testing.T) (map[string]APIConfig, APIConfig, func(string) string, func() string) {
+	t.Helper()
+	resetJavascriptInclude(t)
+	testDB := setTestSQLiteDB(t)
+	if _, err := testDB.Exec(`CREATE TABLE oauth_stages (stage TEXT);`); err != nil {
+		t.Fatal(err)
+	}
+	markerSQL := filepath.Join(t.TempDir(), "mark.sql")
+	writeTestFile(t, markerSQL, `INSERT INTO oauth_stages (stage) VALUES (/*stage*/'unknown');`)
+	mark := func(stage string) string { return fmt.Sprintf(`nyanRunSQL(%q, {stage:%q});`, markerSQL, stage) }
+	stages := func() string {
+		t.Helper()
+		rows, err := testDB.Query(`SELECT stage FROM oauth_stages ORDER BY rowid`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var values []string
+		for rows.Next() {
+			var value string
+			if err := rows.Scan(&value); err != nil {
+				t.Fatal(err)
+			}
+			values = append(values, value)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(values, ",")
+	}
+	const allow = `({success:true,status:200,result:{checked:true}});`
+	const restrictions = `
+if (typeof nyanHostExec !== "undefined" || typeof nyanCallMe !== "undefined" || typeof nyanGetAPI !== "undefined" || typeof nyanSaveFile !== "undefined" || typeof nyanCrypto !== "undefined") throw new Error("unrestricted OAuth VM");
+if (nyanRuntimeSettings.issuer !== "https://service.example") throw new Error("missing runtime settings");
+`
+	definition := APIConfig{
+		ParamCheck: writeTestScript(t, restrictions+mark("input")+allow),
+		Script:     writeTestScript(t, restrictions+mark("body")+`({status:302,contentType:"text/plain",headers:{Location:"https://client.example/done","Set-Cookie":["one=1; HttpOnly","two=2; HttpOnly"]},body:"original"});`),
+		OutCheck:   writeTestScript(t, restrictions+mark("output")+allow),
+		Runtime:    APIRuntimeConfig{Capabilities: []string{"sql"}, SQLFiles: []string{markerSQL}},
+	}
+	definitions := map[string]APIConfig{}
+	for _, name := range []string{"authorize", "token", "register", "admin", "auth_meta", "resource_meta", "verify"} {
+		definitions[name] = definition
+	}
+	for _, name := range []string{"auth_meta", "resource_meta"} {
+		metadata := definition
+		metadata.Script = writeTestScript(t, `throw new Error("metadata must be generated by Go");`)
+		definitions[name] = metadata
+	}
+	verify := definition
+	verify.Script = writeTestScript(t, restrictions+mark("verify")+`({authenticated:nyanAllParams.authorization === "Bearer good",principal:{user_id:"verified"}});`)
+	verify.Scopes = []string{"tool:read"}
+	definitions["verify"] = verify
+	definitions["tool"] = APIConfig{
+		ParamCheck: writeTestScript(t, mark("tool_input")+allow),
+		Script:     writeTestScript(t, mark("tool_body")+`({success:true,status:200,result:{executed:true}});`),
+		Scopes:     []string{"tool:read"},
+	}
+	server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocolVersion20251125}, Tools: []MCPToolConfig{{API: "tool"}}, OAuth: MCPOAuthConfig{
+		AuthorizationServerMetadata: "auth_meta", ProtectedResourceMetadata: "resource_meta", Authorize: "authorize", Token: "token", Register: "register", AdminUser: "admin", VerifyAccess: "verify",
+	}}
+	return definitions, server, mark, stages
+}
+
+func TestOAuthChecksHTTPRoutes(t *testing.T) {
+	for _, role := range []string{"oauthAuthorize", "oauthToken", "oauthRegister", "oauthAdminUser", "authorizationServerMetadata", "protectedResourceMetadata"} {
+		for _, test := range []string{"allowed", "input_denied", "output_denied", "input_exception", "output_exception", "invalid_input", "invalid_output", "missing_file", "check_only", "check_only_denied", "check_only_missing", "check_alias"} {
+			t.Run(role+"/"+test, func(t *testing.T) {
+				definitions, server, mark, stages := newOAuthChecksFixture(t)
+				apiName := mcpOAuthAPIForRole(server, role)
+				definition := definitions[apiName]
+				wantStatus, wantStages := http.StatusFound, "input,body,output"
+				if isMCPOAuthMetadataRole(role) {
+					wantStatus, wantStages = http.StatusOK, "input,output"
+				}
+				const denied = `({success:false,status:403,result:{reason:"denied"}});`
+				switch test {
+				case "input_denied", "check_only_denied":
+					definition.ParamCheck = writeTestScript(t, mark("input")+denied)
+					wantStatus, wantStages = http.StatusForbidden, "input"
+				case "output_denied":
+					definition.OutCheck = writeTestScript(t, mark("output")+denied)
+					wantStatus = http.StatusForbidden
+				case "input_exception", "invalid_input", "missing_file":
+					check := `throw new Error("private-check-detail");`
+					if test == "invalid_input" {
+						check = `({success:"true",status:200});`
+					}
+					definition.ParamCheck = writeTestScript(t, check)
+					if test == "missing_file" {
+						definition.ParamCheck += ".missing"
+					}
+					wantStatus, wantStages = http.StatusInternalServerError, ""
+				case "output_exception", "invalid_output":
+					check := `throw new Error("private-check-detail");`
+					if test == "invalid_output" {
+						check = `({success:true});`
+					}
+					definition.OutCheck = writeTestScript(t, check)
+					wantStatus, wantStages = http.StatusInternalServerError, strings.TrimSuffix(wantStages, ",output")
+				case "check_only":
+					wantStatus, wantStages = http.StatusOK, "input"
+				case "check_only_missing":
+					definition.ParamCheck = ""
+					wantStatus, wantStages = http.StatusInternalServerError, ""
+				case "check_alias":
+					definition.Check, definition.ParamCheck = definition.ParamCheck, ""
+				}
+				definitions[apiName] = definition
+				snapshot := newAPIConfigSnapshot(definitions, "", [sha256.Size]byte{})
+				method, contentType, body := http.MethodPost, "application/x-www-form-urlencoded", "value=1"
+				if role == "oauthRegister" || role == "oauthAdminUser" {
+					contentType, body = "application/json", `{"value":1}`
+				}
+				if role == "oauthAuthorize" || isMCPOAuthMetadataRole(role) {
+					method, body = http.MethodGet, ""
+				}
+				target := "https://service.example/" + apiName
+				if strings.HasPrefix(test, "check_only") {
+					target += "?nyan_mode=checkOnly"
+				}
+				req := httptest.NewRequest(method, target, strings.NewReader(body))
+				req.Header.Set("Content-Type", contentType)
+				req.RemoteAddr = "127.0.0.1:1234"
+				req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+				rec := httptest.NewRecorder()
+				handleMCPOAuthHTTPRequest(snapshot, rec, req, t.Name(), server, apiName, role)
+				if rec.Code != wantStatus || stages() != wantStages {
+					t.Fatalf("status=%d want=%d stages=%q want=%q body=%s", rec.Code, wantStatus, stages(), wantStages, rec.Body.String())
+				}
+				if test != "allowed" && test != "check_alias" {
+					if rec.Header().Get("Location") != "" || len(rec.Header().Values("Set-Cookie")) != 0 {
+						t.Fatalf("script headers escaped: %v", rec.Header())
+					}
+				} else if !isMCPOAuthMetadataRole(role) {
+					if rec.Body.String() != "original" || len(rec.Header().Values("Set-Cookie")) != 2 {
+						t.Fatalf("original response lost: %s %v", rec.Body.String(), rec.Header())
+					}
+				} else {
+					value := decodeTestJSONObject(t, rec.Body.Bytes())
+					if value["issuer"] == nil && value["resource"] == nil {
+						t.Fatalf("missing metadata: %v", value)
+					}
+				}
+				if wantStatus == http.StatusForbidden {
+					if !reflect.DeepEqual(decodeTestJSONObject(t, rec.Body.Bytes())["result"], map[string]interface{}{"reason": "denied"}) {
+						t.Fatalf("check result lost: %s", rec.Body.String())
+					}
+				}
+				if test == "check_only" && !strings.Contains(rec.Body.String(), `"checked":true`) {
+					t.Fatalf("check result lost: %s", rec.Body.String())
+				}
+				if strings.Contains(rec.Body.String(), "private-check-detail") {
+					t.Fatal("check exception leaked")
+				}
+			})
+		}
+	}
+}
+
+func TestOAuthVerifyChecksBeforeMCPTool(t *testing.T) {
+	for _, mode := range []string{"normal", "checkOnly"} {
+		for _, test := range []string{"allowed", "input_denied", "output_denied", "input_exception", "output_exception", "invalid_check", "non_200_output", "invalid_token"} {
+			t.Run(mode+"/"+test, func(t *testing.T) {
+				definitions, server, mark, stages := newOAuthChecksFixture(t)
+				definition := definitions["verify"]
+				const noMode = `if (nyanAllParams.nyan_mode !== undefined) throw new Error("authentication was put in checkOnly mode");`
+				definition.ParamCheck = writeTestScript(t, noMode+mark("input")+`({success:true,status:200});`)
+				definition.OutCheck = writeTestScript(t, noMode+mark("output")+`
+const decision=JSON.parse(nyanAllParams.nyan_output.body);
+if (decision.principal.user_id !== "verified") throw new Error("whole decision missing");
+nyanAllParams.nyan_output.body = '{"authenticated":false}';
+({success:true,status:200});`)
+				wantStatus, wantStages := http.StatusUnauthorized, ""
+				token := "Bearer good"
+				switch test {
+				case "allowed":
+					wantStatus, wantStages = http.StatusOK, "input,verify,output,tool_input"
+					if mode == "normal" {
+						wantStages += ",tool_body"
+					}
+				case "input_denied":
+					// Even a rejection containing a forged authentication decision
+					// must be treated as a check rejection, not as verified access.
+					definition.ParamCheck = writeTestScript(t, mark("input")+`({success:false,status:403,authenticated:true,allow:true,principal:{user_id:"forged"}});`)
+					wantStages = "input"
+				case "output_denied", "non_200_output":
+					result := `({success:false,status:403,authenticated:true,principal:{user_id:"forged"}});`
+					if test == "non_200_output" {
+						result = `({success:true,status:201});`
+					}
+					definition.OutCheck = writeTestScript(t, mark("output")+result)
+					wantStages = "input,verify,output"
+				case "input_exception":
+					definition.ParamCheck = writeTestScript(t, `throw new Error("private-auth-error");`)
+				case "output_exception":
+					definition.OutCheck = writeTestScript(t, `throw new Error("private-auth-error");`)
+					wantStages = "input,verify"
+				case "invalid_check":
+					definition.ParamCheck = writeTestScript(t, `({authenticated:true,principal:{user_id:"forged"}});`)
+				case "invalid_token":
+					token, wantStages = "Bearer invalid", "input,verify,output"
+				}
+				definitions["verify"] = definition
+				snapshot := newAPIConfigSnapshot(definitions, "", [sha256.Size]byte{})
+				arguments := `{}`
+				if mode == "checkOnly" {
+					arguments = `{"nyan_mode":"checkOnly"}`
+				}
+				message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":` + arguments + `}}`
+				req := httptest.NewRequest(http.MethodPost, "https://service.example/mcp", nil)
+				req.Header.Set("Authorization", token)
+				urls, err := deriveMCPRuntimeURLs(req, "mcp", server)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var request MCPJSONRPCRequest
+				if err := json.Unmarshal([]byte(message), &request); err != nil {
+					t.Fatal(err)
+				}
+				rec := httptest.NewRecorder()
+				handleMCPToolCall(snapshot, rec, req, request, t.Name(), server, urls)
+				if rec.Code != wantStatus || stages() != wantStages {
+					t.Fatalf("status=%d want=%d stages=%q want=%q body=%s", rec.Code, wantStatus, stages(), wantStages, rec.Body.String())
+				}
+				result := decodeTestJSONObject(t, rec.Body.Bytes())["result"].(map[string]interface{})
+				if (result["isError"] == true) != (wantStatus != http.StatusOK) {
+					t.Fatalf("wrong Tool result: %v", result)
+				}
+				if wantStatus == http.StatusUnauthorized && !strings.Contains(rec.Header().Get("WWW-Authenticate"), "invalid_token") {
+					t.Fatalf("missing challenge: %v", rec.Header())
+				}
+			})
+		}
+	}
+}
+
+func TestOAuthCheckOnlyHTTPValidation(t *testing.T) {
+	for _, test := range []struct {
+		name, role, method, contentType, query, body string
+		status                                       int
+		stages                                       string
+		noAdminAuth                                  bool
+	}{
+		{name: "query", role: "oauthAuthorize", method: "GET", query: "?nyan_mode=checkOnly", status: 200, stages: "input"},
+		{name: "form", role: "oauthToken", method: "POST", contentType: "application/x-www-form-urlencoded", body: "nyan_mode=checkOnly", status: 200, stages: "input"},
+		{name: "json", role: "oauthRegister", method: "POST", contentType: "application/json", body: `{"nyan_mode":"checkOnly"}`, status: 200, stages: "input"},
+		{name: "form_over_query", role: "oauthToken", method: "POST", contentType: "application/x-www-form-urlencoded", query: "?nyan_mode=checkOnly", body: "nyan_mode=", status: 302, stages: "input,body,output"},
+		{name: "json_over_query", role: "oauthRegister", method: "POST", contentType: "application/json", query: "?nyan_mode=checkOnly", body: `{"nyan_mode":""}`, status: 302, stages: "input,body,output"},
+		{name: "invalid_mode", role: "oauthAuthorize", method: "GET", query: "?nyan_mode=checkOnyl", status: 400},
+		{name: "repeated_mode", role: "oauthAuthorize", method: "GET", query: "?nyan_mode=checkOnly&nyan_mode=checkOnly", status: 400},
+		{name: "null_mode", role: "oauthRegister", method: "POST", contentType: "application/json", body: `{"nyan_mode":null}`, status: 400},
+		{name: "wrong_method", role: "oauthToken", method: "GET", query: "?nyan_mode=checkOnly", status: 405},
+		{name: "metadata_wrong_method", role: "authorizationServerMetadata", method: "POST", query: "?nyan_mode=checkOnly", status: 405},
+		{name: "wrong_content_type", role: "oauthToken", method: "POST", contentType: "application/json", query: "?nyan_mode=checkOnly", body: `{}`, status: 415},
+		{name: "invalid_json", role: "oauthRegister", method: "POST", contentType: "application/json", query: "?nyan_mode=checkOnly", body: `{`, status: 400},
+		{name: "duplicate_json_key", role: "oauthRegister", method: "POST", contentType: "application/json", body: `{"nyan_mode":"checkOnly","nyan_mode":""}`, status: 400},
+		{name: "invalid_form", role: "oauthToken", method: "POST", contentType: "application/x-www-form-urlencoded", query: "?nyan_mode=checkOnly", body: "value=%", status: 400},
+		{name: "oversized_request", role: "oauthRegister", method: "POST", contentType: "application/json", query: "?nyan_mode=checkOnly", body: strings.Repeat("x", maxConfiguredHTTPBodyBytes+1), status: 413},
+		{name: "admin_auth", role: "oauthAdminUser", method: "POST", contentType: "application/json", body: `{"nyan_mode":"checkOnly"}`, status: 401, noAdminAuth: true},
+		{name: "options", role: "oauthAuthorize", method: "OPTIONS", query: "?nyan_mode=checkOnly", status: 204},
+		{name: "metadata_options", role: "protectedResourceMetadata", method: "OPTIONS", query: "?nyan_mode=checkOnly", status: 204},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			definitions, server, _, stages := newOAuthChecksFixture(t)
+			apiName := mcpOAuthAPIForRole(server, test.role)
+			req := httptest.NewRequest(test.method, "https://service.example/"+apiName+test.query, strings.NewReader(test.body))
+			req.RemoteAddr = "127.0.0.1:1234"
+			req.Header.Set("Content-Type", test.contentType)
+			if !test.noAdminAuth {
+				req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+			}
+			rec := httptest.NewRecorder()
+			handleMCPOAuthHTTPRequest(newAPIConfigSnapshot(definitions, "", [sha256.Size]byte{}), rec, req, t.Name(), server, apiName, test.role)
+			if rec.Code != test.status || stages() != test.stages {
+				t.Fatalf("status=%d want=%d stages=%q want=%q body=%s", rec.Code, test.status, stages(), test.stages, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestOAuthCheckResponseBoundaries(t *testing.T) {
+	for _, test := range []string{"inspection_copy", "invalid_header", "invalid_content_type", "invalid_status", "oversized_body", "oversized_input_check", "oversized_output_check", "non_200_output", "forbidden_sql_input", "forbidden_sql_output"} {
+		t.Run(test, func(t *testing.T) {
+			definitions, server, mark, stages := newOAuthChecksFixture(t)
+			definition := definitions["authorize"]
+			wantStatus, wantStages := http.StatusInternalServerError, "input,body"
+			query := ""
+			switch test {
+			case "inspection_copy":
+				definition.OutCheck = writeTestScript(t, mark("output")+`
+const output=nyanAllParams.nyan_output;
+if (output.status !== 302 || output.contentType !== "text/plain" || output.body !== "original" || output.bodyBase64 !== "b3JpZ2luYWw=" || output.bodyLengthBytes !== 8) throw new Error("wrong output metadata");
+if (output.headers.Location !== "https://client.example/done" || output.headers["Set-Cookie"].length !== 2) throw new Error("missing response headers");
+if (nyanAllParams.nyan_output_body !== output.body || nyanAllParams.nyan_output_status !== 302) throw new Error("missing output aliases");
+output.headers.Location="https://changed.example/";
+output.headers["Set-Cookie"][0]="changed=1";
+output.body="changed";
+({success:true,status:200});`)
+				wantStatus, wantStages = http.StatusFound, "input,body,output"
+			case "invalid_header":
+				definition.Script = writeTestScript(t, mark("body")+`({status:302,headers:{Location:"https://client.example/","Set-Cookie":"secret=1",Connection:"close"},body:"original"});`)
+			case "invalid_content_type":
+				definition.Script = writeTestScript(t, mark("body")+`({status:302,headers:{Location:"https://client.example/","Set-Cookie":"secret=1"},contentType:"text/plain;=",body:"original"});`)
+			case "invalid_status":
+				definition.Script = writeTestScript(t, mark("body")+`({status:302.5,headers:{"Set-Cookie":"secret=1"},body:"original"});`)
+			case "oversized_body":
+				definition.Script = writeTestScript(t, mark("body")+fmt.Sprintf(`({status:200,headers:{"Set-Cookie":"secret=1"},body:"x".repeat(%d)});`, maxConfiguredHTTPResponseBytes+1))
+			case "oversized_input_check", "oversized_output_check":
+				path := writeTestScript(t, fmt.Sprintf(`({success:true,status:200,result:"x".repeat(%d)});`, maxConfiguredHTTPResponseBytes))
+				if test == "oversized_input_check" {
+					definition.ParamCheck, wantStages, query = path, "", "?nyan_mode=checkOnly"
+				} else {
+					definition.OutCheck = path
+				}
+			case "non_200_output":
+				definition.OutCheck = writeTestScript(t, mark("output")+`({success:true,status:201,result:{rejected:true}});`)
+				wantStatus, wantStages = 201, "input,body,output"
+			case "forbidden_sql_input", "forbidden_sql_output":
+				forbidden := filepath.Join(t.TempDir(), "forbidden.sql")
+				writeTestFile(t, forbidden, `INSERT INTO oauth_stages VALUES ('forbidden');`)
+				path := writeTestScript(t, fmt.Sprintf(`nyanRunSQL(%q, {}); ({success:true,status:200});`, forbidden))
+				if test == "forbidden_sql_input" {
+					definition.ParamCheck, wantStages = path, ""
+				} else {
+					definition.OutCheck = path
+				}
+			}
+			definitions["authorize"] = definition
+			req := httptest.NewRequest(http.MethodGet, "https://service.example/authorize"+query, nil)
+			rec := httptest.NewRecorder()
+			handleMCPOAuthHTTPRequest(newAPIConfigSnapshot(definitions, "", [sha256.Size]byte{}), rec, req, t.Name(), server, "authorize", "oauthAuthorize")
+			if rec.Code != wantStatus || stages() != wantStages {
+				t.Fatalf("status=%d want=%d stages=%q want=%q body=%.200s", rec.Code, wantStatus, stages(), wantStages, rec.Body.String())
+			}
+			if test == "inspection_copy" {
+				if rec.Body.String() != "original" || rec.Header().Get("Location") != "https://client.example/done" || rec.Header().Values("Set-Cookie")[0] != "one=1; HttpOnly" {
+					t.Fatalf("response mutated: %s %v", rec.Body.String(), rec.Header())
+				}
+			} else if rec.Header().Get("Location") != "" || len(rec.Header().Values("Set-Cookie")) != 0 {
+				t.Fatalf("script headers escaped: %v", rec.Header())
+			}
+		})
+	}
+}
+
+func TestOAuthMetadataChecksUseExecutionLimits(t *testing.T) {
+	for _, role := range []string{"authorizationServerMetadata", "protectedResourceMetadata"} {
+		for _, limit := range []string{"rate", "concurrency"} {
+			t.Run(role+"/"+limit, func(t *testing.T) {
+				definitions, server, _, stages := newOAuthChecksFixture(t)
+				apiName := mcpOAuthAPIForRole(server, role)
+				server.RateLimit = &HTTPRateLimitConfig{Requests: 1, Window: "1m"}
+				wantStatus, wantStages := http.StatusTooManyRequests, "input,output"
+				if limit == "concurrency" {
+					server.MaxConcurrent = 1
+					release, acquired := acquireMCPExecutionSlot(t.Name()+":oauth:"+role, 1)
+					if !acquired {
+						t.Fatal("failed to acquire test slot")
+					}
+					defer release()
+					wantStatus, wantStages = http.StatusServiceUnavailable, ""
+				}
+				snapshot := newAPIConfigSnapshot(definitions, "", [sha256.Size]byte{})
+				call := func() *httptest.ResponseRecorder {
+					rec := httptest.NewRecorder()
+					handleMCPOAuthHTTPRequest(snapshot, rec, httptest.NewRequest(http.MethodGet, "https://service.example/"+apiName, nil), t.Name(), server, apiName, role)
+					return rec
+				}
+				if limit == "rate" {
+					if rec := call(); rec.Code != http.StatusOK {
+						t.Fatalf("first request: %d %s", rec.Code, rec.Body.String())
+					}
+				}
+				rec := call()
+				if rec.Code != wantStatus || stages() != wantStages || rec.Header().Get("Retry-After") == "" {
+					t.Fatalf("status=%d stages=%q headers=%v", rec.Code, stages(), rec.Header())
+				}
+			})
+		}
 	}
 }
 
@@ -6054,7 +6642,7 @@ func TestCheckOnlyRunsOnlyParamCheck(t *testing.T) {
 	oldHub := hub
 	hub = NewHub()
 	t.Cleanup(func() { hub = oldHub })
-	for _, route := range []string{"http", "jsonrpc", "nyanCallMe", "websocket"} {
+	for _, route := range []string{"http", "jsonrpc", "nyanCallMe", "websocket", "mcp_http", "mcp_stdio"} {
 		for _, checkField := range []string{"paramCheck", "check", "missing"} {
 			for _, bodyType := range []string{"script", "sql"} {
 				t.Run(route+"/"+checkField+"/"+bodyType, func(t *testing.T) {
@@ -6124,6 +6712,23 @@ func TestCheckOnlyRunsOnlyParamCheck(t *testing.T) {
 						request := httptest.NewRequest(http.MethodGet, "/events", nil)
 						request.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
 						response = decodeTestJSONObject(t, executeWebSocketAPIMessage(request, []byte(`{"api":"target","nyan_mode":"checkOnly"}`)))
+					case "mcp_http", "mcp_stdio":
+						server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocolVersion20251125}, Tools: []MCPToolConfig{{API: "target"}}}
+						message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"target","arguments":{"nyan_mode":"checkOnly"}}}`
+						if route == "mcp_stdio" {
+							server.Transport = "stdio"
+							state := mcpStdioReady
+							response, _ = handleMCPStdioMessage(currentAPISnapshot(), "test_mcp", server, &state, []byte(message))
+						} else {
+							rec := performTestMCPRequest(t, currentAPISnapshot(), server, message, "")
+							response = decodeTestJSONObject(t, rec.Body.Bytes())
+						}
+						result := response["result"].(map[string]interface{})
+						if result["isError"] == true {
+							callErr = fmt.Errorf("MCP Tool error: %v", result)
+						} else {
+							response = result["structuredContent"].(map[string]interface{})
+						}
 					}
 					if checkField == "missing" {
 						if callErr == nil && response["error"] == nil && response["success"] != false {
@@ -6208,7 +6813,7 @@ if (nyanAllParams.api !== "events" || nyanAllParams.value !== "7" ||
 				target := APIConfig{ParamCheck: paramCheck, OutCheck: outCheck, Push: "nested"}
 				if test.sql {
 					target.SQL = []string{filepath.Join(dir, "list.sql")}
-					query := `SELECT 7 AS value;`
+					query := `SELECT CAST(/*value*/0 AS INTEGER) AS value;`
 					if test.bodyError {
 						query = `SELECT * FROM missing_push_table;`
 					}
@@ -6280,6 +6885,172 @@ if (nyanAllParams.api !== "events" || nyanAllParams.value !== "7" ||
 				assertPushCheckFrame(t, conn, sentinel)
 			})
 		}
+	}
+}
+
+func TestPushSQLMatchesDirectAPIExecution(t *testing.T) {
+	const expected = `{"success":true,"status":200,"result":[{"id":3,"value":16}]}`
+	for _, test := range []struct {
+		name       string
+		failSQL    int
+		rejectIn   bool
+		rejectOut  bool
+		wantRows   int
+		wantOutput bool
+		wantPush   bool
+	}{
+		{name: "all_files_in_order", wantRows: 1, wantOutput: true, wantPush: true},
+		{name: "second_file_fails", failSQL: 2},
+		{name: "last_file_fails", failSQL: 3},
+		{name: "input_rejected", rejectIn: true},
+		{name: "output_rejected", rejectOut: true, wantRows: 1, wantOutput: true},
+	} {
+		for _, route := range []string{"http", "nyanCallMe", "push"} {
+			t.Run(test.name+"/"+route, func(t *testing.T) {
+				resetJavascriptInclude(t)
+				testDB := setTestSQLiteDB(t)
+				for _, query := range []string{`CREATE TABLE items (id INTEGER, value INTEGER);`, `CREATE TABLE origin_changes (value INTEGER);`} {
+					if _, err := testDB.Exec(query); err != nil {
+						t.Fatal(err)
+					}
+				}
+				dir := t.TempDir()
+				marker := func(stage string) string {
+					return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode((nyanGetFile(%q) || "") + "x"), %q);`, filepath.Join(dir, stage), filepath.Join(dir, stage))
+				}
+				paramResult := `({success:true,status:200});`
+				if test.rejectIn {
+					paramResult = `({success:false,status:403,error:"input rejected"});`
+				}
+				paramCheck := writeTestScript(t, marker("param")+`
+if (nyanAllParams.api !== "events" || Number(nyanAllParams.value) !== 7) throw new Error("wrong parameters");
+nyanAllParams.value = Number(nyanAllParams.value) + 1;
+`+paramResult)
+				outResult := `({success:true,status:200});`
+				if test.rejectOut {
+					outResult = `({success:false,status:409,error:"output rejected"});`
+				}
+				outCheck := writeTestScript(t, fmt.Sprintf(`
+if (nyanAllParams.api !== "events" || nyanAllParams.value !== 8 || nyanAllParams.nyan_output.body !== %q) {
+  throw new Error("SQL order, parameters, or final output differs");
+}
+`, expected)+marker("out")+outResult)
+				queries := []string{
+					`INSERT INTO items (id, value) VALUES (/*id*/0, /*value*/0) RETURNING id, value;`,
+					`UPDATE items SET value = value * 2 WHERE id = /*id*/0;`,
+					`SELECT id, value FROM items
+/*BEGIN*/
+WHERE
+/*IF id != null*/
+  id = /*id*/0
+/*END*/
+/*IF omitted != null*/
+  AND value = /*omitted*/0
+/*END*/
+/*END*/;`,
+				}
+				paths := make([]string, len(queries))
+				for index, query := range queries {
+					if test.failSQL == index+1 {
+						query = `SELECT * FROM missing_table;`
+					}
+					paths[index] = filepath.Join(dir, fmt.Sprintf("%d.sql", index+1))
+					writeTestFile(t, paths[index], query)
+				}
+				originSQL := filepath.Join(dir, "origin.sql")
+				writeTestFile(t, originSQL, `INSERT INTO origin_changes (value) VALUES (1);`)
+				const originBody = `{"origin":"ok"}`
+				setTestSQLFiles(t, map[string]APIConfig{
+					"origin": {Script: writeTestScript(t, fmt.Sprintf(`nyanRunSQL(%q); %q;`, originSQL, originBody)), Push: "events"},
+					"events": {SQL: paths, ParamCheck: paramCheck, OutCheck: outCheck},
+				})
+				var body string
+				var callErr error
+				if route == "push" {
+					conn, testHub := newPushCheckSubscriber(t, "events")
+					req := httptest.NewRequest(http.MethodPost, "/origin?id=3&value=7", nil)
+					req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+					rec := httptest.NewRecorder()
+					unifiedHandler(rec, req)
+					if rec.Code != http.StatusOK || rec.Body.String() != originBody {
+						t.Fatalf("Push affected origin: status=%d body=%s", rec.Code, rec.Body.String())
+					}
+					var originCount int
+					if err := testDB.QueryRow(`SELECT COUNT(*) FROM origin_changes`).Scan(&originCount); err != nil || originCount != 1 {
+						t.Fatalf("origin update count=%d err=%v", originCount, err)
+					}
+					const sentinel = "sql-push-complete"
+					testHub.Broadcast("events", []byte(sentinel))
+					if test.wantPush {
+						assertPushCheckFrame(t, conn, expected)
+					}
+					assertPushCheckFrame(t, conn, sentinel)
+				} else if route == "http" {
+					req := httptest.NewRequest(http.MethodPost, "/events?id=3&value=7", nil)
+					req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+					rec := httptest.NewRecorder()
+					unifiedHandler(rec, req)
+					body = rec.Body.String()
+				} else {
+					body, callErr = callNyanAPIFromVMWithSnapshot(currentAPISnapshot(), "events", map[string]interface{}{"id": 3, "value": 7})
+				}
+				if route != "push" {
+					if test.wantPush && (callErr != nil || body != expected) {
+						t.Fatalf("direct API result=%s err=%v", body, callErr)
+					}
+					if !test.wantPush && callErr == nil && decodeTestJSONObject(t, []byte(body))["success"] != false {
+						t.Fatalf("direct API failure was not reported: %s", body)
+					}
+				}
+				var rows int
+				if err := testDB.QueryRow(`SELECT COUNT(*) FROM items`).Scan(&rows); err != nil || rows != test.wantRows {
+					t.Fatalf("committed SQL rows=%d, want %d; err=%v", rows, test.wantRows, err)
+				}
+				for stage, want := range map[string]bool{"param": true, "out": test.wantOutput} {
+					data, err := os.ReadFile(filepath.Join(dir, stage))
+					if want {
+						if err != nil || string(data) != "x" {
+							t.Errorf("%s must run exactly once: marker=%q err=%v", stage, data, err)
+						}
+					} else if !os.IsNotExist(err) {
+						t.Errorf("%s should not run: marker=%q err=%v", stage, data, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestPushParamCheckOnlyAPIExecutesOutCheck(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	dir := t.TempDir()
+	const body = `{"success":true,"status":200,"result":{"value":7}}`
+	for _, reject := range []bool{false, true} {
+		t.Run(fmt.Sprint(reject), func(t *testing.T) {
+			marker := filepath.Join(dir, fmt.Sprint(reject))
+			setTestSQLFiles(t, map[string]APIConfig{
+				"events": {
+					ParamCheck: writeTestScript(t, fmt.Sprintf(`%q;`, body)),
+					OutCheck: writeTestScript(t, fmt.Sprintf(`
+if (nyanAllParams.nyan_output.body !== %q) throw new Error("wrong output");
+nyanSaveFile(nyanBase64Encode("checked"), %q);
+({success:%t,status:%d});`, body, marker, !reject, map[bool]int{false: 200, true: 409}[reject])),
+				},
+			})
+			conn, testHub := newPushCheckSubscriber(t, "events")
+			performPush(currentAPISnapshot(), APIConfig{Push: "events"}, map[string]interface{}{})
+			data, err := os.ReadFile(marker)
+			if err != nil || string(data) != "checked" {
+				t.Fatalf("outCheck did not run: marker=%q err=%v", data, err)
+			}
+			const sentinel = "param-only-push-complete"
+			testHub.Broadcast("events", []byte(sentinel))
+			if !reject {
+				assertPushCheckFrame(t, conn, body)
+			}
+			assertPushCheckFrame(t, conn, sentinel)
+		})
 	}
 }
 

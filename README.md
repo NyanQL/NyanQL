@@ -716,7 +716,7 @@ const nyanAcceptedParams = {
 curl -u admin:secret "http://localhost:8080/nyan/test2"
 ```
 
-`nyanOutputSchema` の公開と `outCheck` による実行時チェックは別の役割です。NyanQLは公開したJSON Schemaを使って自動検証しないため、実際の出力を拒否したい条件は `outCheck` のJavaScriptにも記述してください。
+`nyanOutputSchema` は出力仕様を公開するための定義です。MCP経由を含め、NyanQLはこのスキーマで実際の出力を自動検証しません。出力を許可・拒否する条件は `outCheck` のJavaScriptに実装してください。`outCheck` が `success: true` かつ `status: 200` を返した場合は、本体の実行結果を使用します。
 
 ### 入出力スキーマを明示する
 
@@ -778,7 +778,7 @@ const output = JSON.parse(nyanAllParams.nyan_output.body);
 
 `nyanOutputSchema` は `result` の中身だけではなく、NyanQLが返す正常レスポンス全体を表します。`$schema` は任意です。記載した場合はそのまま公開され、省略した場合にNyanQLが自動追加することはありません。
 
-現時点では、これらのスキーマは `/nyan/{API名}` からの公開用です。NyanQLはJSON Schemaによるリクエスト値・レスポンス値の実行時検証や、Draft 2020-12メタスキーマに対する完全検証を行いません。業務ルールの確認は従来どおり `paramCheck` / `outCheck` のJavaScriptで行います。
+これらのスキーマは `/nyan/{API名}` とMCPのツール定義で公開します。通常のAPI呼び出しでは、入出力の判定を `paramCheck` / `outCheck` のJavaScriptで行います。MCP経由では入力スキーマによる引数の自動検証も行いますが、出力スキーマによる実行結果の自動検証は行いません。出力の判定は `outCheck` のJavaScriptが担当します。
 
 ### スキーマの取得優先順位
 
@@ -873,11 +873,33 @@ if (!nyanAllParams.id) {
 
 ### checkだけを実行する
 
-通常HTTP・JSON-RPC・`nyanCallMe()`・WebSocketからのAPI呼び出しで `nyan_mode=checkOnly` を指定すると、`paramCheck` だけを実行し、その結果を返します。本体のscript／SQL・`outCheck`・Pushは実行しません。`check` で指定した古い設定も、`paramCheck` として同じように実行されます。`paramCheck`（または `check`）が未設定の場合は、本体を実行せずエラーを返します。
+通常HTTP・JSON-RPC・`nyanCallMe()`・WebSocket・MCP（HTTP／stdio）からのAPI呼び出しで `nyan_mode=checkOnly` を指定すると、`paramCheck` だけを実行し、その結果を返します。本体のscript／SQL・`outCheck`・Pushは実行しません。`check` で指定した古い設定も、`paramCheck` として同じように実行されます。`paramCheck`（または `check`）が未設定の場合は、本体を実行せずエラーを返します。
+
+MCPでは `tools/call` の `arguments` に `"nyan_mode":"checkOnly"` を指定します。MCP用の入力スキーマには、この制御項目を任意の文字列プロパティ（許可値は `checkOnly` のみ）として追加し、`tools/list` でも公開します。通常実行では `nyan_mode` を省略してください。APIの入力スキーマが `additionalProperties:false` でも指定できますが、必須項目・型など、その他のスキーマ制約は引き続き適用されます。認証・認可も省略しません。不正な `nyan_mode` はToolエラーとなり、本体を実行しません。入力チェック自身が行うDB更新などの副作用を取り消す機能ではありません。
 
 ```bash
 curl -u admin:secret "http://localhost:8080/getItem?id=1&nyan_mode=checkOnly"
 ```
+
+### OAuth経路のチェック
+
+OAuth参照先APIの `paramCheck`（別名 `check`）と `outCheck` も実行します。
+
+| 対象 | 実行順序 |
+|---|---|
+| `authorize` / `token` / `register` / `adminUser` | 入力チェック → 本体スクリプト → 出力チェック → HTTP応答 |
+| `authorizationServerMetadata` / `protectedResourceMetadata` | 入力チェック → Goによるメタデータ生成 → 出力チェック → HTTP応答。参照先の本体スクリプトは実行しません |
+| `verifyAccess` | 入力チェック → トークン検証スクリプト → 出力チェック → 認証判定 |
+
+チェックはJSON文字列またはオブジェクトを返し、真偽値の `success` と100〜599の整数 `status` を必須とします。入力チェックは `success:true` で通過し、出力チェックは `success:true` かつ `status:200` で通過します。HTTPの拒否時にはチェック結果全体をその `status` で返し、本体の `Set-Cookie` / `Location` などは送信しません。チェックの例外・形式不正・ファイル欠落は詳細を含まないHTTP 500になります。チェック結果にも既存の応答本文上限（4 MiB）を適用します。
+
+OAuthのHTTP要求でも `nyan_mode=checkOnly` を指定すると、入力チェックの結果だけを返します。クエリと本文の両方に指定した場合はJSON／フォーム本文を優先し、空文字列は通常実行、`checkOnly` 以外の非空値や文字列以外はHTTP 400とします。入力チェック未設定時は本体を実行せずHTTP 500です。HTTPメソッド・Content-Type・本文上限・管理者認証などの検証は省略しません。OPTIONSではチェックも本体も実行しません。メタデータを含むHTTP経路にOAuthのレート・同時実行数制限を適用します。
+
+前後チェックと本体は、それぞれ新しいOAuth用VMで実行します。参照先APIの `runtime.capabilities`、SQLファイルの許可リスト、実行ごとの15秒制限とトランザクションを使います。既存の `javascript_include` も読み込みます。各段階に入力情報のコピーを渡すため、チェック内でのパラメータ書換えを後段の入力変更には使えません。チェックや本体で既に完了したDB更新などは、後続の拒否では取り消しません。
+
+出力チェックの `nyanAllParams.nyan_output` には、送信予定の本文全体を文字列の `body` として渡し、`status`、`contentType`、検証済みの `headers`、`bodyBase64`、本文バイト数も渡します。`headers` のキーはHTTPの標準表記（`Location`、`Set-Cookie` など）で、値は1件なら文字列、複数件なら配列です。これらを書き換えても送信内容は変わりません。`verifyAccess` ではHTTP応答の代わりに認証判定全体のJSONを `body` に渡し、検査用の `status` は200とします。
+
+`verifyAccess` のチェック拒否・エラーは401／`invalid_token`として扱い、MCPのToolを実行しません。Tool側の `checkOnly` は認証側へ引き継がず、トークン検証とその前後チェックを最後まで実行します。
 
 入力フォームの事前チェックなどに使えます。
 
@@ -1078,6 +1100,8 @@ API実行には通常HTTPと同じBasic認証が必要です。接続時のHTTP�
 ### Pushで配信される内容
 
 `push` の参照先がSQL APIの場合、NyanQLはそのSQLを実行し、次のような形に包んで配信します。
+
+SQLの実行方法は通常のAPI呼び出しと同じです。元APIから引き継いだパラメータを使って2way-SQLのパラメータ・条件分岐を処理し、`sql` 配列の全ファイルを指定順に実行します。複数ファイルは1つのトランザクションで実行し、途中でSQLの読み込みや実行に失敗すると、そのPush先でのトランザクションをロールバックして配信を中止します。配信する `result` は最後のSQLの結果です。
 
 ```json
 {
