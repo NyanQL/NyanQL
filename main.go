@@ -5217,7 +5217,7 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 			return
 		}
 		if len(apiConfig.SQL) == 0 && apiConfig.Script == "" {
-			performPush(snapshot, apiConfig, params)
+			performPushForResponse(snapshot, apiConfig, params, statusCode, []byte(jsonStr))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
 			w.Write([]byte(jsonStr))
@@ -5244,7 +5244,7 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 			w.Write([]byte(outJSON))
 			return
 		}
-		performPush(snapshot, apiConfig, params)
+		performPushForResponse(snapshot, apiConfig, params, http.StatusOK, body)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write(body)
@@ -5361,7 +5361,7 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		w.Write([]byte(outJSON))
 		return
 	}
-	performPush(snapshot, apiConfig, params)
+	performPushForResponse(snapshot, apiConfig, params, http.StatusOK, body)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(body)
 }
@@ -7363,7 +7363,7 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 		return "", err
 	}
 	if !result.CheckRejected && !result.CheckOnly {
-		performPush(snapshot, snapshot.Definitions[apiName], result.Params)
+		performPushForResponse(snapshot, snapshot.Definitions[apiName], result.Params, http.StatusOK, []byte(result.Body))
 	}
 	return result.Body, nil
 }
@@ -8314,7 +8314,7 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	}
 
 	// 6) Push処理（必要な場合）
-	performPush(snapshot, apiConfig, allParams)
+	performPushForResponse(snapshot, apiConfig, allParams, statusCode, finalBody)
 
 	// 7) 最終レスポンスの返却
 	if st, ok := finalResult["status"].(float64); ok {
@@ -8332,6 +8332,32 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	w.WriteHeader(statusCode)
 	if err := json.NewEncoder(w).Encode(rpcResp); err != nil {
 		logServiceError(slog.LevelError, "jsonrpc_response_encode_failed", err)
+	}
+}
+
+// Gate only the source API's Push. A Push target may intentionally return an
+// error notification; its own checks, rather than this predicate, gate delivery.
+// Inspecting the result must not change the source response or skip outCheck.
+func responseAllowsPush(statusCode int, body []byte) bool {
+	if statusCode < http.StatusOK || statusCode >= http.StatusBadRequest {
+		return false
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return true // Text and non-object results retain the transport status.
+	}
+	if success, ok := result["success"].(bool); ok && !success {
+		return false
+	}
+	if status, ok := result["status"].(float64); ok {
+		return status >= http.StatusOK && status < http.StatusBadRequest && math.Trunc(status) == status
+	}
+	return true
+}
+
+func performPushForResponse(snapshot *APIConfigSnapshot, apiConfig APIConfig, allParams map[string]interface{}, statusCode int, body []byte) {
+	if apiConfig.Push != "" && responseAllowsPush(statusCode, body) {
+		performPush(snapshot, apiConfig, allParams)
 	}
 }
 

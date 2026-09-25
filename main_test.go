@@ -6757,6 +6757,174 @@ func TestCheckOnlyRunsOnlyParamCheck(t *testing.T) {
 	}
 }
 
+func TestPushSourceResultAcrossTransports(t *testing.T) {
+	for _, route := range []string{"http", "root", "jsonrpc", "websocket", "nyanCallMe", "mcp_http", "mcp_stdio"} {
+		for _, test := range []struct {
+			name, body string
+			status     int
+			push       bool
+		}{
+			{"ok", `{"success":true,"status":200}`, 200, true},
+			{"created", `{"status":201}`, 201, true},
+			{"redirect", `{"status":302}`, 302, true},
+			{"upper_success", `{"status":399}`, 399, true},
+			{"below_success", `{"status":199}`, 199, false},
+			{"bad_request", `{"status":400}`, 400, false},
+			{"conflict", `{"success":false,"status":409}`, 409, false},
+			{"server_error", `{"status":500}`, 500, false},
+			{"unavailable", `{"success":true,"status":503}`, 503, false},
+			{"false_with_ok", `{"success":false,"status":200}`, 200, false},
+			{"false_without_status", `{"success":false}`, 200, false},
+			{"missing_fields", `{"items":[1,2]}`, 200, true},
+			{"nested_failure", `{"result":{"success":false,"status":503}}`, 200, true},
+			{"string_false", `{"success":"false"}`, 200, true},
+			{"plain_text", `plain text`, 200, true},
+		} {
+			if test.name == "plain_text" && (route == "jsonrpc" || strings.HasPrefix(route, "mcp_")) {
+				continue
+			}
+			t.Run(route+"/"+test.name, func(t *testing.T) {
+				resetJavascriptInclude(t)
+				setTestSQLiteDB(t)
+				dir := t.TempDir()
+				mark := func(stage string) string {
+					return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode((nyanGetFile(%q)||"")+"x"),%q);`, filepath.Join(dir, stage), filepath.Join(dir, stage))
+				}
+				const allow = `({success:true,status:200});`
+				// An error notification from the Push target is intentional: only
+				// the originating API result controls whether to start the Push.
+				const pushed = `{"success":false,"status":503,"result":"notification"}`
+				setTestSQLFiles(t, map[string]APIConfig{
+					"origin": {ParamCheck: writeTestScript(t, mark("input")+allow), Script: writeTestScript(t, mark("body")+fmt.Sprintf(`%q;`, test.body)), OutCheck: writeTestScript(t, mark("output")+fmt.Sprintf(`if(nyanAllParams.nyan_output.body!==%q) throw new Error("source result changed");`, test.body)+allow), Push: "events"},
+					"events": {ParamCheck: writeTestScript(t, mark("push_input")+allow), Script: writeTestScript(t, mark("push_body")+fmt.Sprintf(`%q;`, pushed)), OutCheck: writeTestScript(t, mark("push_output")+allow)},
+				})
+				conn, testHub := newPushCheckSubscriber(t, "events")
+				var body string
+				switch route {
+				case "http", "root", "jsonrpc":
+					path := "/origin"
+					if route == "root" {
+						path = "/?api=origin"
+					}
+					req := httptest.NewRequest(http.MethodGet, path, nil)
+					if route == "jsonrpc" {
+						req = httptest.NewRequest(http.MethodPost, "/nyan-rpc", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"origin","params":{}}`))
+					}
+					rec := httptest.NewRecorder()
+					if route == "jsonrpc" {
+						handleJSONRPC(rec, req)
+					} else {
+						handleRequest(rec, req)
+					}
+					body = rec.Body.String()
+					if route == "jsonrpc" {
+						want := decodeTestJSONObject(t, []byte(test.body))
+						delete(want, "status")
+						if rec.Code != test.status || !reflect.DeepEqual(decodeTestJSONObject(t, []byte(body))["result"], want) {
+							t.Fatalf("RPC response changed: status=%d body=%s", rec.Code, body)
+						}
+					} else if rec.Code != http.StatusOK || body != test.body {
+						t.Fatalf("HTTP response changed: status=%d body=%s", rec.Code, body)
+					}
+				case "websocket":
+					req := httptest.NewRequest(http.MethodGet, "/events", nil)
+					req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+					body = string(executeWebSocketAPIMessage(req, []byte(`{"api":"origin"}`)))
+					if body != test.body {
+						t.Fatalf("WebSocket response changed: %s", body)
+					}
+				case "nyanCallMe":
+					vm := goja.New()
+					registerNyanFuncs(vm, currentAPISnapshot(), map[string]interface{}{}, nil)
+					value, err := vm.RunString(`const result=nyanCallMe({api:"origin"}); typeof result === "string" ? result : JSON.stringify(result);`)
+					if err != nil {
+						t.Fatal(err)
+					}
+					body = value.String()
+					if test.name == "plain_text" {
+						if body != test.body {
+							t.Fatalf("internal response changed: %s", body)
+						}
+					} else if !reflect.DeepEqual(decodeTestJSONObject(t, []byte(body)), decodeTestJSONObject(t, []byte(test.body))) {
+						t.Fatalf("internal response changed: %s", body)
+					}
+				case "mcp_http", "mcp_stdio":
+					server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocolVersion20251125}, Tools: []MCPToolConfig{{API: "origin"}}}
+					message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"origin","arguments":{}}}`
+					var response map[string]interface{}
+					if route == "mcp_stdio" {
+						server.Transport = "stdio"
+						state := mcpStdioReady
+						response, _ = handleMCPStdioMessage(currentAPISnapshot(), "mcp", server, &state, []byte(message))
+					} else {
+						rec := performTestMCPRequest(t, currentAPISnapshot(), server, message, "")
+						response = decodeTestJSONObject(t, rec.Body.Bytes())
+					}
+					result := response["result"].(map[string]interface{})
+					if !reflect.DeepEqual(result["structuredContent"], decodeTestJSONObject(t, []byte(test.body))) {
+						t.Fatalf("MCP response changed: %v", result)
+					}
+				}
+				for _, stage := range []string{"input", "body", "output", "push_input", "push_body", "push_output"} {
+					data, err := os.ReadFile(filepath.Join(dir, stage))
+					want := !strings.HasPrefix(stage, "push_") || test.push
+					if want {
+						if err != nil || string(data) != "x" {
+							t.Errorf("%s must run once: %q %v", stage, data, err)
+						}
+					} else if !os.IsNotExist(err) {
+						t.Errorf("%s ran on failed source: %q %v", stage, data, err)
+					}
+				}
+				// Broadcast is synchronous. A sentinel proves there was no unwanted
+				// or duplicate frame, without relying on a short receive timeout.
+				testHub.Broadcast("events", []byte("complete"))
+				if test.push {
+					assertPushCheckFrame(t, conn, pushed)
+				}
+				assertPushCheckFrame(t, conn, "complete")
+			})
+		}
+	}
+}
+
+func TestInternalPushSourceAndParentAreIndependent(t *testing.T) {
+	for _, test := range []struct {
+		name, child, parent string
+		want                string
+	}{
+		{"both_success", `({success:true,status:200});`, `({success:true,status:200});`, "child,after,parent,"},
+		{"child_failed", `({success:false,status:200});`, `({success:true,status:200});`, "after,parent,"},
+		{"child_unavailable", `({success:true,status:503});`, `({success:true,status:200});`, "after,parent,"},
+		{"parent_failed", `({success:true,status:200});`, `({success:false,status:200});`, "child,after,"},
+		{"parent_exception", `({success:true,status:200});`, `throw new Error("parent failed");`, "child,after,"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetJavascriptInclude(t)
+			setTestSQLiteDB(t).SetMaxOpenConns(8)
+			trace := filepath.Join(t.TempDir(), "trace")
+			mark := func(stage string) string {
+				return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode((nyanGetFile(%q)||"")+%q),%q);`, trace, stage+",", trace)
+			}
+			setTestSQLFiles(t, map[string]APIConfig{
+				"parent":       {Script: writeTestScript(t, `nyanCallMe({api:"child"});`+mark("after")+test.parent), Push: "parent_event"},
+				"child":        {Script: writeTestScript(t, test.child), Push: "child_event"},
+				"child_event":  {Script: writeTestScript(t, mark("child")+`({ok:true});`)},
+				"parent_event": {Script: writeTestScript(t, mark("parent")+`({ok:true});`)},
+			})
+			rec := httptest.NewRecorder()
+			handleRequest(rec, httptest.NewRequest(http.MethodGet, "/parent", nil))
+			data, err := os.ReadFile(trace)
+			if err != nil || string(data) != test.want {
+				t.Fatalf("trace=%q want=%q err=%v", data, test.want, err)
+			}
+			if (rec.Code == http.StatusInternalServerError) != (test.name == "parent_exception") {
+				t.Fatalf("unexpected response: %d %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestPushChecksPreserveOriginResponse(t *testing.T) {
 	const originBody = `{"success":true,"status":200,"result":{"message":"origin"}}`
 	const pushedBody = `{"success":true,"status":200,"result":[{"value":7}]}`
