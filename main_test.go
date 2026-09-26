@@ -2557,7 +2557,9 @@ func TestHubBroadcastsToRequestedChannel(t *testing.T) {
 	hub = NewHub()
 	t.Cleanup(func() { hub = oldHub })
 
-	server := httptest.NewServer(http.HandlerFunc(handleWebSocket))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleWebSocketWithSnapshot(&APIConfigSnapshot{}, w, r)
+	}))
 	t.Cleanup(server.Close)
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/sub/updates"
 	headers := http.Header{"Origin": []string{"https://example.invalid"}}
@@ -7527,7 +7529,8 @@ func newPushCheckSubscriber(t *testing.T, channel string) (*websocket.Conn, *Hub
 	finished := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() { finished <- struct{}{} }()
-		handleWebSocket(w, r)
+		// This fixture tests Push execution checks, independently of connection checks.
+		handleWebSocketWithSnapshot(&APIConfigSnapshot{}, w, r)
 	}))
 	t.Cleanup(server.Close)
 	conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/"+channel, http.Header{"Origin": []string{server.URL}})
@@ -8288,5 +8291,190 @@ func TestUnifiedHandlerMountedWebSocketRejectsForeignOrigin(t *testing.T) {
 	unifiedHandler(recorder, request)
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status=%d want 403", recorder.Code)
+	}
+}
+
+func TestWebSocketConnectionChecks(t *testing.T) {
+	const allow = `({success:true,status:200,result:{checked:true}});`
+	const deny = `({success:false,status:403,result:{reason:"denied"},error:"denied"});`
+	for _, test := range []struct {
+		name, script, query, path                        string
+		status                                           int
+		legacyCheck, noCheck, missingFile, foreignOrigin bool
+	}{
+		{name: "allow", script: allow, status: 101},
+		{name: "allow_non_200", script: `({success:true,status:201});`, status: 101},
+		{name: "deny", script: deny, status: 403},
+		{name: "exception", script: `throw new Error("private check detail");`, status: 500},
+		{name: "export_exception", script: `({get success(){throw new Error("private check detail");}});`, status: 500},
+		{name: "missing_file", missingFile: true, status: 500},
+		{name: "missing_status", script: `({success:true});`, status: 500},
+		{name: "informational_status", script: `({success:true,status:101});`, status: 500},
+		{name: "invalid_status", script: `({success:false,status:600});`, status: 500},
+		{name: "fractional_status", script: `({success:true,status:200.5});`, status: 500},
+		{name: "invalid_json", script: `"not JSON";`, status: 500},
+		{name: "check_only", script: allow, query: "&nyan_mode=checkOnly", status: 200},
+		{name: "check_only_denied", script: deny, query: "&nyan_mode=checkOnly", status: 403},
+		{name: "check_only_unset", noCheck: true, query: "&nyan_mode=checkOnly", status: 404},
+		{name: "invalid_mode", script: allow, query: "&nyan_mode=unknown", status: 400},
+		{name: "duplicate_mode", script: allow, query: "&nyan_mode=checkOnly&nyan_mode=", status: 400},
+		{name: "empty_mode", script: allow, query: "&nyan_mode=", status: 101},
+		{name: "invalid_query", script: allow, query: "&token=%ZZ", status: 400},
+		{name: "query_api_cannot_bypass", script: deny, query: "&api=unchecked", status: 403},
+		{name: "no_check", noCheck: true, status: 101},
+		{name: "legacy_check", script: deny, legacyCheck: true, status: 403},
+		{name: "legacy_subscription", path: "/legacy/channel", noCheck: true, status: 101},
+		{name: "legacy_check_only", path: "/legacy/channel", noCheck: true, query: "&nyan_mode=checkOnly", status: 404},
+		{name: "foreign_origin", script: allow, foreignOrigin: true, status: 403},
+		{name: "unknown_endpoint", script: allow, path: "/unknown", status: 404},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetJavascriptInclude(t)
+			dir := t.TempDir()
+			marker := func(stage string) string {
+				return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("done"), %q);`, filepath.Join(dir, stage))
+			}
+			target := APIConfig{
+				Script:   writeTestScript(t, marker("body")+`({success:true});`),
+				OutCheck: writeTestScript(t, marker("out")+allow), Push: "events",
+			}
+			if !test.noCheck {
+				target.ParamCheck = writeTestScript(t, marker("param")+`
+if (nyanAllParams.api !== "sub/events" || nyanAllParams.token !== "secret" ||
+    JSON.stringify(nyanAllParams.tag) !== '["a","b"]') throw new Error("wrong connection parameters");
+`+test.script)
+			}
+			if test.legacyCheck {
+				target.Check, target.ParamCheck = target.ParamCheck, ""
+			}
+			if test.missingFile {
+				target.ParamCheck = filepath.Join(dir, "missing.js")
+			}
+			setTestSQLFiles(t, map[string]APIConfig{
+				"sub/events": target, "unchecked": {},
+				"events": {Script: writeTestScript(t, marker("push")+allow)},
+				"client": {Type: apiTypeWSClient, ConnectURL: "ws://localhost/legacy/channel"},
+			})
+			oldHub := hub
+			testHub := NewHub()
+			hub = testHub
+			t.Cleanup(func() { hub = oldHub })
+			finished := make(chan struct{}, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer func() { finished <- struct{}{} }()
+				unifiedHandler(w, r)
+			}))
+			t.Cleanup(server.Close)
+			path := test.path
+			if path == "" {
+				path = "/sub/events"
+			}
+			origin := server.URL
+			if test.foreignOrigin {
+				origin = "https://foreign.example"
+			}
+			conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+path+"?token=secret&tag=a&tag=b"+test.query, http.Header{"Origin": []string{origin}})
+			if conn != nil {
+				t.Cleanup(func() { _ = conn.Close() })
+			}
+			if response == nil {
+				t.Fatalf("no handshake response: %v", err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != test.status {
+				t.Fatalf("status=%d want %d: %v", response.StatusCode, test.status, err)
+			}
+			if test.status == 101 {
+				if err != nil || conn == nil {
+					t.Fatalf("connection failed: %v", err)
+				}
+				waitForCondition(t, "checked subscription registration", func() bool {
+					testHub.mu.Lock()
+					defer testHub.mu.Unlock()
+					return len(testHub.clients[strings.TrimPrefix(path, "/")]) == 1
+				})
+				_ = conn.Close()
+			} else {
+				if err == nil || conn != nil {
+					t.Fatal("rejected connection was upgraded")
+				}
+				body, readErr := io.ReadAll(response.Body)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if (test.status == 200 || test.status == 403) && !test.foreignOrigin {
+					result := decodeTestJSONObject(t, body)
+					if _, exists := result["result"]; !exists {
+						t.Fatalf("check result lost: %s", body)
+					}
+				}
+				if strings.Contains(string(body), "private check detail") {
+					t.Fatalf("exception detail exposed: %s", body)
+				}
+			}
+			waitForSignal(t, finished, "connection check handler exit")
+			testHub.mu.Lock()
+			count := len(testHub.connections)
+			testHub.mu.Unlock()
+			if count != 0 {
+				t.Fatalf("connections remaining: %d", count)
+			}
+			wantParam := !test.noCheck && !test.missingFile && !test.foreignOrigin && test.path == "" && test.status != 400
+			for stage, want := range map[string]bool{"param": wantParam, "body": false, "out": false, "push": false} {
+				_, statErr := os.Stat(filepath.Join(dir, stage))
+				if statErr != nil && !os.IsNotExist(statErr) {
+					t.Fatal(statErr)
+				}
+				if (statErr == nil) != want {
+					t.Fatalf("%s executed=%v want %v", stage, statErr == nil, want)
+				}
+			}
+		})
+	}
+}
+
+func TestWebSocketConnectionCheckDoesNotReplaceMessageCheck(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	setTestSQLFiles(t, map[string]APIConfig{
+		"channel": {
+			ParamCheck: writeTestScript(t, `({success:nyanAllParams.token === undefined,status:nyanAllParams.token === undefined ? 200 : 403});`),
+			Script:     writeTestScript(t, `({value:"executed"});`),
+		},
+	})
+	conn, _ := newWebSocketAPITestClient(t, true)
+	if err := conn.WriteJSON(map[string]interface{}{"api": "channel", "token": "rejected"}); err != nil {
+		t.Fatal(err)
+	}
+	response := readWebSocketAPIResponse(t, conn)
+	if response["status"] != float64(403) || response["success"] != false {
+		t.Fatalf("message check bypassed after accepted connection: %#v", response)
+	}
+	if err := conn.WriteJSON(map[string]interface{}{"api": "channel"}); err != nil {
+		t.Fatal(err)
+	}
+	if response := readWebSocketAPIResponse(t, conn); response["value"] != "executed" {
+		t.Fatalf("connection unusable after rejection: %#v", response)
+	}
+}
+
+func TestWebSocketConnectionCheckUsesCapturedSnapshot(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	snapshot := &APIConfigSnapshot{Definitions: map[string]APIConfig{
+		"channel": {ParamCheck: writeTestScript(t, `nyanCallMe({api:"nested",nyan_mode:"checkOnly"});`)},
+		"nested":  {ParamCheck: writeTestScript(t, `({success:true,status:200,result:"captured"});`)},
+	}}
+	setTestSQLFiles(t, map[string]APIConfig{
+		"nested": {ParamCheck: writeTestScript(t, `({success:false,status:403,result:"new"});`)},
+	})
+	request := httptest.NewRequest(http.MethodGet, "/channel?nyan_mode=checkOnly", nil)
+	recorder := httptest.NewRecorder()
+	if checkWebSocketConnection(snapshot, recorder, request) {
+		t.Fatal("checkOnly allowed an upgrade")
+	}
+	response := decodeTestJSONObject(t, recorder.Body.Bytes())
+	if recorder.Code != http.StatusOK || response["result"] != "captured" {
+		t.Fatalf("check used a different configuration snapshot: %d %s", recorder.Code, recorder.Body.String())
 	}
 }

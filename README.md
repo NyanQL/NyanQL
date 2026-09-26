@@ -1083,6 +1083,10 @@ ws.onmessage = function (event) {
 
 NyanQLのWebSocketサーバでは、先頭の `/` を除いたURLパス全体がチャネル名になります。上の例では、`listItems` がチャネル名です。mount配下の `sub/listItems` をpush先にする場合は、WebSocketも `/sub/listItems` へ接続してください。
 
+接続先APIに `paramCheck`（旧名 `check`）がある場合は、WebSocketへのアップグレード・購読登録の前に実行します。チェックにはURLのクエリパラメータを渡します（単一値は文字列、同名の複数値は文字列配列）。`api` は接続先の完全API名に固定し、クエリでは変更できません。入力チェックが必要とするパラメータは、`/sub/listItems?token=...` のように接続URLにも指定してください。`success:true` なら接続を許可し、拒否時はチェック結果のJSONと `status` をHTTP応答で返します。例外・チェックファイルの読み込み失敗・不正なステータス（200〜599の整数以外）はHTTP 500となり、接続しません。接続時にはAPI本体・`outCheck`・Pushを実行しません。
+
+接続URLに `nyan_mode=checkOnly` を指定した場合は、成功時もチェック結果をHTTP応答で返し、WebSocketへアップグレードしません。チェック未設定ならHTTP 404です。`nyan_mode` は省略または空文字列で通常接続となり、それ以外の値や複数指定はHTTP 400です。チェック未設定の通常接続と、`ws_client` の `connectURL` による既存の購読パスは引き続き利用できます。購読接続への一律のBasic認証は追加せず、接続後のAPI実行には下記の認証を適用します。
+
 ### WebSocketからAPIを呼び出す
 
 接続後、`api` に実行対象を指定したJSONオブジェクトをテキストメッセージとして送信できます。その他の項目はAPIのパラメータになります。
@@ -1095,7 +1099,7 @@ NyanQLのWebSocketサーバでは、先頭の `/` を除いたURLパス全体が
 
 API実行には通常HTTPと同じBasic認証が必要です。接続時のHTTPリクエストに認証情報を含めてください。接続先のチャネル名と実行対象の `api` は別に指定でき、mount配下のAPIには `sub/getItem` のような完全API名を使います。対象は `type: "api"`（省略時を含む）のAPIです。内部コンテキスト用の `nyan_request`・`nyan_guard`・`mcp_principal` はメッセージに指定できません。
 
-`nyan_mode: "checkOnly"` を指定した呼び出しでは `paramCheck` だけを実行し、本体処理・`outCheck`・Pushは実行しません。接続しただけではAPIは実行せず、`api` を含まないJSONオブジェクトやバイナリメッセージもAPI実行の対象にはしません。既存のPush購読は引き続き利用できます。
+`nyan_mode: "checkOnly"` を指定した呼び出しでは `paramCheck` だけを実行し、本体処理・`outCheck`・Pushは実行しません。接続しただけではAPI本体は実行せず、`api` を含まないJSONオブジェクトやバイナリメッセージもAPI実行の対象にはしません。
 
 ### Pushで配信される内容
 

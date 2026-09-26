@@ -674,7 +674,7 @@ func unifiedHandler(w http.ResponseWriter, r *http.Request) {
 		handleMCPRequestWithSnapshot(snapshot, w, r, apiName, apiConfig)
 		return
 	}
-	// WebSocketアップグレード要求なら認証後、handleWebSocketに処理を委譲
+	// WebSocket購読は接続先の入力チェックを適用する。API実行のBasic認証はメッセージ受信時に行う。
 	if isWebSocketRequest(r) {
 		if !webSocketEndpointConfigured(snapshot, r.URL.Path) {
 			http.NotFound(w, r)
@@ -684,7 +684,7 @@ func unifiedHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forbidden origin", http.StatusForbidden)
 			return
 		}
-		handleWebSocket(w, r)
+		handleWebSocketWithSnapshot(snapshot, w, r)
 		return
 	}
 	if apiKey, requestedPath, apiConfig, ok := findPublicAPIForPathInSnapshot(snapshot, r.URL.Path); ok {
@@ -701,7 +701,7 @@ func webSocketEndpointConfigured(snapshot *APIConfigSnapshot, requestPath string
 	if snapshot == nil {
 		return false
 	}
-	// Match the full channel name used by handleWebSocket, including include mounts.
+	// Match the full channel name used by handleWebSocketWithSnapshot, including include mounts.
 	apiName := strings.TrimPrefix(requestPath, "/")
 	if apiName != "" {
 		if apiConfig, exists := snapshot.Definitions[apiName]; exists && getAPIType(apiConfig) == apiTypeAPI {
@@ -2445,13 +2445,78 @@ func isWebSocketRequest(r *http.Request) bool {
 	return strings.ToLower(upgrade) == "websocket"
 }
 
+// checkWebSocketConnection returns true only when the connection may be upgraded.
+// Check-only responses and failures are completed as HTTP responses, before Hub registration.
+func checkWebSocketConnection(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request) (allowed bool) {
+	apiName := strings.TrimPrefix(r.URL.Path, "/")
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logServiceError(slog.LevelError, "websocket_param_check_panicked", fmt.Errorf("check panic: %v", recovered), "api", apiName)
+			sendJSONError(w, "WebSocket connection check failed", http.StatusInternalServerError)
+			allowed = false
+		}
+	}()
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		sendJSONError(w, "Invalid query parameters", http.StatusBadRequest)
+		return false
+	}
+	params := urlValuesToInterfaceMap(query)
+	params["api"] = apiName
+	mode := ""
+	if raw, exists := params["nyan_mode"]; exists {
+		var ok bool
+		mode, ok = raw.(string)
+		if !ok || (mode != "" && mode != "checkOnly") {
+			sendJSONError(w, "Invalid nyan_mode", http.StatusBadRequest)
+			return false
+		}
+	}
+	apiConfig, exists := snapshot.Definitions[apiName]
+	checkPath := ""
+	if exists && getAPIType(apiConfig) == apiTypeAPI {
+		checkPath = getParamCheckScriptPath(apiConfig)
+	}
+	if checkPath == "" {
+		if mode == "checkOnly" {
+			sendJSONError(w, "No check script for this API", http.StatusNotFound)
+			return false
+		}
+		return true // Includes legacy ws_client subscription paths without an API definition.
+	}
+	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
+	if err != nil {
+		logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiName)
+		acceptedKeys = []string{}
+	}
+	success, status, _, body, err := runCheckScriptWithSnapshot(snapshot, checkPath, params, acceptedKeys)
+	if err != nil || status < 200 || status > 599 {
+		if err == nil {
+			err = fmt.Errorf("invalid connection check status: %d", status)
+		}
+		logServiceError(slog.LevelError, "websocket_param_check_failed", err, "api", apiName)
+		sendJSONError(w, "WebSocket connection check failed", http.StatusInternalServerError)
+		return false
+	}
+	if !success || mode == "checkOnly" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+		return false
+	}
+	return true
+}
+
 // WebSocketアップグレードと接続管理を行う関数
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+func handleWebSocketWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request) {
 	select {
 	case websocketConnectionSlots <- struct{}{}:
 		defer func() { <-websocketConnectionSlots }()
 	default:
 		http.Error(w, "too many WebSocket connections", http.StatusServiceUnavailable)
+		return
+	}
+	if !checkWebSocketConnection(snapshot, w, r) {
 		return
 	}
 	channel := strings.TrimPrefix(r.URL.Path, "/")
