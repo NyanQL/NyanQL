@@ -985,7 +985,8 @@ JSON.stringify({
 
 | 名前 | 説明 |
 |---|---|
-| `nyanAllParams` | リクエストで受け取ったパラメータ全体です。 |
+| `nyanAllParams` | 実行中のAPIのパラメータです。予約項目 `nyan_request` にはサーバーが取得した元リクエスト情報が入ります。 |
+| `nyanRequest` | JavaScriptから直接参照できる元リクエスト情報です。`nyanAllParams.nyan_request` と同じデータを参照します。 |
 | `nyanAcceptedParamsKeys` | SQLコメントから拾った受け付けパラメータ名です。主にcheckで使います。 |
 | `nyanRunSQL(path, params)` | 一番親の `api.json` のフォルダを基準にSQLファイルを実行します。scriptでは同じトランザクション内で実行されます。 |
 | `nyanGetAPI(url, user, pass)` | 外部APIへGETリクエストを送ります。 |
@@ -1007,6 +1008,36 @@ JSON.stringify({
 `api.json` 内の `script`・`sql`・`paramCheck`・`outCheck` などの設定値は、その定義を書いたJSONファイルのフォルダ基準です。JavaScript関数に渡すパスとは区別してください。
 
 `nyanHostExec` は、サーバ上でOSコマンドを実行できる強い機能です。公開環境や、外部から入力を受ける処理では、安易に使わないでください。
+
+### リクエスト情報と内部呼び出し・Push
+
+`nyanRequest` は通常HTTP・ルートHTTP・JSON-RPC・publicのチェック・WebSocket・HTTP MCP・OAuthで、サーバーが実際のHTTP要求から生成します。`paramCheck`・本体・`outCheck` から参照できます。外部入力の `nyan_request` はこの情報の代わりに採用しません。WebSocketメッセージでは従来どおり予約名の指定をエラーにし、MCPでは入力スキーマ検証後に利用者の値を除いてから設定します。
+
+```javascript
+const ip = nyanRequest.remoteIP;
+const agent = nyanRequest.headers["user-agent"];
+const session = nyanRequest.cookies.session;
+// 同じデータを nyanAllParams.nyan_request からも参照できます。
+```
+
+| プロパティ | 内容 |
+|---|---|
+| `method` / `path` | 元のHTTPメソッドとURLパス。内部呼び出し先のAPI名へは変更しません。 |
+| `host` / `scheme` | 受信Hostと実接続の `http` / `https`。 |
+| `remoteAddress` / `remoteIP` | 実接続のアドレス（通常ポート付き）とポートを除いたIP。`X-Forwarded-For` による置き換えはしません。 |
+| `userAgent` | 受信したUser-Agent。 |
+| `headers` | 受信ヘッダー。キーは小文字と標準表記（例：`authorization` / `Authorization`）で参照可能。値は1件なら文字列、複数件なら配列。 |
+| `cookies` | Cookie名から値へのオブジェクト。 |
+| `query` / `form` | URLクエリとフォーム本文を分離した値。1件なら文字列、同名の複数値は配列。 |
+| `json` / `body` | 取り込んだJSON本文の値と、解析時に読み取った本文文字列。JSON本文がない場合の `json` は `null`。 |
+
+ヘッダー・Cookieなどは受信した値であり、それ自体が認証済みの身元を保証するわけではありません。WebSocketでは接続時のHTTP情報を使用し、各メッセージのJSONは `nyanAllParams` に入ります。接続前チェックと各メッセージではそれぞれ情報を生成するため、前のチェック／メッセージでの書き換えを次のメッセージへ引き継ぎません。JSON-RPCとHTTP MCPの `json` / `body` は、引数部分だけでなく元のプロトコル要求全体です。HTTP要求がないstdio・schedule・ws_clientのスクリプトでは `nyanRequest` と互換参照は空オブジェクト `{}` です。
+
+`nyanCallMe({api:"child", id:2})` は、子APIの通常引数には明示した `id:2` だけを渡し、リクエスト情報を別途自動継承します。親の業務パラメータは自動統合せず、`api` は子API名になります。引数に `nyan_request` を指定しても、継承する元情報の置き換えには使いません。通常引数は従来どおり浅いコピーなので、親の入れ子のオブジェクトを渡した場合、その内容の変更は親にも影響し得ます。
+
+Push先には、呼び出し元の処理後のパラメータとリクエスト情報を入れ子までコピーして渡し、`api` をPush先API名にします。子APIのPushは子の引数、親APIのPushは親の引数が基準です。Push先の変更は元へ戻らず、購読者の接続情報や購読時の引数は混ぜません。呼び出し元の戻り値JSONをPush先の引数へ自動追加することもありません。通常APIでは入力チェック・本体で補正／追加したパラメータもPushへ渡ります。`outCheck` は浅いコピーで実行するため、最上位への追加・置き換えは渡りませんが、共有された入れ子の変更は影響します。
+
+**運用ルール：通常の業務パラメータは必要に応じて補正・追加して構いませんが、`nyanRequest` と `nyanAllParams.nyan_request` は参照専用として扱ってください。** JavaScriptの読み取り専用化は強制しません。内容を書き換えると同じ情報を参照する後続処理にも影響し得ます。変数や互換参照の丸ごとの置き換えも避けてください。OAuthの各段階は既存仕様どおり入力のコピーで実行します。`nyanAllParams` 全体には元リクエストのヘッダー・Cookie・本文も含まれるため、ログや応答へ丸ごと出力せず、必要な業務項目だけを選んでください。
 
 ---
 

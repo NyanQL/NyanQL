@@ -8478,3 +8478,321 @@ func TestWebSocketConnectionCheckUsesCapturedSnapshot(t *testing.T) {
 		t.Fatalf("check used a different configuration snapshot: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
+
+func contextTestRequest(method, path, contentType, body string) *http.Request {
+	r := httptest.NewRequest(method, "http://localhost"+path, strings.NewReader(body))
+	r.RemoteAddr = "[2001:db8::1]:1234"
+	r.Header.Set("Content-Type", contentType)
+	r.Header.Set("User-Agent", "context-test")
+	r.Header.Set("X-Forwarded-For", "127.0.0.1")
+	r.Header.Add("X-Multi", "one")
+	r.Header.Add("X-Multi", "two")
+	r.AddCookie(&http.Cookie{Name: "session", Value: "real-cookie"})
+	return r
+}
+
+func assertScriptRequestContext(t *testing.T, value interface{}, path string) map[string]interface{} {
+	t.Helper()
+	c, ok := value.(map[string]interface{})
+	if !ok {
+		t.Fatalf("request context: %#v", value)
+	}
+	if c["path"] != path || c["remoteIP"] != "2001:db8::1" || c["remoteAddress"] != "[2001:db8::1]:1234" || c["userAgent"] != "context-test" {
+		t.Fatalf("wrong request origin: %#v", c)
+	}
+	if c["cookies"].(map[string]interface{})["session"] != "real-cookie" {
+		t.Fatalf("wrong cookies: %#v", c)
+	}
+	headers := c["headers"].(map[string]interface{})
+	if headers["user-agent"] != "context-test" || headers["User-Agent"] != "context-test" || len(headers["x-multi"].([]interface{})) != 2 {
+		t.Fatalf("wrong headers: %#v", headers)
+	}
+	return c
+}
+
+func TestRequestContextHTTPInternalCallsAndPush(t *testing.T) {
+	for _, route := range []string{"http", "root", "form", "query", "rpc"} {
+		t.Run(route, func(t *testing.T) {
+			resetJavascriptInclude(t)
+			setTestSQLiteDB(t).SetMaxOpenConns(4)
+			oldHub := hub
+			hub = NewHub()
+			t.Cleanup(func() { hub = oldHub })
+			dir := t.TempDir()
+			pushScript := func(name string) string {
+				return writeTestScript(t, fmt.Sprintf(`
+if (nyanAllParams.onlyInResult !== undefined || nyanAllParams.nyan_output !== undefined) throw new Error("result leaked into Push arguments");
+nyanSaveFile(nyanBase64Encode(JSON.stringify({params:nyanAllParams,request:nyanRequest})), %q);
+nyanRequest.pushMutation = true;
+({success:true});`, filepath.Join(dir, name)))
+			}
+			setTestSQLFiles(t, map[string]APIConfig{
+				"parent": {
+					ParamCheck: writeTestScript(t, `
+if (nyanRequest.remoteIP !== "2001:db8::1") throw new Error("spoofed request");
+nyanRequest.checkMarker = true;
+if (nyanAllParams.nyan_request.checkMarker !== true) throw new Error("alias missing");
+nyanAllParams.checked = true;
+({success:true,status:200});`),
+					Script: writeTestScript(t, `
+const args = {api:"child", id:2, nyan_request:{remoteIP:"forged"}};
+const child = nyanCallMe(args);
+if (args.nyan_request.remoteIP !== "forged") throw new Error("caller arguments mutated");
+if (!nyanAllParams.checked || !nyanRequest.checkMarker || nyanRequest.pushMutation) throw new Error("context changed");
+({success:true,child:child,request:nyanRequest,onlyInResult:true});`),
+					OutCheck: writeTestScript(t, `if (!nyanRequest.checkMarker) throw new Error("outCheck lost context"); ({success:true,status:200});`),
+					Push:     "parentEvents",
+				},
+				"child": {Script: writeTestScript(t, `
+if (nyanAllParams.parentOnly !== undefined || nyanAllParams.checked !== undefined) throw new Error("implicit business arguments");
+if (nyanAllParams.id !== 2 || !nyanRequest.checkMarker) throw new Error("child input changed");
+({request:nyanRequest,id:nyanAllParams.id});`), Push: "childEvents"},
+				"parentEvents": {Script: pushScript("parent.json")},
+				"childEvents":  {Script: pushScript("child.json")},
+			})
+			path, method, contentType := "/parent", "POST", "application/json"
+			body := `{"id":1,"parentOnly":true,"nyan_request":{"remoteIP":"forged"}}`
+			switch route {
+			case "root":
+				path = "/"
+				body = `{"api":"parent","id":1,"parentOnly":true,"nyan_request":{"remoteIP":"forged"}}`
+			case "form":
+				contentType = "application/x-www-form-urlencoded"
+				body = "id=1&parentOnly=true&nyan_request=forged"
+			case "query":
+				method = "GET"
+				contentType = ""
+				body = ""
+			case "rpc":
+				path = "/rpc"
+				body = `{"jsonrpc":"2.0","id":1,"method":"parent","params":{"id":1,"parentOnly":true,"nyan_request":{"remoteIP":"forged"}}}`
+			}
+			r := contextTestRequest(method, path+"?q=one&q=two&nyan_request=forged", contentType, body)
+			w := httptest.NewRecorder()
+			if route == "rpc" {
+				handleJSONRPC(w, r)
+			} else {
+				handleRequest(w, r)
+			}
+			if w.Code != 200 {
+				t.Fatalf("HTTP %d: %s", w.Code, w.Body.String())
+			}
+			response := decodeTestJSONObject(t, w.Body.Bytes())
+			if route == "rpc" {
+				response = response["result"].(map[string]interface{})
+			}
+			ctx := assertScriptRequestContext(t, response["request"], path)
+			if ctx["method"] != method || ctx["checkMarker"] != true || ctx["body"] != body {
+				t.Fatalf("context: %#v", ctx)
+			}
+			if len(ctx["query"].(map[string]interface{})["q"].([]interface{})) != 2 {
+				t.Fatal("query values lost")
+			}
+			if route == "form" && ctx["form"].(map[string]interface{})["id"] != "1" {
+				t.Fatal("form lost")
+			}
+			if contentType == "application/json" && ctx["json"] == nil {
+				t.Fatal("JSON lost")
+			}
+			assertScriptRequestContext(t, response["child"].(map[string]interface{})["request"], path)
+			for _, name := range []string{"parent", "child"} {
+				b, err := os.ReadFile(filepath.Join(dir, name+".json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				pushed := decodeTestJSONObject(t, b)
+				assertScriptRequestContext(t, pushed["request"], path)
+				p := pushed["params"].(map[string]interface{})
+				if p["api"] != name+"Events" {
+					t.Fatalf("Push api: %#v", p)
+				}
+				if name == "child" && (p["id"] != float64(2) || p["parentOnly"] != nil) {
+					t.Fatalf("child Push args: %#v", p)
+				}
+				if name == "parent" && route != "query" && p["parentOnly"] == nil {
+					t.Fatalf("parent Push args lost: %#v", p)
+				}
+			}
+		})
+	}
+}
+
+func TestRequestContextWebSocketAndPublic(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	check := writeTestScript(t, `({success:true,status:200,result:nyanRequest});`)
+	setTestSQLFiles(t, map[string]APIConfig{"events": {ParamCheck: check}, "target": {Script: writeTestScript(t, `({request:nyanRequest});`)}})
+	r := contextTestRequest("GET", "/events?nyan_mode=checkOnly&nyan_request=forged", "", "")
+	r.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+	w := httptest.NewRecorder()
+	if checkWebSocketConnection(currentAPISnapshot(), w, r) {
+		t.Fatal("checkOnly upgraded")
+	}
+	assertScriptRequestContext(t, decodeTestJSONObject(t, w.Body.Bytes())["result"], "/events")
+	response := executeWebSocketAPIMessage(r, []byte(`{"api":"target"}`))
+	assertScriptRequestContext(t, decodeTestJSONObject(t, response)["request"], "/events")
+	response = executeWebSocketAPIMessage(r, []byte(`{"api":"target","nyan_request":{}}`))
+	if decodeTestJSONObject(t, response)["status"] != float64(400) {
+		t.Fatal("reserved message accepted")
+	}
+	w = httptest.NewRecorder()
+	r = contextTestRequest("GET", "/assets?nyan_mode=checkOnly&nyan_request=forged", "", "")
+	handlePublicRequestWithSnapshot(currentAPISnapshot(), w, r, "assets", "", APIConfig{Path: t.TempDir(), ParamCheck: check})
+	assertScriptRequestContext(t, decodeTestJSONObject(t, w.Body.Bytes())["result"], "/assets")
+}
+
+func TestRequestContextMCPTransports(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t).SetMaxOpenConns(4)
+	setTestSQLFiles(t, map[string]APIConfig{
+		"tool":  {ParamCheck: writeTestScript(t, `const nyanInputSchema={type:"object"};({success:true,status:200});`), Script: writeTestScript(t, `nyanCallMe({api:"child",nyan_request:{remoteIP:"forged"}});`)},
+		"child": {Script: writeTestScript(t, `({request:nyanRequest});`)},
+	})
+	server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocolVersion20251125}, Tools: []MCPToolConfig{{Name: "tool", API: "tool"}}}
+	message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":{"nyan_request":{"remoteIP":"forged"}}}}`
+	r := contextTestRequest("POST", "/mcp", "application/json", message)
+	r.Header.Set("Accept", "application/json, text/event-stream")
+	r.Header.Set("MCP-Protocol-Version", mcpProtocolVersion20251125)
+	w := httptest.NewRecorder()
+	handleMCPRequestWithSnapshot(currentAPISnapshot(), w, r, "mcp", server)
+	if w.Code != 200 {
+		t.Fatalf("HTTP %d: %s", w.Code, w.Body.String())
+	}
+	response := decodeTestJSONObject(t, w.Body.Bytes())["result"].(map[string]interface{})
+	structured, ok := response["structuredContent"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Tool failed: %#v", response)
+	}
+	ctx := assertScriptRequestContext(t, structured["request"], "/mcp")
+	if ctx["body"] != message {
+		t.Fatal("MCP body not preserved")
+	}
+	result, err := executeMCPToolForStdio(currentAPISnapshot(), server.Tools[0], map[string]interface{}{"nyan_request": map[string]interface{}{"remoteIP": "forged"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty := result["structuredContent"].(map[string]interface{})["request"].(map[string]interface{})
+	if len(empty) != 0 {
+		t.Fatalf("stdio inherited HTTP context: %#v", empty)
+	}
+}
+
+func TestRequestContextIsolationAndNoHTTPRequest(t *testing.T) {
+	resetJavascriptInclude(t)
+	// No global request state: independent VMs may read and mutate their own contexts concurrently.
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r := contextTestRequest("GET", fmt.Sprintf("/request%d", i), "", "")
+			p, err := collectRequestParams(r)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			vm := goja.New()
+			registerNyanFuncs(vm, nil, p, nil)
+			v, err := vm.RunString(`nyanRequest.marker=nyanRequest.path;nyanAllParams.nyan_request.marker;`)
+			if err != nil || v.String() != r.URL.Path {
+				t.Errorf("request mixing: %v %v", v, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	vm := goja.New()
+	registerNyanFuncs(vm, nil, nil, nil)
+	v, err := vm.RunString(`JSON.stringify({request:nyanRequest,alias:nyanAllParams.nyan_request});`)
+	if err != nil || v.String() != `{"request":{},"alias":{}}` {
+		t.Fatalf("no-request VM: %v %v", v, err)
+	}
+}
+
+func TestRequestContextOAuthAndTokenVerification(t *testing.T) {
+	for _, route := range []string{"authorize", "token", "register", "metadata", "verify"} {
+		t.Run(route, func(t *testing.T) {
+			resetJavascriptInclude(t)
+			setTestSQLiteDB(t)
+			validate := `
+if (nyanRequest.remoteIP !== "2001:db8::1" || nyanRequest.cookies.session !== "real-cookie" ||
+    nyanRequest.headers["user-agent"] !== "context-test" || nyanAllParams.nyan_request.path !== nyanRequest.path) {
+  throw new Error("OAuth lost actual request context");
+}
+`
+			definition := APIConfig{
+				ParamCheck: writeTestScript(t, validate+`({success:true,status:200,result:nyanRequest});`),
+				Script:     writeTestScript(t, validate+`({status:200,body:{request:nyanRequest}});`),
+				OutCheck:   writeTestScript(t, validate+`({success:true,status:200});`),
+			}
+			verify := definition
+			verify.Script = writeTestScript(t, validate+`
+if (nyanRequest.path !== "/mcp" || nyanRequest.json.method !== "tools/call" || nyanAllParams.nyan_mode !== undefined) throw new Error("wrong verification request");
+({authenticated:true,principal:{user_id:"verified"}});`)
+			server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocolVersion20251125},
+				OAuth: MCPOAuthConfig{Authorize: "authorize", Token: "token", Register: "register", AuthorizationServerMetadata: "metadata", VerifyAccess: "verify"},
+				Tools: []MCPToolConfig{{Name: "tool", API: "tool"}},
+			}
+			setTestSQLFiles(t, map[string]APIConfig{"authorize": definition, "token": definition, "register": definition, "metadata": definition, "verify": verify, "mcp": server,
+				"tool": {Script: writeTestScript(t, validate+`({request:nyanRequest,user:nyanAllParams.mcp_principal.user_id});`)},
+			})
+			if route == "verify" {
+				message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":{"nyan_request":{"remoteIP":"forged"}}}}`
+				r := contextTestRequest("POST", "/mcp", "application/json", message)
+				r.Header.Set("Accept", "application/json, text/event-stream")
+				r.Header.Set("MCP-Protocol-Version", mcpProtocolVersion20251125)
+				r.Header.Set("Authorization", "Bearer real-token")
+				w := httptest.NewRecorder()
+				handleMCPRequestWithSnapshot(currentAPISnapshot(), w, r, "mcp", server)
+				response := decodeTestJSONObject(t, w.Body.Bytes())
+				if w.Code != 200 {
+					t.Fatalf("verification: %d %s", w.Code, w.Body.String())
+				}
+				toolResult, ok := response["result"].(map[string]interface{})["structuredContent"].(map[string]interface{})
+				if !ok || toolResult["user"] != "verified" {
+					t.Fatalf("verification/Tool failed: %#v", response)
+				}
+				assertScriptRequestContext(t, toolResult["request"], "/mcp")
+				return
+			}
+			for _, checkOnly := range []bool{false, true} {
+				method, contentType, body, role := "GET", "", "", "oauthAuthorize"
+				switch route {
+				case "token":
+					method, contentType, body, role = "POST", "application/x-www-form-urlencoded", "nyan_request=forged&value=body", "oauthToken"
+				case "register":
+					method, contentType, body, role = "POST", "application/json", `{"nyan_request":{"remoteIP":"forged"},"value":"body"}`, "oauthRegister"
+				case "metadata":
+					role = "authorizationServerMetadata"
+				}
+				path := "/" + route + "?nyan_request=forged"
+				if checkOnly {
+					path += "&nyan_mode=checkOnly"
+				}
+				r := contextTestRequest(method, path, contentType, body)
+				w := httptest.NewRecorder()
+				handleMCPOAuthHTTPRequest(currentAPISnapshot(), w, r, "mcp", server, route, role)
+				if w.Code != 200 {
+					t.Fatalf("OAuth %s checkOnly=%t: %d %s", route, checkOnly, w.Code, w.Body.String())
+				}
+				response := decodeTestJSONObject(t, w.Body.Bytes())
+				if route == "metadata" && !checkOnly {
+					continue
+				}
+				key := "request"
+				if checkOnly {
+					key = "result"
+				}
+				ctx := assertScriptRequestContext(t, response[key], "/"+route)
+				if ctx["body"] != body {
+					t.Fatalf("OAuth body lost: %#v", ctx)
+				}
+				if route == "token" && ctx["form"].(map[string]interface{})["value"] != "body" {
+					t.Fatal("OAuth form lost")
+				}
+				if route == "register" && ctx["json"].(map[string]interface{})["value"] != "body" {
+					t.Fatal("OAuth JSON lost")
+				}
+			}
+		})
+	}
+}

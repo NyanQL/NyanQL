@@ -826,6 +826,64 @@ func urlValuesToInterfaceMap(values url.Values) map[string]interface{} {
 	return result
 }
 
+// Only server code populates this context key after reading an HTTP body.
+// API arguments (including client-supplied nyan_request) cannot populate it.
+type scriptHTTPRequestContextKey struct{}
+
+func newScriptHTTPRequestContext(r *http.Request, body []byte) map[string]interface{} {
+	if r == nil {
+		return map[string]interface{}{}
+	}
+	headers := map[string]interface{}{}
+	for key, values := range r.Header {
+		var value interface{} = append([]string(nil), values...)
+		if len(values) == 1 {
+			value = values[0]
+		}
+		// Prefer lowercase names; retain canonical aliases for existing OAuth scripts.
+		headers[strings.ToLower(key)] = value
+		headers[http.CanonicalHeaderKey(key)] = value
+	}
+	cookies := map[string]interface{}{}
+	for _, cookie := range r.Cookies() {
+		cookies[cookie.Name] = cookie.Value
+	}
+	remoteIP := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(remoteIP); err == nil {
+		remoteIP = host
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	var jsonBody interface{}
+	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mediaType == "application/json" && len(body) > 0 {
+		_ = json.Unmarshal(body, &jsonBody)
+	}
+	form := urlValuesToInterfaceMap(r.PostForm)
+	if mediaType == "application/x-www-form-urlencoded" && len(body) > 0 {
+		if values, err := url.ParseQuery(string(body)); err == nil {
+			form = urlValuesToInterfaceMap(values)
+		}
+	}
+	return map[string]interface{}{
+		"method": r.Method, "path": r.URL.Path, "host": r.Host, "scheme": scheme,
+		"query": urlValuesToInterfaceMap(r.URL.Query()), "form": form, "json": jsonBody,
+		"headers": headers, "cookies": cookies, "body": string(body),
+		"remoteAddress": r.RemoteAddr, "remoteIP": remoteIP, "userAgent": r.UserAgent(),
+	}
+}
+
+func scriptHTTPRequestContext(r *http.Request) map[string]interface{} {
+	if r != nil {
+		if value, ok := r.Context().Value(scriptHTTPRequestContextKey{}).(map[string]interface{}); ok {
+			return cloneJSONCompatibleValue(value).(map[string]interface{})
+		}
+	}
+	return newScriptHTTPRequestContext(r, nil)
+}
+
 func scriptResponseHeaderValues(value interface{}) ([]string, error) {
 	switch value := value.(type) {
 	case string:
@@ -1026,6 +1084,7 @@ func handleMCPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 	case "tools/list":
 		handleMCPToolsList(snapshot, w, request, serverConfig)
 	case "tools/call":
+		r = r.WithContext(context.WithValue(r.Context(), scriptHTTPRequestContextKey{}, newScriptHTTPRequestContext(r, body)))
 		handleMCPToolCall(snapshot, w, r, request, serverName, serverConfig, runtimeURLs)
 	default:
 		writeMCPError(w, request.ID, -32601, "Method not found", nil)
@@ -1242,6 +1301,7 @@ func mcpOAuthRequestParams(w http.ResponseWriter, r *http.Request) (map[string]i
 		cookies[cookie.Name] = cookie.Value
 	}
 	params["cookies"] = cookies
+	params["nyan_request"] = newScriptHTTPRequestContext(r, nil)
 	if r.Method != http.MethodPost {
 		return params, nil
 	}
@@ -1269,6 +1329,7 @@ func mcpOAuthRequestParams(w http.ResponseWriter, r *http.Request) (map[string]i
 		}
 		params["form"] = urlValuesToInterfaceMap(values)
 	}
+	params["nyan_request"] = newScriptHTTPRequestContext(r, body)
 	return params, nil
 }
 
@@ -1800,7 +1861,7 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 	}
 	principal := interface{}(map[string]interface{}{"anonymous": true, "transport": "streamable_http"})
 	if mcpOAuthConfigured(serverConfig.OAuth) {
-		verifiedPrincipal, authenticated, forbidden := validateMCPAccessToken(snapshot, serverName, serverConfig, runtimeURLs, r.Header.Get("Authorization"), toolConfig.API, requiredScopes)
+		verifiedPrincipal, authenticated, forbidden := validateMCPAccessToken(snapshot, serverName, serverConfig, runtimeURLs, r, toolConfig.API, requiredScopes)
 		if !authenticated {
 			status := http.StatusUnauthorized
 			errorCode := "invalid_token"
@@ -1834,6 +1895,7 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 	for _, reservedName := range []string{"api", "nyan_guard", "nyan_request", "mcp_principal"} {
 		delete(executionParams, reservedName)
 	}
+	executionParams["nyan_request"] = scriptHTTPRequestContext(r)
 	if principal != nil {
 		executionParams["mcp_principal"] = cloneJSONCompatibleValue(principal)
 	}
@@ -1892,21 +1954,7 @@ func runMCPGuard(snapshot *APIConfigSnapshot, r *http.Request, serverConfig APIC
 	if !exists || guardConfig.Script == "" {
 		return MCPGuardDecision{}, fmt.Errorf("guard API is unavailable")
 	}
-	headers := map[string]interface{}{}
-	if authorization := strings.TrimSpace(r.Header.Get("Authorization")); authorization != "" {
-		headers["authorization"] = authorization
-	}
-	requestContext := map[string]interface{}{
-		"method":        r.Method,
-		"path":          r.URL.Path,
-		"query":         urlValuesToInterfaceMap(r.URL.Query()),
-		"form":          map[string]interface{}{},
-		"json":          nil,
-		"headers":       headers,
-		"cookies":       map[string]interface{}{},
-		"body":          "",
-		"remoteAddress": r.RemoteAddr,
-	}
+	requestContext := scriptHTTPRequestContext(r)
 	params := map[string]interface{}{
 		"api":                  serverConfig.Guard.API,
 		"nyan_request":         requestContext,
@@ -1942,9 +1990,10 @@ func runMCPGuard(snapshot *APIConfigSnapshot, r *http.Request, serverConfig APIC
 	return decision, nil
 }
 
-func validateMCPAccessToken(snapshot *APIConfigSnapshot, serverName string, serverConfig APIConfig, runtimeURLs mcpRuntimeURLs, authorization, tool string, requiredScopes []string) (interface{}, bool, bool) {
+func validateMCPAccessToken(snapshot *APIConfigSnapshot, serverName string, serverConfig APIConfig, runtimeURLs mcpRuntimeURLs, r *http.Request, tool string, requiredScopes []string) (interface{}, bool, bool) {
 	execution, err := invokeMCPOAuthHook(snapshot, serverName, serverConfig, runtimeURLs, "oauthValidateAccessToken", map[string]interface{}{
-		"authorization": authorization, "tool": tool, "required_scopes": requiredScopes,
+		"authorization": r.Header.Get("Authorization"), "tool": tool, "required_scopes": requiredScopes,
+		"nyan_request": scriptHTTPRequestContext(r),
 	})
 	if err != nil || execution.CheckRejected || execution.CheckOnly {
 		return nil, false, false
@@ -2168,9 +2217,9 @@ func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverCo
 		delete(params, "nyan_mode")
 	}
 	execution.CheckOnly = params["nyan_mode"] == "checkOnly"
-	requestContext := map[string]interface{}{
-		"method": extra["method"], "path": extra["request_path"], "query": extra["query"],
-		"form": extra["form"], "json": extra["body"], "headers": extra["headers"], "cookies": extra["cookies"],
+	requestContext, ok := extra["nyan_request"].(map[string]interface{})
+	if !ok || requestContext == nil {
+		requestContext = map[string]interface{}{}
 	}
 	params["nyan_request"] = requestContext
 	runtimeConfig := definition.Runtime
@@ -2462,6 +2511,7 @@ func checkWebSocketConnection(snapshot *APIConfigSnapshot, w http.ResponseWriter
 		return false
 	}
 	params := urlValuesToInterfaceMap(query)
+	params["nyan_request"] = scriptHTTPRequestContext(r)
 	params["api"] = apiName
 	mode := ""
 	if raw, exists := params["nyan_mode"]; exists {
@@ -2628,6 +2678,7 @@ func executeWebSocketAPIMessage(r *http.Request, message []byte) (response []byt
 	if !exists || getAPIType(apiConfig) != apiTypeAPI {
 		return webSocketAPIError(http.StatusNotFound, "API not found")
 	}
+	params["nyan_request"] = scriptHTTPRequestContext(r)
 	result, err := callNyanAPIFromVMWithSnapshot(snapshot, apiName, params)
 	if err != nil {
 		logServiceError(slog.LevelError, "websocket_api_failed", err, "api", apiName)
@@ -4168,9 +4219,21 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 			return nil, fmt.Errorf("error parsing JSON data: %v", err)
 		}
 
+		if data == nil {
+			data = make(map[string]interface{})
+		}
+		data["nyan_request"] = newScriptHTTPRequestContext(r, body)
 		return data, nil
 	}
 
+	// Capture only the body consumed by the existing form parser.
+	var formBody bytes.Buffer
+	if r.Body != nil {
+		r.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.TeeReader(r.Body, &formBody), r.Body}
+	}
 	if err := r.ParseForm(); err != nil {
 		return nil, fmt.Errorf("error parsing form data: %v", err)
 	}
@@ -4200,6 +4263,7 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 			params[key] = val
 		}
 	}
+	params["nyan_request"] = newScriptHTTPRequestContext(r, formBody.Bytes())
 	return params, nil
 }
 
@@ -8281,6 +8345,7 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	for k, v := range rpcReq.Params {
 		allParams[k] = v
 	}
+	allParams["nyan_request"] = newScriptHTTPRequestContext(r, body)
 	if _, ok := allParams["api"]; !ok {
 		allParams["api"] = rpcReq.Method
 	}
@@ -8577,13 +8642,17 @@ func saveBase64ToFileWithSnapshot(snapshot *APIConfigSnapshot, destPath, b64 str
 }
 
 func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map[string]interface{}, acceptedParamsKeys []string) {
+	if params == nil {
+		params = make(map[string]interface{})
+	}
+	requestContext, ok := params["nyan_request"].(map[string]interface{})
+	if !ok || requestContext == nil {
+		requestContext = map[string]interface{}{}
+	}
+	params["nyan_request"] = requestContext
 	vm.Set("nyanAllParams", params)
 	vm.Set("nyanAcceptedParamsKeys", acceptedParamsKeys)
-	if requestContext, ok := params["nyan_request"]; ok {
-		vm.Set("nyanRequest", requestContext)
-	} else {
-		vm.Set("nyanRequest", map[string]interface{}{})
-	}
+	vm.Set("nyanRequest", requestContext)
 	vm.Set("console", map[string]interface{}{
 		"log": func(call goja.FunctionCall) goja.Value {
 			if serviceLogLevel.Level() > slog.LevelDebug {
@@ -8707,7 +8776,11 @@ func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map
 			panic(vm.ToValue("nyanCallMe(params) requires params.api as non-empty string"))
 		}
 		apiName = strings.TrimSpace(apiName)
+		params = cloneParams(params)
 		params["api"] = apiName
+		// Business arguments are explicit; the originating request is inherited
+		// separately and cannot be replaced by a nyanCallMe argument.
+		params["nyan_request"] = requestContext
 
 		result, err := callNyanAPIFromVMWithSnapshot(snapshot, apiName, params)
 		if err != nil {
