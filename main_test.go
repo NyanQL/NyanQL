@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -6755,6 +6757,256 @@ func TestCheckOnlyRunsOnlyParamCheck(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A real WebSocket over net.Pipe makes backpressure deterministic: writes
+// cannot finish until the peer reads, regardless of OS socket buffer sizes.
+type hubTestConn struct {
+	net.Conn
+	writes chan struct{}
+}
+
+func (c *hubTestConn) Write(data []byte) (int, error) {
+	select {
+	case c.writes <- struct{}{}:
+	default:
+	}
+	return c.Conn.Write(data)
+}
+
+type hubTestResponseWriter struct {
+	*httptest.ResponseRecorder
+	conn   net.Conn
+	reader *bufio.Reader
+}
+
+func (w *hubTestResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return w.conn, bufio.NewReadWriter(w.reader, bufio.NewWriter(w.conn)), nil
+}
+
+func newHubTestPair(t *testing.T) (*websocket.Conn, *websocket.Conn, <-chan struct{}) {
+	t.Helper()
+	local, remote := net.Pipe()
+	observed := &hubTestConn{Conn: local, writes: make(chan struct{}, 1)}
+	t.Cleanup(func() { local.Close(); remote.Close() })
+	_ = local.SetDeadline(time.Now().Add(3 * time.Second))
+	_ = remote.SetDeadline(time.Now().Add(3 * time.Second))
+	type accepted struct {
+		conn *websocket.Conn
+		err  error
+	}
+	peerReady := make(chan accepted, 1)
+	go func() {
+		reader := bufio.NewReader(observed)
+		request, err := http.ReadRequest(reader)
+		if err != nil {
+			peerReady <- accepted{err: err}
+			return
+		}
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(&hubTestResponseWriter{httptest.NewRecorder(), observed, reader}, request, nil)
+		peerReady <- accepted{conn, err}
+	}()
+	address, _ := url.Parse("ws://hub.test/events")
+	connection, _, err := websocket.NewClient(remote, address, nil, 1024, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := <-peerReady
+	if peer.err != nil {
+		t.Fatal(peer.err)
+	}
+	_ = local.SetDeadline(time.Time{})
+	_ = remote.SetDeadline(time.Time{})
+	<-observed.writes // discard the opening handshake notification
+	return peer.conn, connection, observed.writes
+}
+
+func assertHubDelivery(t *testing.T, send func(), peers []*websocket.Conn, want string) {
+	t.Helper()
+	type frame struct {
+		kind int
+		data []byte
+		err  error
+	}
+	frames := make(chan frame, len(peers))
+	for _, peer := range peers {
+		go func(conn *websocket.Conn) {
+			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			kind, data, err := conn.ReadMessage()
+			frames <- frame{kind, data, err}
+		}(peer)
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); send() }()
+	for range peers {
+		got := <-frames
+		if got.err != nil || got.kind != websocket.TextMessage || string(got.data) != want {
+			t.Fatalf("frame=%q type=%d err=%v, want %q", got.data, got.kind, got.err, want)
+		}
+	}
+	waitForSignal(t, done, "Hub delivery completion")
+}
+
+func TestHubFailedConnectionRemovalAndReconnect(t *testing.T) {
+	h := NewHub()
+	old, _, _ := newHubTestPair(t)
+	a, pa, _ := newHubTestPair(t)
+	c, pc, _ := newHubTestPair(t)
+	replacement, pr, _ := newHubTestPair(t)
+	for _, conn := range []*websocket.Conn{old, a, c, replacement} {
+		h.AddClient("events", conn)
+	}
+	h.AddClient("other", old)
+	_ = old.Close()
+	assertHubDelivery(t, func() { h.Broadcast("events", []byte("first")) }, []*websocket.Conn{pa, pc, pr}, "first")
+	h.mu.Lock()
+	_, oldPresent := h.connections[old]
+	_, otherPresent := h.clients["other"]
+	remaining := len(h.clients["events"])
+	h.mu.Unlock()
+	if oldPresent || otherPresent || remaining != 3 {
+		t.Fatalf("failed connection retained: old=%v other=%v remaining=%d", oldPresent, otherPresent, remaining)
+	}
+	// The old read loop may finish after the replacement has been registered.
+	h.RemoveClient("events", old)
+	h.RemoveClient("events", a)
+	assertHubDelivery(t, func() { h.Broadcast("events", []byte("second")) }, []*websocket.Conn{pc, pr}, "second")
+	h.RemoveClient("events", c)
+	assertHubDelivery(t, func() { h.Broadcast("events", []byte("third")) }, []*websocket.Conn{pr}, "third")
+	h.RemoveClient("events", replacement)
+	h.RemoveClient("events", replacement)
+	if len(h.clients) != 0 || len(h.connections) != 0 {
+		t.Fatal("last subscriber was not removed")
+	}
+	if err := h.Send(replacement, []byte("late")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("late reply error=%v", err)
+	}
+}
+
+func TestHubBlockedWriteDoesNotHoldRegistryLock(t *testing.T) {
+	h := NewHub()
+	slow, _, writes := newHubTestPair(t)
+	fast, peer, _ := newHubTestPair(t)
+	newcomer, _, _ := newHubTestPair(t)
+	h.AddClient("slow", slow)
+	h.AddClient("fast", fast)
+	done := make(chan struct{})
+	go func() { defer close(done); h.Broadcast("slow", []byte("blocked")) }()
+	waitForSignal(t, writes, "blocked write started")
+	changed := make(chan struct{})
+	go func() { defer close(changed); h.AddClient("new", newcomer); h.RemoveClient("new", newcomer) }()
+	select {
+	case <-changed:
+	case <-time.After(time.Second):
+		t.Fatal("registration waited for an unrelated write")
+	}
+	assertHubDelivery(t, func() { h.Broadcast("fast", []byte("push")) }, []*websocket.Conn{peer}, "push")
+	assertHubDelivery(t, func() {
+		if err := h.Send(fast, []byte("reply")); err != nil {
+			t.Error(err)
+		}
+	}, []*websocket.Conn{peer}, "reply")
+	// Unregistering must also interrupt the pending write without waiting for
+	// its per-connection write lock or for the five-second deadline.
+	removed := make(chan struct{})
+	go func() { defer close(removed); h.RemoveClient("slow", slow) }()
+	select {
+	case <-removed:
+	case <-time.After(time.Second):
+		t.Fatal("removal waited for the blocked write")
+	}
+	waitForSignal(t, done, "blocked write interrupted")
+}
+
+func TestHubWriteTimeoutRemovesOnlyFailedConnection(t *testing.T) {
+	for _, mode := range []string{"reply", "push"} {
+		t.Run(mode, func(t *testing.T) {
+			h := NewHub()
+			h.writeTimeout = 50 * time.Millisecond
+			slow, slowPeer, _ := newHubTestPair(t)
+			fast, fastPeer, _ := newHubTestPair(t)
+			h.AddClient("events", slow)
+			h.AddClient("events", fast)
+			if mode == "reply" {
+				err := h.Send(slow, []byte("blocked"))
+				var netErr net.Error
+				if !errors.As(err, &netErr) || !netErr.Timeout() {
+					t.Fatalf("write did not time out: %v", err)
+				}
+			} else {
+				assertHubDelivery(t, func() { h.Broadcast("events", []byte("broadcast")) }, []*websocket.Conn{fastPeer}, "broadcast")
+			}
+			if len(h.connections) != 1 || len(h.clients["events"]) != 1 || h.connections[slow] != nil {
+				t.Fatal("timeout removed healthy peer or retained failed peer")
+			}
+			_ = slowPeer.SetReadDeadline(time.Now().Add(time.Second))
+			_, _, readErr := slowPeer.ReadMessage()
+			var timeout net.Error
+			if readErr == nil || (errors.As(readErr, &timeout) && timeout.Timeout()) {
+				t.Fatalf("timed-out connection was not closed: %v", readErr)
+			}
+			assertHubDelivery(t, func() { h.Broadcast("events", []byte("next")) }, []*websocket.Conn{fastPeer}, "next")
+		})
+	}
+}
+
+func TestHubConcurrentRepliesPushAndSubscriptions(t *testing.T) {
+	h := NewHub()
+	conn, peer, _ := newHubTestPair(t)
+	h.AddClient("a", conn)
+	h.AddClient("b", conn)
+	const count = 20
+	var workers sync.WaitGroup
+	errorsFound := make(chan error, count)
+	for _, kind := range []string{"reply", "a", "b"} {
+		workers.Add(1)
+		go func(kind string) {
+			defer workers.Done()
+			for i := 0; i < count; i++ {
+				if kind == "reply" {
+					if err := h.Send(conn, []byte(kind)); err != nil {
+						errorsFound <- err
+					}
+				} else {
+					h.Broadcast(kind, []byte(kind))
+				}
+			}
+		}(kind)
+	}
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		for i := 0; i < count; i++ {
+			h.AddClient("temporary", conn)
+			h.RemoveClient("temporary", conn)
+		}
+	}()
+	done := make(chan struct{})
+	go func() { workers.Wait(); close(done) }()
+	counts := map[string]int{}
+	_ = peer.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for i := 0; i < 3*count; i++ {
+		kind, data, err := peer.ReadMessage()
+		if err != nil || kind != websocket.TextMessage {
+			t.Fatalf("concurrent write failed: type=%d err=%v", kind, err)
+		}
+		counts[string(data)]++
+	}
+	waitForSignal(t, done, "concurrent Hub operations")
+	close(errorsFound)
+	for err := range errorsFound {
+		t.Error(err)
+	}
+	for _, kind := range []string{"reply", "a", "b"} {
+		if counts[kind] != count {
+			t.Fatalf("lost or duplicated frames: %v", counts)
+		}
+	}
+	if len(h.connections) != 1 || len(h.clients) != 2 {
+		t.Fatalf("subscription changes damaged the registry: %v", h.clients)
+	}
+	assertHubDelivery(t, func() { h.Broadcast("a", []byte("complete")) }, []*websocket.Conn{peer}, "complete")
 }
 
 func TestPushSourceResultAcrossTransports(t *testing.T) {

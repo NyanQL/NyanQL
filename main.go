@@ -255,8 +255,17 @@ func (apiConfig *APIConfig) UnmarshalJSON(data []byte) error {
 }
 
 type Hub struct {
-	mu      sync.Mutex
-	clients map[string]map[*websocket.Conn]bool // チャネル名ごとのクライアント一覧
+	mu           sync.Mutex
+	clients      map[string]map[*websocket.Conn]*hubClient
+	connections  map[*websocket.Conn]*hubClient
+	writeTimeout time.Duration
+}
+
+type hubClient struct {
+	conn     *websocket.Conn
+	writeMu  sync.Mutex
+	closed   atomic.Bool
+	channels map[string]struct{} // protected by Hub.mu
 }
 
 type SQLResponse struct {
@@ -401,6 +410,7 @@ const (
 	maxRestrictedScriptRuntime       = 15 * time.Second
 	maxWebSocketMessageBytes         = 1 << 20
 	maxWebSocketConnections          = 128
+	webSocketWriteTimeout            = 5 * time.Second
 )
 
 type mcpRateBucket struct {
@@ -599,31 +609,58 @@ func main() {
 }
 
 func (h *Hub) AddClient(channel string, conn *websocket.Conn) {
+	if conn == nil {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.clients == nil {
-		h.clients = make(map[string]map[*websocket.Conn]bool)
+		h.clients = make(map[string]map[*websocket.Conn]*hubClient)
+	}
+	if h.connections == nil {
+		h.connections = make(map[*websocket.Conn]*hubClient)
+	}
+	client := h.connections[conn]
+	if client == nil {
+		client = &hubClient{conn: conn, channels: make(map[string]struct{})}
+		h.connections[conn] = client
 	}
 	if _, ok := h.clients[channel]; !ok {
-		h.clients[channel] = make(map[*websocket.Conn]bool)
+		h.clients[channel] = make(map[*websocket.Conn]*hubClient)
 	}
-	h.clients[channel][conn] = true
+	h.clients[channel][conn] = client
+	client.channels[channel] = struct{}{}
 }
 
 func (h *Hub) RemoveClient(channel string, conn *websocket.Conn) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if clients, ok := h.clients[channel]; ok {
+	client := h.clients[channel][conn]
+	closeConnection := false
+	if client != nil {
+		clients := h.clients[channel]
 		delete(clients, conn)
+		delete(client.channels, channel)
 		if len(clients) == 0 {
 			delete(h.clients, channel)
 		}
+		if len(client.channels) == 0 {
+			delete(h.connections, conn)
+			client.closed.Store(true)
+			closeConnection = true
+		}
+	}
+	h.mu.Unlock()
+	// Closing must not wait for the write lock: it interrupts a blocked write.
+	if closeConnection {
+		_ = conn.Close()
 	}
 }
 
 func NewHub() *Hub {
 	return &Hub{
-		clients: make(map[string]map[*websocket.Conn]bool),
+		clients:      make(map[string]map[*websocket.Conn]*hubClient),
+		connections:  make(map[*websocket.Conn]*hubClient),
+		writeTimeout: webSocketWriteTimeout,
 	}
 }
 
@@ -7676,24 +7713,65 @@ func normalizeSQL(sqlText string) string {
 // Send serializes API replies with Push broadcasts on the same connection.
 func (h *Hub) Send(conn *websocket.Conn, message []byte) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	return conn.WriteMessage(websocket.TextMessage, message)
+	client := h.connections[conn]
+	h.mu.Unlock()
+	if client == nil {
+		return net.ErrClosed
+	}
+	return h.send(client, message)
+}
+
+func (h *Hub) send(client *hubClient, message []byte) error {
+	client.writeMu.Lock()
+	defer client.writeMu.Unlock()
+	if client.closed.Load() {
+		return net.ErrClosed
+	}
+	timeout := h.writeTimeout
+	if timeout <= 0 {
+		timeout = webSocketWriteTimeout
+	}
+	err := client.conn.SetWriteDeadline(time.Now().Add(timeout))
+	if err == nil {
+		err = client.conn.WriteMessage(websocket.TextMessage, message)
+	}
+	if err != nil {
+		h.removeFailedClient(client)
+	}
+	return err
+}
+
+func (h *Hub) removeFailedClient(client *hubClient) {
+	h.mu.Lock()
+	if h.connections[client.conn] != client {
+		h.mu.Unlock()
+		return
+	}
+	for channel := range client.channels {
+		delete(h.clients[channel], client.conn)
+		if len(h.clients[channel]) == 0 {
+			delete(h.clients, channel)
+		}
+	}
+	delete(h.connections, client.conn)
+	client.closed.Store(true)
+	h.mu.Unlock()
+	_ = client.conn.Close()
 }
 
 func (h *Hub) Broadcast(channel string, message []byte) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	clients, ok := h.clients[channel]
-	if !ok {
+	clients := make([]*hubClient, 0, len(h.clients[channel]))
+	for _, client := range h.clients[channel] {
+		clients = append(clients, client)
+	}
+	h.mu.Unlock()
+	if len(clients) == 0 {
 		serviceLog(slog.LevelDebug, "push_no_subscribers", "channel", channel)
 		return
 	}
-	for conn := range clients {
-		if conn == nil {
-			// nil の接続があればスキップ
-			continue
-		}
-		if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
+	for _, client := range clients {
+		if err := h.send(client, message); err != nil {
 			logServiceError(slog.LevelWarn, "push_send_failed", err, "channel", channel)
 		}
 	}
