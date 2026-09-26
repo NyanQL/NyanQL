@@ -5336,9 +5336,7 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	if r.URL.Path != "/" {
 		apiName := strings.TrimPrefix(r.URL.Path, "/")
 		if apiName != "" {
-			if _, exists := params["api"]; !exists {
-				params["api"] = apiName
-			}
+			params["api"] = apiName
 		}
 	}
 	apiKey, ok := params["api"].(string)
@@ -8375,14 +8373,8 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		allParams[k] = v
 	}
 	allParams["nyan_request"] = newScriptHTTPRequestContext(r, body)
-	if _, ok := allParams["api"]; !ok {
-		allParams["api"] = rpcReq.Method
-	}
-	apiKey, ok := allParams["api"].(string)
-	if !ok || apiKey == "" {
-		respondJSONRPCError(w, rpcReq.ID, -32602, "API key is required and must be a string", nil)
-		return
-	}
+	apiKey := rpcReq.Method
+	allParams["api"] = apiKey
 
 	apiConfig, exists := snapshot.Definitions[apiKey]
 	if !exists {

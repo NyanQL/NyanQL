@@ -2420,6 +2420,108 @@ if ((nyanRequest.json || nyanRequest.form).value !== "body") throw new Error("bo
 	}
 }
 
+func TestAPISelectionUsesPathAndRPCMethod(t *testing.T) {
+	for _, test := range []struct {
+		name, path, contentType, body, api string
+		status                             int
+		rpc, checkOnly                     bool
+	}{
+		{name: "query", path: "/sub/alpha?api=beta", api: "sub/alpha", status: 200},
+		{name: "duplicate_query", path: "/sub/alpha?api=beta&api=beta", api: "sub/alpha", status: 200},
+		{name: "json", path: "/sub/alpha?api=beta", contentType: "application/json", body: `{"api":"beta"}`, api: "sub/alpha", status: 200},
+		{name: "json_null", path: "/sub/alpha", contentType: "application/json", body: `{"api":null}`, api: "sub/alpha", status: 200},
+		{name: "json_array", path: "/sub/alpha", contentType: "application/json", body: `{"api":["beta"]}`, api: "sub/alpha", status: 200},
+		{name: "json_empty", path: "/sub/alpha", contentType: "application/json", body: `{"api":""}`, api: "sub/alpha", status: 200},
+		{name: "form", path: "/sub/alpha", contentType: "application/x-www-form-urlencoded", body: "api=beta", api: "sub/alpha", status: 200},
+		{name: "missing_path", path: "/missing?api=beta", status: 404},
+		{name: "root_query", path: "/?api=beta", api: "beta", status: 200},
+		{name: "root_body", path: "/?api=sub/alpha", contentType: "application/json", body: `{"api":"beta"}`, api: "beta", status: 200},
+		{name: "root_missing", path: "/", status: 400},
+		{name: "check_only", path: "/sub/alpha?api=beta&nyan_mode=checkOnly", api: "sub/alpha", status: 200, checkOnly: true},
+		{name: "denied", path: "/sub/alpha?api=beta&deny=yes", api: "sub/alpha", status: 403},
+		{name: "rpc", rpc: true, body: `{"jsonrpc":"2.0","id":1,"method":"sub/alpha","params":{"api":"beta"}}`, api: "sub/alpha", status: 200},
+		{name: "rpc_null", rpc: true, body: `{"jsonrpc":"2.0","id":1,"method":"sub/alpha","params":{"api":null}}`, api: "sub/alpha", status: 200},
+		{name: "rpc_array", rpc: true, body: `{"jsonrpc":"2.0","id":1,"method":"sub/alpha","params":{"api":["beta"]}}`, api: "sub/alpha", status: 200},
+		{name: "rpc_missing_method", rpc: true, body: `{"jsonrpc":"2.0","id":1,"method":"missing","params":{"api":"beta"}}`, status: 404},
+		{name: "rpc_empty_method", rpc: true, body: `{"jsonrpc":"2.0","id":1,"method":"","params":{"api":"beta"}}`, status: 404},
+		{name: "rpc_check_only", rpc: true, body: `{"jsonrpc":"2.0","id":1,"method":"sub/alpha","params":{"api":"beta","nyan_mode":"checkOnly"}}`, api: "sub/alpha", status: 200, checkOnly: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetJavascriptInclude(t)
+			setTestSQLiteDB(t)
+			dir := t.TempDir()
+			files := make(map[string]APIConfig)
+			for _, api := range []string{"sub/alpha", "beta"} {
+				mark := func(stage string) string {
+					return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"),%q);`, filepath.Join(dir, api, stage))
+				}
+				guard := fmt.Sprintf(`if(nyanAllParams.api!==%q) throw new Error("wrong effective API name");`, api)
+				files[api] = APIConfig{
+					ParamCheck: writeTestScript(t, guard+mark("param")+`({success:!nyanAllParams.deny,status:nyanAllParams.deny?403:200,result:{api:nyanAllParams.api,request:nyanRequest}});`),
+					Script:     writeTestScript(t, guard+mark("body")+`({success:true,status:200,result:{api:nyanAllParams.api,request:nyanRequest}});`),
+					OutCheck:   writeTestScript(t, guard+mark("out")+`({success:true,status:200});`),
+					Push:       api + "/events",
+				}
+				files[api+"/events"] = APIConfig{Script: writeTestScript(t, mark("push")+`({status:200});`)}
+			}
+			setTestSQLFiles(t, files)
+			path, contentType := test.path, test.contentType
+			if test.rpc {
+				path, contentType = "/nyan-rpc", "application/json"
+			}
+			r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(test.body))
+			r.Header.Set("Content-Type", contentType)
+			r.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+			w := httptest.NewRecorder()
+			if test.rpc {
+				handleJSONRPC(w, r)
+			} else {
+				unifiedHandler(w, r)
+			}
+			if w.Code != test.status {
+				t.Fatalf("HTTP %d, want %d: %s", w.Code, test.status, w.Body.String())
+			}
+			if test.api != "" {
+				response := decodeTestJSONObject(t, w.Body.Bytes())
+				if test.rpc {
+					response = response["result"].(map[string]interface{})
+				}
+				result := response["result"].(map[string]interface{})
+				if result["api"] != test.api {
+					t.Fatalf("selected API=%v, want %s", result["api"], test.api)
+				}
+				request := result["request"].(map[string]interface{})
+				if request["path"] != path && request["path"] != strings.Split(path, "?")[0] {
+					t.Fatalf("request path changed: %#v", request)
+				}
+				if contentType == "application/json" && !reflect.DeepEqual(request["json"], decodeTestJSONObject(t, []byte(test.body))) {
+					t.Fatalf("original JSON changed: %#v", request["json"])
+				}
+				query, _ := json.Marshal(urlValuesToInterfaceMap(r.URL.Query()))
+				if !reflect.DeepEqual(request["query"], decodeTestJSONObject(t, query)) {
+					t.Fatalf("original query changed: %#v", request["query"])
+				}
+				if contentType == "application/x-www-form-urlencoded" && !reflect.DeepEqual(request["form"], map[string]interface{}{"api": "beta"}) {
+					t.Fatalf("original form changed: %#v", request["form"])
+				}
+			}
+			for _, api := range []string{"sub/alpha", "beta"} {
+				for _, stage := range []string{"param", "body", "out", "push"} {
+					data, err := os.ReadFile(filepath.Join(dir, api, stage))
+					want := api == test.api && (stage == "param" || (!test.checkOnly && test.status == 200))
+					if want {
+						if err != nil || string(data) != "ran" {
+							t.Fatalf("%s/%s did not run: %q %v", api, stage, data, err)
+						}
+					} else if !os.IsNotExist(err) {
+						t.Fatalf("unexpected %s/%s execution: %q %v", api, stage, data, err)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestPrepareQueryWithParamsScansJSONDocumentCommentDefaults(t *testing.T) {
 	query, args := prepareQueryWithParams(
 		`INSERT INTO hoge2 VALUES /*doc*/{"id":9, "name":"たまこ"};`,

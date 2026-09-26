@@ -437,7 +437,9 @@ curl -u admin:secret \
   "http://localhost:8080/"
 ```
 
-URLのパスにAPI名を書いた場合、NyanQLはそのパスをAPI名として扱います。たとえば `/getItem?id=1` は、`api=getItem` として扱われます。
+URLのパスにAPI名を書いた場合、NyanQLはそのパスで実行対象を固定します。たとえば `/getItem?id=1` は、`api=getItem` として扱われます。クエリや本文に別の `api` があっても実行先は変更せず、`nyanAllParams.api` にはURLの完全API名を設定します。API名はURLか、ルート `/` に渡す `api` のどちらかで指定してください。以前のように `/getItem?api=other` で `other` を呼び出していた場合は、`/other` または `/?api=other` に変更してください。
+
+ルート `/` の場合だけ、クエリ・本文を統合した `api` で実行対象を選びます。同名項目は本文を優先します。URLパスを優先しても、`nyanRequest.query`・`nyanRequest.form`・`nyanRequest.json` にある送信元の値は変更しません。
 
 通常APIの公開パスはAPI名から決まります。`api.json` のAPI定義に `http` 設定は指定できません。ファイルの公開には `type: "public"` を使います。
 
@@ -1369,7 +1371,7 @@ curl -u admin:secret \
   "http://localhost:8080/nyan-rpc"
 ```
 
-`method` が、`api.json` のAPI名として扱われます。
+`method` が、`api.json` のAPI名として扱われます。`params.api` が指定されていても実行先は変更せず、`nyanAllParams.api` は `method` の完全API名になります。API名は `method` に指定してください。存在しない `method` を `params.api` で補うこともできません。送信された元のJSONは `nyanRequest.json` に保持します。
 
 現在の実装では、JSON-RPCの一括リクエスト、つまりbatch形式には対応していません。
 
