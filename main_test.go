@@ -6642,6 +6642,151 @@ func setTestSQLiteDB(t *testing.T) *sql.DB {
 	return testDB
 }
 
+func TestParamCheckRejectionPreservesResultAndError(t *testing.T) {
+	for _, route := range []string{"http", "root", "jsonrpc", "nyanCallMe", "websocket", "mcp_http", "mcp_stdio"} {
+		for _, checkOnly := range []bool{false, true} {
+			for _, test := range []struct {
+				name, response, want string
+				status               int
+				jsonString           bool
+			}{
+				{"both", `{"success":false,"status":403,"result":{"contactAdmin":true},"error":{"code":"DISABLED","message":"disabled"}}`, `{"success":false,"status":403,"result":{"contactAdmin":true},"error":{"code":"DISABLED","message":"disabled"}}`, 403, false},
+				{"result_only", `{"success":false,"status":403,"result":["id","name"]}`, `{"success":false,"status":403,"result":["id","name"],"error":"Request check failed"}`, 403, true},
+				{"error_only", `{"success":false,"status":403,"error":"denied"}`, `{"success":false,"status":403,"error":"denied"}`, 403, false},
+				{"null", `{"success":false,"status":403,"result":null,"error":null}`, `{"success":false,"status":403,"result":null,"error":"Request check failed"}`, 403, false},
+				{"false_and_empty", `{"success":false,"status":403,"result":false,"error":""}`, `{"success":false,"status":403,"result":false,"error":""}`, 403, true},
+				{"returned_500", `{"success":false,"status":500,"result":{"retryable":true},"error":{"message":"unavailable"}}`, `{"success":false,"status":500,"result":{"retryable":true},"error":{"message":"unavailable"}}`, 500, false},
+			} {
+				t.Run(fmt.Sprintf("%s/checkOnly=%t/%s", route, checkOnly, test.name), func(t *testing.T) {
+					resetJavascriptInclude(t)
+					setTestSQLiteDB(t)
+					oldHub := hub
+					hub = NewHub()
+					t.Cleanup(func() { hub = oldHub })
+					dir := t.TempDir()
+					mark := func(stage string) string {
+						return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"),%q);`, filepath.Join(dir, stage))
+					}
+					check := "(" + test.response + ");"
+					if test.jsonString {
+						check = fmt.Sprintf("%q;", test.response)
+					}
+					setTestSQLFiles(t, map[string]APIConfig{
+						"target": {ParamCheck: writeTestScript(t, mark("param")+check), Script: writeTestScript(t, mark("body")+`({success:true});`), OutCheck: writeTestScript(t, mark("out")+`({success:true,status:200});`), Push: "events"},
+						"events": {Script: writeTestScript(t, mark("push")+`({success:true});`)},
+					})
+					params := map[string]interface{}{"api": "target"}
+					if checkOnly {
+						params["nyan_mode"] = "checkOnly"
+					}
+					args, _ := json.Marshal(params)
+					var response map[string]interface{}
+					switch route {
+					case "http", "root", "jsonrpc":
+						path := "/target"
+						if route == "root" {
+							path = "/"
+						}
+						body := args
+						if route == "jsonrpc" {
+							path = "/nyan-rpc"
+							body, _ = json.Marshal(map[string]interface{}{"jsonrpc": "2.0", "id": 1, "method": "target", "params": params})
+						}
+						r := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+						r.Header.Set("Content-Type", "application/json")
+						r.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+						w := httptest.NewRecorder()
+						if route == "jsonrpc" {
+							handleJSONRPC(w, r)
+						} else {
+							unifiedHandler(w, r)
+						}
+						response = decodeTestJSONObject(t, w.Body.Bytes())
+						wantStatus := test.status
+						if route == "jsonrpc" {
+							wantStatus = 400
+							failure := response["error"].(map[string]interface{})
+							data := failure["data"].(map[string]interface{})
+							if failure["code"] != float64(-32602) || data["message"] != "Request check failed" {
+								t.Fatalf("RPC contract changed: %#v", response)
+							}
+							original := decodeTestJSONObject(t, []byte(test.response))
+							if !reflect.DeepEqual(data["detail"], original["error"]) {
+								t.Fatalf("RPC detail changed: %#v", data)
+							}
+							response = data["checkResult"].(map[string]interface{})
+						}
+						if w.Code != wantStatus {
+							t.Fatalf("HTTP %d want %d: %s", w.Code, wantStatus, w.Body.String())
+						}
+					case "nyanCallMe":
+						vm := goja.New()
+						registerNyanFuncs(vm, currentAPISnapshot(), nil, nil)
+						value, err := vm.RunString("JSON.stringify(nyanCallMe(" + string(args) + "));")
+						if err != nil {
+							t.Fatalf("valid rejection became an exception: %v", err)
+						}
+						response = decodeTestJSONObject(t, []byte(value.String()))
+					case "websocket":
+						r := httptest.NewRequest(http.MethodGet, "/channel", nil)
+						r.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+						response = decodeTestJSONObject(t, executeWebSocketAPIMessage(r, args))
+					case "mcp_http", "mcp_stdio":
+						server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", Tools: []MCPToolConfig{{API: "target"}}}
+						message, _ := json.Marshal(map[string]interface{}{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]interface{}{"name": "target", "arguments": params}})
+						if route == "mcp_http" {
+							w := performTestMCPRequest(t, currentAPISnapshot(), server, string(message), "")
+							response = decodeTestJSONObject(t, w.Body.Bytes())
+						} else {
+							server.Transport = "stdio"
+							state := mcpStdioReady
+							response, _ = handleMCPStdioMessage(currentAPISnapshot(), "test_mcp", server, &state, message)
+						}
+						tool := response["result"].(map[string]interface{})
+						if tool["isError"] != true {
+							t.Fatalf("MCP rejection not marked as error: %#v", tool)
+						}
+						response = tool["structuredContent"].(map[string]interface{})
+					}
+					if want := decodeTestJSONObject(t, []byte(test.want)); !reflect.DeepEqual(response, want) {
+						t.Fatalf("response=%#v want %#v", response, want)
+					}
+					for stage, want := range map[string]bool{"param": true, "body": false, "out": false, "push": false} {
+						_, err := os.Stat(filepath.Join(dir, stage))
+						if err != nil && !os.IsNotExist(err) {
+							t.Fatal(err)
+						}
+						if (err == nil) != want {
+							t.Fatalf("stage %s executed=%t want %t", stage, err == nil, want)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestParamCheckExceptionRemainsException(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLFiles(t, map[string]APIConfig{"target": {ParamCheck: writeTestScript(t, `throw new Error("check exploded");`)}})
+	vm := goja.New()
+	registerNyanFuncs(vm, currentAPISnapshot(), nil, nil)
+	v, err := vm.RunString(`let caught=false;try{nyanCallMe({api:"target"});}catch(e){caught=String(e).includes("check exploded");}caught;`)
+	if err != nil || !v.ToBoolean() {
+		t.Fatalf("check exception not caught: %v %v", v, err)
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/target", nil)
+	handleRequest(w, r)
+	response := decodeTestJSONObject(t, w.Body.Bytes())
+	if w.Code != 500 || response["success"] != false || response["error"] == nil {
+		t.Fatalf("exception response: %d %s", w.Code, w.Body.String())
+	}
+	if _, exists := response["result"]; exists {
+		t.Fatal("execution exception acquired a result")
+	}
+}
+
 func TestCheckOnlyRunsOnlyParamCheck(t *testing.T) {
 	oldHub := hub
 	hub = NewHub()

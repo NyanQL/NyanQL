@@ -871,6 +871,21 @@ if (!nyanAllParams.id) {
 
 `paramCheck` の戻り値は、JSON文字列またはオブジェクトにしてください。NyanQLは、そのJSONを読んで、`success` が `true` なら次の処理へ進みます。`false` の場合は、SQLやscriptを実行せずにエラーを返します。
 
+拒否結果には `result` と `error` の両方を指定できます。`result` は呼び出し元で使うデータや補足情報、`error` はエラーの詳細に使えます。失敗の判定はメッセージの有無ではなく `success` で行います。
+
+```javascript
+({
+  success: false,
+  status: 403,
+  result: { contactAdmin: true },
+  error: { code: "ACCOUNT_DISABLED", message: "このアカウントは無効です" }
+});
+```
+
+通常HTTP・ルートHTTP・`nyanCallMe()`・WebSocketのAPI実行・MCPのTool実行では、入力チェックの拒否結果として `success`・`status`・`error` に加え、指定された `result` も保持します。`result` はオブジェクト・配列・文字列・数値・真偽値・`null` を使用でき、省略時は追加しません。既存の `error` も保持し、省略または `null` の場合は従来どおり `"Request check failed"` を補います。`checkOnly` の拒否時も同じです。JSON-RPCでは、既存のHTTP 400・`error.code:-32602`・`error.data.message`・`error.data.detail` を維持し、同じ形式のチェック結果を `error.data.checkResult` に追加します。
+
+`success:false, status:500` をチェックから返すことと、チェック自体で例外が起きることは別です。前者は有効な拒否結果として `result` / `error` を返し、`nyanCallMe()`でも戻り値になります。後者は従来どおり実行エラーで、通常HTTPでは `result` を付けないHTTP 500の `error` 応答、`nyanCallMe()`ではJavaScript例外になります。拒否されたAPIの本体・`outCheck`・Pushは実行しません。
+
 ### checkだけを実行する
 
 通常HTTP・JSON-RPC・`nyanCallMe()`・WebSocket・MCP（HTTP／stdio）からのAPI呼び出しで `nyan_mode=checkOnly` を指定すると、`paramCheck` だけを実行し、その結果を返します。本体のscript／SQL・`outCheck`・Pushは実行しません。`check` で指定した古い設定も、`paramCheck` として同じように実行されます。`paramCheck`（または `check`）が未設定の場合は、本体を実行せずエラーを返します。

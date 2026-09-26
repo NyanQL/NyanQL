@@ -5356,24 +5356,21 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		return
 	}
 	if checkScriptPath != "" {
-		success, statusCode, errorObj, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, acceptedKeys)
+		success, statusCode, _, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, acceptedKeys)
 		if err != nil {
 			logServiceError(slog.LevelError, "param_check_failed", err, "api", apiKey)
 			sendJSONError(w, err.Error(), statusCode)
 			return
 		}
 		if !success {
-			if errorObj == nil {
-				errorObj = "Request check failed"
-			}
-			response := map[string]interface{}{
-				"success": success,
-				"status":  statusCode,
-				"error":   errorObj,
+			response, err := paramCheckRejectionJSON(statusCode, jsonStr)
+			if err != nil {
+				sendJSONError(w, "Failed to encode check response", http.StatusInternalServerError)
+				return
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
-			json.NewEncoder(w).Encode(response)
+			_, _ = fmt.Fprintln(w, response)
 			return
 		}
 		if nyanMode == "checkOnly" {
@@ -7199,6 +7196,27 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 	return runCheckScriptWithSnapshot(currentAPISnapshot(), apiCheckScriptPath, params, acceptedParamsKeys)
 }
 
+// Preserve the two supported payload fields on input rejection. Keep the
+// existing default error for absent/null error; an absent result stays absent.
+func paramCheckRejectionJSON(status int, checkJSON string) (string, error) {
+	var payload struct {
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(checkJSON), &payload); err != nil {
+		return "", err
+	}
+	if len(payload.Error) == 0 || bytes.Equal(bytes.TrimSpace(payload.Error), []byte("null")) {
+		payload.Error = json.RawMessage(`"Request check failed"`)
+	}
+	response := map[string]interface{}{"success": false, "status": status, "error": payload.Error}
+	if len(payload.Result) != 0 {
+		response["result"] = payload.Result
+	}
+	body, err := json.Marshal(response)
+	return string(body), err
+}
+
 func runCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, string, error) {
 	var combinedScript strings.Builder
 	for _, includePath := range config.JavascriptInclude {
@@ -7565,19 +7583,16 @@ func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allPara
 			logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiName)
 			acceptedKeys = []string{}
 		}
-		success, checkStatus, errorObj, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, acceptedKeys)
+		success, checkStatus, _, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, acceptedKeys)
 		if err != nil {
 			return result, fmt.Errorf("check script error: %v", err)
 		}
 		if !success {
-			if errorObj == nil {
-				errorObj = "Request check failed"
-			}
-			b, err := json.Marshal(map[string]interface{}{"success": false, "status": checkStatus, "error": errorObj})
+			body, err := paramCheckRejectionJSON(checkStatus, jsonStr)
 			if err != nil {
 				return result, fmt.Errorf("failed to marshal check response for API %s: %v", apiName, err)
 			}
-			result.Body, result.CheckRejected = string(b), true
+			result.Body, result.CheckRejected = body, true
 			return result, nil
 		}
 		result.Body = jsonStr
@@ -8384,9 +8399,15 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 			return
 		}
 		if !success {
+			checkResult, err := paramCheckRejectionJSON(statusCode, jsonStr)
+			if err != nil {
+				respondJSONRPCError(w, rpcReq.ID, -32603, "Failed to encode check response", nil)
+				return
+			}
 			errData := map[string]interface{}{
-				"message": "Request check failed",
-				"detail":  errorObj,
+				"message":     "Request check failed",
+				"detail":      errorObj,
+				"checkResult": json.RawMessage(checkResult),
 			}
 			respondJSONRPCError(w, rpcReq.ID, -32602, "Invalid params", errData)
 			return
