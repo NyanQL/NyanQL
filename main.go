@@ -5393,7 +5393,12 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 			return
 		}
 		body := []byte(scriptResult)
-		if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", body); handled {
+		statusCode, err := apiResponseStatus(body)
+		if err != nil {
+			sendJSONError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, statusCode, "application/json", body); handled {
 			if err != nil {
 				logServiceError(slog.LevelError, "out_check_failed", err, "api", apiKey)
 				sendJSONError(w, err.Error(), outStatusCode)
@@ -5404,9 +5409,9 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 			w.Write([]byte(outJSON))
 			return
 		}
-		performPushForResponse(snapshot, apiConfig, params, http.StatusOK, body)
+		performPushForResponse(snapshot, apiConfig, params, statusCode, body)
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(statusCode)
 		w.Write(body)
 		return
 	}
@@ -7573,7 +7578,6 @@ func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allPara
 	if result.CheckOnly && checkScriptPath == "" {
 		return result, fmt.Errorf("No check script for API %s", apiName)
 	}
-	statusCode := http.StatusOK
 	if checkScriptPath != "" {
 		acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
 		if err != nil {
@@ -7612,6 +7616,10 @@ func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allPara
 		result.Body = string(body)
 	default:
 		return result, fmt.Errorf("No script or SQL defined for API %s", apiName)
+	}
+	statusCode, err := apiResponseStatus([]byte(result.Body))
+	if err != nil {
+		return result, err
 	}
 	if handled, _, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, statusCode, "application/json", []byte(result.Body)); handled {
 		if err != nil {
@@ -8522,11 +8530,10 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		return
 	}
 
-	statusCode := 200
-	if st, ok := finalResult["status"].(float64); ok {
-		statusCode = int(st)
-	} else if st, ok := finalResult["status"].(int); ok {
-		statusCode = st
+	statusCode, err := apiResponseStatus(finalBody)
+	if err != nil {
+		respondJSONRPCError(w, rpcReq.ID, -32603, "Invalid API response status", err.Error())
+		return
 	}
 	if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, allParams, statusCode, "application/json", finalBody); handled {
 		if err != nil {
@@ -8541,12 +8548,7 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	performPushForResponse(snapshot, apiConfig, allParams, statusCode, finalBody)
 
 	// 7) 最終レスポンスの返却
-	if st, ok := finalResult["status"].(float64); ok {
-		statusCode = int(st)
-		delete(finalResult, "status")
-	} else if _, ok := finalResult["status"].(int); ok {
-		delete(finalResult, "status")
-	}
+	delete(finalResult, "status")
 	rpcResp := JSONRPCResponse{
 		JSONRPC: "2.0",
 		Result:  finalResult,
@@ -8557,6 +8559,24 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	if err := json.NewEncoder(w).Encode(rpcResp); err != nil {
 		logServiceError(slog.LevelError, "jsonrpc_response_encode_failed", err)
 	}
+}
+
+// API bodies may be plain text or JSON without status. An explicit status is
+// the final response code; informational 1xx codes cannot complete the response.
+func apiResponseStatus(body []byte) (int, error) {
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(body, &result); err != nil {
+		return http.StatusOK, nil
+	}
+	raw, exists := result["status"]
+	if !exists {
+		return http.StatusOK, nil
+	}
+	var status float64
+	if err := json.Unmarshal(raw, &status); err != nil || status < 200 || status > 599 || math.Trunc(status) != status {
+		return 0, fmt.Errorf("API response status must be an integer between 200 and 599")
+	}
+	return int(status), nil
 }
 
 // Gate only the source API's Push. A Push target may intentionally return an

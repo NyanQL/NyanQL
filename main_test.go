@@ -7363,7 +7363,6 @@ func TestPushSourceResultAcrossTransports(t *testing.T) {
 			{"created", `{"status":201}`, 201, true},
 			{"redirect", `{"status":302}`, 302, true},
 			{"upper_success", `{"status":399}`, 399, true},
-			{"below_success", `{"status":199}`, 199, false},
 			{"bad_request", `{"status":400}`, 400, false},
 			{"conflict", `{"success":false,"status":409}`, 409, false},
 			{"server_error", `{"status":500}`, 500, false},
@@ -7390,8 +7389,8 @@ func TestPushSourceResultAcrossTransports(t *testing.T) {
 				// the originating API result controls whether to start the Push.
 				const pushed = `{"success":false,"status":503,"result":"notification"}`
 				setTestSQLFiles(t, map[string]APIConfig{
-					"origin": {ParamCheck: writeTestScript(t, mark("input")+allow), Script: writeTestScript(t, mark("body")+fmt.Sprintf(`%q;`, test.body)), OutCheck: writeTestScript(t, mark("output")+fmt.Sprintf(`if(nyanAllParams.nyan_output.body!==%q) throw new Error("source result changed");`, test.body)+allow), Push: "events"},
-					"events": {ParamCheck: writeTestScript(t, mark("push_input")+allow), Script: writeTestScript(t, mark("push_body")+fmt.Sprintf(`%q;`, pushed)), OutCheck: writeTestScript(t, mark("push_output")+allow)},
+					"origin": {ParamCheck: writeTestScript(t, mark("input")+allow), Script: writeTestScript(t, mark("body")+fmt.Sprintf(`%q;`, test.body)), OutCheck: writeTestScript(t, mark("output")+fmt.Sprintf(`if(nyanAllParams.nyan_output.body!==%q || nyanAllParams.nyan_output.status!==%d || nyanAllParams.nyan_output_status!==%d) throw new Error("source result changed");`, test.body, test.status, test.status)+allow), Push: "events"},
+					"events": {ParamCheck: writeTestScript(t, mark("push_input")+allow), Script: writeTestScript(t, mark("push_body")+fmt.Sprintf(`%q;`, pushed)), OutCheck: writeTestScript(t, mark("push_output")+`if(nyanAllParams.nyan_output.status!==503 || nyanAllParams.nyan_output_status!==503) throw new Error("wrong Push output status");`+allow)},
 				})
 				conn, testHub := newPushCheckSubscriber(t, "events")
 				var body string
@@ -7418,7 +7417,7 @@ func TestPushSourceResultAcrossTransports(t *testing.T) {
 						if rec.Code != test.status || !reflect.DeepEqual(decodeTestJSONObject(t, []byte(body))["result"], want) {
 							t.Fatalf("RPC response changed: status=%d body=%s", rec.Code, body)
 						}
-					} else if rec.Code != http.StatusOK || body != test.body {
+					} else if rec.Code != test.status || body != test.body {
 						t.Fatalf("HTTP response changed: status=%d body=%s", rec.Code, body)
 					}
 				case "websocket":
@@ -7478,6 +7477,108 @@ func TestPushSourceResultAcrossTransports(t *testing.T) {
 					assertPushCheckFrame(t, conn, pushed)
 				}
 				assertPushCheckFrame(t, conn, "complete")
+			})
+		}
+	}
+}
+
+func TestAPIResponseStatusLargeNumbers(t *testing.T) {
+	if _, err := apiResponseStatus([]byte(`{"status":1e400}`)); err == nil {
+		t.Fatal("overflowing status was accepted")
+	}
+	if status, err := apiResponseStatus([]byte(`{"status":503,"result":1e400}`)); err != nil || status != 503 {
+		t.Fatalf("unrelated large number changed status: status=%d err=%v", status, err)
+	}
+}
+
+func TestAPIResponseStatusAndOutputChecks(t *testing.T) {
+	for _, route := range []string{"http", "root", "internal", "jsonrpc"} {
+		for _, test := range []struct {
+			name, body, out string
+			status          int
+			invalid, push   bool
+		}{
+			{name: "created_without_check", body: `{"status":201}`, status: 201, push: true},
+			{name: "failure_without_check", body: `{"success":false,"status":503}`, status: 503},
+			{name: "missing_status", body: `{"value":7}`, status: 200, push: true},
+			{name: "array", body: `[{"status":503}]`, status: 200, push: true},
+			{name: "output_rejected", body: `{"status":201}`, out: `({success:false,status:409,result:"denied"});`, status: 409},
+			{name: "output_exception", body: `{"status":201}`, out: `throw new Error("output check failed");`, status: 500},
+			{name: "informational", body: `{"status":199}`, status: 500, invalid: true},
+			{name: "negative", body: `{"status":-1}`, status: 500, invalid: true},
+			{name: "out_of_range", body: `{"status":600}`, status: 500, invalid: true},
+			{name: "fractional", body: `{"status":201.5}`, status: 500, invalid: true},
+			{name: "string", body: `{"status":"503"}`, status: 500, invalid: true},
+			{name: "null", body: `{"status":null}`, status: 500, invalid: true},
+			{name: "boolean", body: `{"status":true}`, status: 500, invalid: true},
+			{name: "huge_number", body: `{"status":1e100}`, status: 500, invalid: true},
+		} {
+			if route == "jsonrpc" && test.name == "array" {
+				continue // JSON-RPC requires an object result independently of status.
+			}
+			t.Run(route+"/"+test.name, func(t *testing.T) {
+				resetJavascriptInclude(t)
+				setTestSQLiteDB(t)
+				dir := t.TempDir()
+				mark := func(stage string) string {
+					return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"),%q);`, filepath.Join(dir, stage))
+				}
+				target := APIConfig{Script: writeTestScript(t, fmt.Sprintf(`%q;`, test.body)), Push: "events"}
+				if test.out != "" || test.invalid {
+					target.OutCheck = writeTestScript(t, mark("out")+`
+if (nyanAllParams.nyan_output.status !== 201 || nyanAllParams.nyan_output_status !== 201) throw new Error("wrong output status");
+`+test.out)
+				}
+				setTestSQLFiles(t, map[string]APIConfig{
+					"target": target,
+					"events": {Script: writeTestScript(t, mark("push")+`({status:200});`)},
+				})
+				if route == "internal" {
+					body, err := callNyanAPIFromVMWithSnapshot(currentAPISnapshot(), "target", nil)
+					if test.invalid || test.name == "output_exception" {
+						if err == nil {
+							t.Fatalf("expected execution error, body=%s", body)
+						}
+					} else if err != nil {
+						t.Fatal(err)
+					} else if test.out == "" && body != test.body {
+						t.Fatalf("body changed: %s", body)
+					} else if test.out != "" && decodeTestJSONObject(t, []byte(body))["status"] != float64(test.status) {
+						t.Fatalf("wrong output rejection: %s", body)
+					}
+				} else {
+					path := "/target"
+					if route == "root" {
+						path = "/?api=target"
+					}
+					req := httptest.NewRequest(http.MethodGet, path, nil)
+					rec := httptest.NewRecorder()
+					if route == "jsonrpc" {
+						req = httptest.NewRequest(http.MethodPost, "/nyan-rpc", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"target","params":{}}`))
+						handleJSONRPC(rec, req)
+					} else {
+						handleRequest(rec, req)
+					}
+					if rec.Code != test.status {
+						t.Fatalf("status=%d, want %d: %s", rec.Code, test.status, rec.Body.String())
+					}
+					if route != "jsonrpc" && !test.invalid && test.out == "" && rec.Body.String() != test.body {
+						t.Fatalf("body changed: %s", rec.Body.String())
+					}
+					if test.invalid && !strings.Contains(rec.Body.String(), "API response status") {
+						t.Fatalf("missing status validation error: %s", rec.Body.String())
+					}
+				}
+				for stage, want := range map[string]bool{"out": test.out != "", "push": test.push} {
+					data, err := os.ReadFile(filepath.Join(dir, stage))
+					if want {
+						if err != nil || string(data) != "ran" {
+							t.Fatalf("%s did not run: %q %v", stage, data, err)
+						}
+					} else if !os.IsNotExist(err) {
+						t.Fatalf("unexpected %s execution: %q %v", stage, data, err)
+					}
+				}
 			})
 		}
 	}

@@ -994,6 +994,14 @@ JSON.stringify({
 
 `script` の実行中は、NyanQLがトランザクションを開始します。`nyanRunSQL()` で実行したSQLは、同じトランザクションの中で処理されます。途中でエラーが起きた場合はロールバックされます。
 
+通常HTTP・ルートHTTPでは、本体が返したJSONオブジェクトのトップレベルの `status` をHTTP応答ステータスに使います。例えば `{"success":false,"status":503}` はHTTP 503、`{"status":201}` はHTTP 201になります。`success:false` だけではHTTPステータスは変更しません。本文の `status` は保持しますが、204・304などではHTTPの規則により本文は送信されません。
+
+`status` を省略したJSON、配列、プレーンテキストは従来どおり200です。`status` を指定する場合は200〜599の整数にしてください。文字列・`null`・小数・範囲外は実行エラー（通常HTTPでは500）になり、`outCheck`・Pushは実行しません。JSON-RPCでも同じ検証を行い、従来どおり `status` はHTTPステータスに使い、RPCの `result` からは取り除きます。
+
+`outCheck` の `nyan_output.status` と `nyan_output_status` にも本体のステータスを渡します。`nyanCallMe()`・WebSocketのAPI実行・MCP・Push先の出力チェックでも同様です。`outCheck` が通過したら本体のステータスと本文を使い、拒否したら出力チェックの結果を返してPushを止めます。MCPのHTTP応答やWebSocketの通信形式は変更しません。内部呼び出しで本体が `status:503` を返しても、それだけではJavaScript例外になりません。
+
+本体の返却ステータスは、SQL更新のロールバックを指示するものではありません。本体が正常終了した後のステータス検証や `outCheck` でエラーになっても、本体が既にコミットした更新は取り消しません。
+
 ---
 
 ## JavaScriptで使える主な変数と関数
@@ -1168,7 +1176,7 @@ API実行には通常HTTPと同じBasic認証が必要です。接続時のHTTP�
 
 ### Pushで配信される内容
 
-Pushは、呼び出し元のAPIがチェック拒否・実行エラー・`checkOnly`で終了していない場合に、返却結果を確認して開始します。応答ステータスが200〜399で、結果JSONのトップレベルの `success` が真偽値の `false` ではないことが条件です。トップレベルに数値の `status` がある場合は、その値も200〜399の整数である必要があります。例えば、HTTP自体が200でも、本文が `{"success":false,"status":200}` や `{"success":true,"status":503}` ならPushを開始しません。数値の `status` を持たない結果やプレーンテキストは、実行経路の応答ステータス（通常は200）で判定します。
+Pushは、呼び出し元のAPIがチェック拒否・実行エラー・`checkOnly`で終了していない場合に、返却結果を確認して開始します。応答ステータスが200〜399で、結果JSONのトップレベルの `success` が真偽値の `false` ではないことが条件です。トップレベルに数値の `status` がある場合は、その値も200〜399の整数である必要があります。例えば、本文が `{"success":false,"status":200}` や `{"success":true,"status":503}` ならPushを開始しません。通常HTTPでは前者のHTTPステータスは200、後者は503です。`status` を省略した結果やプレーンテキストは、実行経路の応答ステータス（通常は200）で判定します。
 
 この判定は通常HTTP・ルートHTTP・JSON-RPC・WebSocket・`nyanCallMe()`・MCP（HTTP／stdio）に適用します。停止時はPush先の入力チェック・本体・出力チェック・配信をすべて実行しません。呼び出し元の出力チェックや応答内容・HTTPステータスは、このPush判定によって変更しません。
 
