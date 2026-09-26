@@ -2297,6 +2297,129 @@ func TestCollectRequestParamsStillSplitsCommaSeparatedValues(t *testing.T) {
 	}
 }
 
+func TestCollectRequestParamsBodyOverridesQuery(t *testing.T) {
+	for _, test := range []struct {
+		name, contentType, query, body, want string
+	}{
+		{"json_merge", "application/json", "api=target&value=query&queryOnly=1", `{"value":"body","bodyOnly":2}`, `{"api":"target","value":"body","queryOnly":"1","bodyOnly":2}`},
+		{"json_empty", "application/json", "api=target&nyan_mode=checkOnly", "", `{"api":"target","nyan_mode":"checkOnly"}`},
+		{"json_null_body", "application/json", "api=target", "null", `{"api":"target"}`},
+		{"json_explicit_values", "application/json", "a=query&b=query&c=query&d=query&e=query", `{"a":null,"b":false,"c":0,"d":"","e":[]}`, `{"a":null,"b":false,"c":0,"d":"","e":[]}`},
+		{"json_preserves_types", "application/json", "tag=a&tag=b&ids=1,2&doc=%7B%22x%22%3A1%7D", `{"value":"a,b"}`, `{"tag":["a","b"],"ids":["1","2"],"doc":{"x":1},"value":"a,b"}`},
+		{"form_merge", "application/x-www-form-urlencoded", "api=target&value=query&queryOnly=1&nyan_mode=checkOnly", "value=body&bodyOnly=2&nyan_mode=checkOnly", `{"api":"target","value":"body","queryOnly":"1","bodyOnly":"2","nyan_mode":"checkOnly"}`},
+		{"form_single_over_multiple", "application/x-www-form-urlencoded", "tag=a&tag=b", "tag=c", `{"tag":"c"}`},
+		{"form_multiple_over_single", "application/x-www-form-urlencoded", "tag=a", "tag=b&tag=c", `{"tag":["b","c"]}`},
+		{"form_conversions", "application/x-www-form-urlencoded", "ids=query&doc=query", "ids=1,2&doc=%7B%22x%22%3A1%7D&empty=", `{"ids":["1","2"],"doc":{"x":1},"empty":""}`},
+		{"form_empty_override", "application/x-www-form-urlencoded", "nyan_mode=checkOnly", "nyan_mode=", `{"nyan_mode":""}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/?"+test.query+"&nyan_request=forged", strings.NewReader(test.body))
+			r.Header.Set("Content-Type", test.contentType)
+			params, err := collectRequestParams(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, ok := params["nyan_request"].(map[string]interface{})
+			if !ok || request["body"] != test.body || request["path"] != "/" {
+				t.Fatalf("actual request context lost: %#v", params["nyan_request"])
+			}
+			if !reflect.DeepEqual(request["query"], urlValuesToInterfaceMap(r.URL.Query())) {
+				t.Fatalf("query source changed: %#v", request["query"])
+			}
+			if test.contentType == "application/json" {
+				var want interface{}
+				if test.body != "" {
+					if err := json.Unmarshal([]byte(test.body), &want); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if !reflect.DeepEqual(request["json"], want) {
+					t.Fatalf("JSON source changed: %#v", request["json"])
+				}
+			} else {
+				values, err := url.ParseQuery(test.body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(request["form"], urlValuesToInterfaceMap(values)) {
+					t.Fatalf("form source changed: %#v", request["form"])
+				}
+			}
+			delete(params, "nyan_request")
+			got, err := json.Marshal(params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(decodeTestJSONObject(t, got), decodeTestJSONObject(t, []byte(test.want))) {
+				t.Fatalf("params=%s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestHTTPMergedParamsControlCheckOnly(t *testing.T) {
+	for _, route := range []string{"/target?", "/?api=target&"} {
+		for _, test := range []struct {
+			name, contentType, body string
+			checkOnly               bool
+		}{
+			{"json_query_mode", "application/json", `{"value":"body"}`, true},
+			{"json_duplicate_mode", "application/json", `{"value":"body","nyan_mode":"checkOnly"}`, true},
+			{"json_body_mode_overrides", "application/json", `{"value":"body","nyan_mode":""}`, false},
+			{"form_query_mode", "application/x-www-form-urlencoded", "value=body", true},
+			{"form_duplicate_mode", "application/x-www-form-urlencoded", "value=body&nyan_mode=checkOnly", true},
+			{"form_body_mode_overrides", "application/x-www-form-urlencoded", "value=body&nyan_mode=", false},
+		} {
+			t.Run(route+test.name, func(t *testing.T) {
+				resetJavascriptInclude(t)
+				setTestSQLiteDB(t)
+				dir := t.TempDir()
+				mark := func(stage string) string {
+					return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"), %q);`, filepath.Join(dir, stage))
+				}
+				setTestSQLFiles(t, map[string]APIConfig{
+					"target": {
+						ParamCheck: writeTestScript(t, mark("param")+`
+if (nyanAllParams.api !== "target" || nyanAllParams.tenant !== "abc" || nyanAllParams.value !== "body") throw new Error("wrong merged params");
+if (nyanRequest.query.value !== "query" || nyanRequest.query.nyan_mode !== "checkOnly") throw new Error("query context changed");
+if ((nyanRequest.json || nyanRequest.form).value !== "body") throw new Error("body context changed");
+({success:true,status:200,result:{checked:true}});`),
+						Script:   writeTestScript(t, mark("body")+`({success:true,status:200,result:{executed:true}});`),
+						OutCheck: writeTestScript(t, mark("out")+`({success:true,status:200});`),
+						Push:     "events",
+					},
+					"events": {Script: writeTestScript(t, mark("push")+`({status:200});`)},
+				})
+				r := httptest.NewRequest(http.MethodPost, route+"tenant=abc&value=query&nyan_mode=checkOnly", strings.NewReader(test.body))
+				r.Header.Set("Content-Type", test.contentType)
+				w := httptest.NewRecorder()
+				handleRequest(w, r)
+				if w.Code != 200 {
+					t.Fatalf("HTTP %d: %s", w.Code, w.Body.String())
+				}
+				result := decodeTestJSONObject(t, w.Body.Bytes())["result"]
+				key := "executed"
+				if test.checkOnly {
+					key = "checked"
+				}
+				if !reflect.DeepEqual(result, map[string]interface{}{key: true}) {
+					t.Fatalf("unexpected result: %#v", result)
+				}
+				for _, stage := range []string{"param", "body", "out", "push"} {
+					data, err := os.ReadFile(filepath.Join(dir, stage))
+					if stage == "param" || !test.checkOnly {
+						if err != nil || string(data) != "ran" {
+							t.Fatalf("%s did not run: %q %v", stage, data, err)
+						}
+					} else if !os.IsNotExist(err) {
+						t.Fatalf("%s ran during checkOnly: %q %v", stage, data, err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestPrepareQueryWithParamsScansJSONDocumentCommentDefaults(t *testing.T) {
 	query, args := prepareQueryWithParams(
 		`INSERT INTO hoge2 VALUES /*doc*/{"id":9, "name":"たまこ"};`,

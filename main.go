@@ -4206,6 +4206,8 @@ func isCheckOnlyMode(params map[string]interface{}) bool {
 }
 
 func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
+	params := make(map[string]interface{})
+	mergeRequestParameterValues(params, r.URL.Query())
 	contentType := r.Header.Get("Content-Type")
 	if strings.HasPrefix(contentType, "application/json") {
 		body, err := io.ReadAll(r.Body)
@@ -4219,11 +4221,11 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 			return nil, fmt.Errorf("error parsing JSON data: %v", err)
 		}
 
-		if data == nil {
-			data = make(map[string]interface{})
+		for key, value := range data {
+			params[key] = value
 		}
-		data["nyan_request"] = newScriptHTTPRequestContext(r, body)
-		return data, nil
+		params["nyan_request"] = newScriptHTTPRequestContext(r, body)
+		return params, nil
 	}
 
 	// Capture only the body consumed by the existing form parser.
@@ -4237,8 +4239,19 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 	if err := r.ParseForm(); err != nil {
 		return nil, fmt.Errorf("error parsing form data: %v", err)
 	}
-	params := make(map[string]interface{})
-	for key, values := range r.Form {
+	// PostForm contains only body fields, so a body value replaces the query
+	// value instead of combining values from the two sources into an array.
+	mergeRequestParameterValues(params, r.PostForm)
+	params["nyan_request"] = newScriptHTTPRequestContext(r, formBody.Bytes())
+	return params, nil
+}
+
+// Preserve NyanQL's value conversions independently for each input source.
+func mergeRequestParameterValues(params map[string]interface{}, source url.Values) {
+	for key, values := range source {
+		if len(values) == 0 {
+			continue
+		}
 		if len(values) > 1 {
 			params[key] = values
 			continue
@@ -4263,8 +4276,6 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 			params[key] = val
 		}
 	}
-	params["nyan_request"] = newScriptHTTPRequestContext(r, formBody.Bytes())
-	return params, nil
 }
 
 func handlePublicRequest(w http.ResponseWriter, r *http.Request, apiKey string, requestedPath string, apiConfig APIConfig) {

@@ -550,6 +550,12 @@ WHERE id IN (/*ids*/1);
 
 GETのクエリ文字列では、`ids=1,2,3` のようにカンマ区切りで渡すこともできます。
 
+通常HTTP・ルートHTTPの入力は、URLクエリを先に取り込み、JSON本文またはURLエンコードされたフォーム本文の同名項目で上書きします。本文にないクエリ項目は保持します。例えば `POST /?api=example&tenant=abc&value=query` に `{"value":"body"}` を送ると、`api=example`・`tenant=abc`・`value=body` になります。本文の空文字列・`null`なども上書きする値として扱います。
+
+クエリとフォーム本文に同じ名前があっても、それらを連結して配列にはしません。同じ入力元の `tag=a&tag=b` は配列のまま保持し、カンマ区切りやJSON形式の値の変換も各入力元で行います。JSON本文の文字列はカンマで分割しません。`nyanRequest.query`・`nyanRequest.form`・`nyanRequest.json` には統合前の入力情報を保持します。
+
+`nyan_mode` も本文を優先します。クエリだけの `nyan_mode=checkOnly` はJSON本文があっても有効で、クエリとフォーム本文の両方に1件ずつ指定した場合も文字列の `checkOnly` として扱います。本文に `nyan_mode:""`（フォームでは `nyan_mode=`）を指定すると、クエリの指定を上書きして通常実行になります。
+
 ### JSONパラメータ
 
 リクエスト値がオブジェクトの場合、NyanQLはJSON文字列に変換して、SQLの1つの値として渡します。PostgreSQLのJSONB列などへ渡すときに使えます。
