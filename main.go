@@ -8921,7 +8921,11 @@ func registerNyanCryptographicFunctions(vm *goja.Runtime) {
 		},
 	})
 	vm.Set("nyanRandomBase64URL", func(call goja.FunctionCall) goja.Value {
-		value, err := secureRandomBase64URL(int(call.Argument(0).ToInteger()))
+		size := 32
+		if len(call.Arguments) > 0 {
+			size = int(call.Argument(0).ToInteger())
+		}
+		value, err := secureRandomBase64URL(size)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
@@ -8950,8 +8954,8 @@ const (
 )
 
 func secureRandomBase64URL(size int) (string, error) {
-	if size < 16 || size > 128 {
-		return "", fmt.Errorf("random byte size must be between 16 and 128")
+	if size < 1 || size > 1024 {
+		return "", fmt.Errorf("random byte size must be between 1 and 1024")
 	}
 	value := make([]byte, size)
 	if _, err := io.ReadFull(rand.Reader, value); err != nil {

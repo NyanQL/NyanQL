@@ -3996,7 +3996,7 @@ func TestGenericCryptographicPrimitives(t *testing.T) {
 	if err != nil || len(decoded) != 32 {
 		t.Fatalf("random value decode = %d bytes, error=%v, value=%q", len(decoded), err, first)
 	}
-	for _, size := range []int{15, 129} {
+	for _, size := range []int{-1, 0, 1025} {
 		if _, err := secureRandomBase64URL(size); err == nil {
 			t.Fatalf("secureRandomBase64URL(%d) error = nil", size)
 		}
@@ -4028,6 +4028,66 @@ func TestGenericCryptographicPrimitives(t *testing.T) {
 	}
 	if valid, err := verifyPasswordArgon2ID("password", "not-a-phc-string"); err == nil || valid {
 		t.Fatalf("verifyPasswordArgon2ID(malformed) = %t, error=%v", valid, err)
+	}
+}
+
+func TestRandomBase64URLJavaScriptArguments(t *testing.T) {
+	for _, function := range []string{"nyanRandomBase64URL", "nyanCrypto.randomBase64URL"} {
+		t.Run(function, func(t *testing.T) {
+			for _, size := range []int{1, 15, 16, 32, 128, 129, 256, 1024} {
+				t.Run(fmt.Sprintf("size=%d", size), func(t *testing.T) {
+					vm := goja.New()
+					registerNyanCryptographicFunctions(vm)
+					value, err := vm.RunString(fmt.Sprintf("%s(%d)", function, size))
+					if err != nil {
+						t.Fatal(err)
+					}
+					encoded, ok := value.Export().(string)
+					if !ok {
+						t.Fatalf("result is not a string: %#v", value.Export())
+					}
+					decoded, err := base64.RawURLEncoding.Strict().DecodeString(encoded)
+					if err != nil || len(decoded) != size || len(encoded) != base64.RawURLEncoding.EncodedLen(size) || strings.ContainsAny(encoded, "=+/\r\n") {
+						t.Fatalf("unexpected Base64URL: %q, decoded size=%d, error=%v", encoded, len(decoded), err)
+					}
+				})
+			}
+			for _, argument := range []string{"0", "-1", "1025", "undefined", "null"} {
+				t.Run("invalid="+argument, func(t *testing.T) {
+					vm := goja.New()
+					registerNyanCryptographicFunctions(vm)
+					value, err := vm.RunString(fmt.Sprintf(`
+try { %s(%s); false; }
+catch (error) { String(error).includes("between 1 and 1024"); }
+`, function, argument))
+					if err != nil || !value.ToBoolean() {
+						t.Fatalf("expected catchable range exception, value=%v, error=%v", value, err)
+					}
+				})
+			}
+		})
+	}
+	t.Run("default", func(t *testing.T) {
+		vm := goja.New()
+		registerNyanCryptographicFunctions(vm)
+		value, err := vm.RunString("nyanRandomBase64URL()")
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := base64.RawURLEncoding.Strict().DecodeString(value.String())
+		if err != nil || len(decoded) != 32 || len(value.String()) != 43 {
+			t.Fatalf("default result=%q, decoded size=%d, error=%v", value.String(), len(decoded), err)
+		}
+	})
+	for _, arguments := range []string{"", "32, 64"} {
+		t.Run("crypto_argument_count="+arguments, func(t *testing.T) {
+			vm := goja.New()
+			registerNyanCryptographicFunctions(vm)
+			_, err := vm.RunString("nyanCrypto.randomBase64URL(" + arguments + ")")
+			if err == nil || !strings.Contains(err.Error(), "requires exactly 1 argument") {
+				t.Fatalf("expected argument count exception, error=%v", err)
+			}
+		})
 	}
 }
 
