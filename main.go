@@ -7944,11 +7944,12 @@ func execCommand(commandLine string) (*ExecResult, error) {
 	}
 
 	if err != nil {
+		// A command's nonzero exit is a result the script can inspect.
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			result.ExitCode = exitErr.ExitCode()
-		} else {
-			result.ExitCode = -1
+			return result, nil
 		}
+		result.ExitCode = -1
 		return result, fmt.Errorf("failed to exec: %w", err)
 	}
 

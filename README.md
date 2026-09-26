@@ -1014,7 +1014,7 @@ JSON.stringify({
 | `nyanSaveFile(base64, path)` | Base64文字列をデコードし、一番親の `api.json` のフォルダを基準に保存します。 |
 | `sha256(text)` | SHA-256のハッシュ文字列を返します。 |
 | `sha1(text)` | SHA-1のハッシュ文字列を返します。 |
-| `nyanHostExec(command)` | OSのコマンドを実行します。利用する場合は十分に注意してください。 |
+| `nyanHostExec(command)` | OSコマンドを実行し、`success`・`exit_code`・`stdout`・`stderr`を持つオブジェクトを返します。 |
 
 `nyanSaveFile()`・`nyanGetFile()`・`nyanRunSQL()` に渡す相対パスは、起動時に指定した一番親の `api.json` があるフォルダを基準にします。include先のAPIや `nyanCallMe()` で呼び出したAPI、`paramCheck`・`outCheck` の中でも同じ基準です。絶対パスはそのまま使用します。
 
@@ -1023,6 +1023,19 @@ JSON.stringify({
 `api.json` 内の `script`・`sql`・`paramCheck`・`outCheck` などの設定値は、その定義を書いたJSONファイルのフォルダ基準です。JavaScript関数に渡すパスとは区別してください。
 
 `nyanHostExec` は、サーバ上でOSコマンドを実行できる強い機能です。公開環境や、外部から入力を受ける処理では、安易に使わないでください。
+
+`nyanHostExec()` はNyan8と同様に、コマンドの非0終了も例外にせず、`success:false`・実際の `exit_code`・取得した `stdout` / `stderr` を返します。終了コード0なら `success:true` で、標準エラーに出力があっても成功扱いです。シェル内でコマンドが見つからない場合も非0終了の結果になります。引数不足やシェル自体を起動できない場合は、引き続きJavaScript例外になります。
+
+```javascript
+const execution = nyanHostExec("some-command");
+if (!execution.success) {
+  // 失敗時にスクリプトを中断したい場合は明示的に例外を投げます。
+  throw new Error(execution.stderr || `終了コード: ${execution.exit_code}`);
+}
+JSON.stringify(execution);
+```
+
+以前は非0終了でスクリプトが中断していたため、既存の呼び出しでは戻り値の `success` / `exit_code` を確認してください。非0終了だけではAPIの処理やトランザクションを自動中断しません。結果をそのままAPIの応答にすると、既存のPush判定がトップレベルの `success:false` を検出してPushを停止します。スクリプトが失敗を処理して最終的に `success:true` の応答を返した場合は、その最終応答でPushを判定します。
 
 ### リクエスト情報と内部呼び出し・Push
 

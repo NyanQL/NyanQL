@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -3676,11 +3677,146 @@ func TestExecCommandReportsSuccessAndFailure(t *testing.T) {
 	}
 
 	result, err = execCommand("exit 7")
-	if err == nil {
-		t.Fatal("execCommand(failure) error = nil")
+	if err != nil {
+		t.Fatalf("execCommand(nonzero exit) error = %v", err)
 	}
 	if result.Success || result.ExitCode != 7 {
 		t.Fatalf("failure result = %#v", result)
+	}
+}
+
+func hostExecTestCommand(exitCode int) string {
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf("echo processing& echo problem 1>&2& exit /b %d", exitCode)
+	}
+	return fmt.Sprintf("echo processing; echo problem >&2; exit %d", exitCode)
+}
+
+func TestNyanHostExecReturnsCommandResults(t *testing.T) {
+	for _, exitCode := range []int{0, 1, 7} {
+		t.Run(fmt.Sprintf("exit_%d", exitCode), func(t *testing.T) {
+			vm := goja.New()
+			registerNyanFuncs(vm, nil, nil, nil)
+			value, err := vm.RunString(fmt.Sprintf(`nyanHostExec(%q);`, hostExecTestCommand(exitCode)))
+			if err != nil {
+				t.Fatalf("command result became an exception: %v", err)
+			}
+			result, ok := value.Export().(map[string]interface{})
+			if !ok {
+				t.Fatalf("result is not an object: %#v", value.Export())
+			}
+			if len(result) != 4 || result["success"] != (exitCode == 0) || result["exit_code"] != float64(exitCode) ||
+				strings.TrimSpace(result["stdout"].(string)) != "processing" || strings.TrimSpace(result["stderr"].(string)) != "problem" {
+				t.Fatalf("unexpected result: %#v", result)
+			}
+		})
+	}
+	t.Run("command_not_found", func(t *testing.T) {
+		vm := goja.New()
+		registerNyanFuncs(vm, nil, nil, nil)
+		value, err := vm.RunString(`const result = nyanHostExec("nyanql_missing_command_643acf5e");
+result.success === false && result.exit_code !== 0 && result.stderr.length > 0;`)
+		if err != nil || !value.ToBoolean() {
+			t.Fatalf("missing command result=%v err=%v", value, err)
+		}
+	})
+}
+
+func TestNyanHostExecInvocationErrorsRemainExceptions(t *testing.T) {
+	t.Run("missing_argument", func(t *testing.T) {
+		vm := goja.New()
+		registerNyanFuncs(vm, nil, nil, nil)
+		if _, err := vm.RunString(`nyanHostExec();`); err == nil || !strings.Contains(err.Error(), "No command provided") {
+			t.Fatalf("missing argument error=%v", err)
+		}
+	})
+	t.Run("shell_unavailable", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows may find cmd in system directories independently of PATH")
+		}
+		t.Setenv("PATH", t.TempDir())
+		result, err := execCommand("echo test")
+		if err == nil || result.Success || result.ExitCode != -1 {
+			t.Fatalf("shell launch failure: result=%#v err=%v", result, err)
+		}
+		vm := goja.New()
+		registerNyanFuncs(vm, nil, nil, nil)
+		if _, err := vm.RunString(`nyanHostExec("echo test");`); err == nil || !strings.Contains(err.Error(), "failed to exec") {
+			t.Fatalf("shell launch failure was not an exception: %v", err)
+		}
+	})
+}
+
+func TestNyanHostExecAPIResultControlsPush(t *testing.T) {
+	for _, route := range []string{"http", "nyanCallMe"} {
+		for _, test := range []struct {
+			name          string
+			exitCode      int
+			handleFailure bool
+		}{
+			{"success", 0, false},
+			{"failure", 7, false},
+			{"handled_failure", 7, true},
+		} {
+			t.Run(route+"/"+test.name, func(t *testing.T) {
+				resetJavascriptInclude(t)
+				setTestSQLiteDB(t)
+				oldHub := hub
+				hub = NewHub()
+				t.Cleanup(func() { hub = oldHub })
+				dir := t.TempDir()
+				mark := func(stage string) string {
+					return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"), %q);`, filepath.Join(dir, stage))
+				}
+				body := fmt.Sprintf(`const result = nyanHostExec(%q);`, hostExecTestCommand(test.exitCode)) + mark("after")
+				if test.handleFailure {
+					body += `({success:true,handled_exit:result.exit_code});`
+				} else {
+					body += `JSON.stringify(result);`
+				}
+				setTestSQLFiles(t, map[string]APIConfig{
+					"origin": {Script: writeTestScript(t, body), OutCheck: writeTestScript(t, mark("out")+`({success:true,status:200});`), Push: "events"},
+					"events": {Script: writeTestScript(t, mark("push")+`({success:true});`)},
+				})
+				var response map[string]interface{}
+				if route == "http" {
+					w := httptest.NewRecorder()
+					handleRequest(w, httptest.NewRequest(http.MethodGet, "/origin", nil))
+					if w.Code != http.StatusOK {
+						t.Fatalf("HTTP %d: %s", w.Code, w.Body.String())
+					}
+					response = decodeTestJSONObject(t, w.Body.Bytes())
+				} else {
+					vm := goja.New()
+					registerNyanFuncs(vm, currentAPISnapshot(), nil, nil)
+					v, err := vm.RunString(`JSON.stringify(nyanCallMe({api:"origin"}));`)
+					if err != nil {
+						t.Fatal(err)
+					}
+					response = decodeTestJSONObject(t, []byte(v.String()))
+				}
+				wantSuccess := test.exitCode == 0 || test.handleFailure
+				if response["success"] != wantSuccess {
+					t.Fatalf("response=%#v", response)
+				}
+				codeKey := "exit_code"
+				if test.handleFailure {
+					codeKey = "handled_exit"
+				}
+				if response[codeKey] != float64(test.exitCode) {
+					t.Fatalf("exit code lost: %#v", response)
+				}
+				for stage, want := range map[string]bool{"after": true, "out": true, "push": wantSuccess} {
+					_, err := os.Stat(filepath.Join(dir, stage))
+					if err != nil && !os.IsNotExist(err) {
+						t.Fatal(err)
+					}
+					if (err == nil) != want {
+						t.Fatalf("stage %s executed=%t want %t", stage, err == nil, want)
+					}
+				}
+			})
+		}
 	}
 }
 
