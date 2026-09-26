@@ -7784,7 +7784,104 @@ WHERE
 	}
 }
 
-func TestPushParamCheckOnlyAPIExecutesOutCheck(t *testing.T) {
+func TestAPIWithoutBody(t *testing.T) {
+	for _, route := range []string{"http", "root", "callme"} {
+		for _, test := range []struct {
+			name, check string
+			checkOnly   bool
+			status      int
+		}{
+			{name: "no_check", status: 400},
+			{name: "allowed", check: `({success:true,status:200,result:{checked:true}});`, status: 400},
+			{name: "denied", check: `({success:false,status:403,result:{checked:true}});`, status: 403},
+			{name: "check_only", check: `({success:true,status:200,result:{checked:true}});`, checkOnly: true, status: 200},
+			{name: "check_only_missing", checkOnly: true, status: 404},
+		} {
+			t.Run(route+"/"+test.name, func(t *testing.T) {
+				resetJavascriptInclude(t)
+				dir := t.TempDir()
+				marker := func(stage string) string {
+					return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"), %q);`, filepath.Join(dir, stage))
+				}
+				target := APIConfig{
+					OutCheck: writeTestScript(t, marker("out")+`({success:true,status:200});`),
+					Push:     "events",
+				}
+				if test.check != "" {
+					target.ParamCheck = writeTestScript(t, marker("param")+test.check)
+				}
+				setTestSQLFiles(t, map[string]APIConfig{
+					"target": target,
+					"events": {Script: writeTestScript(t, marker("push")+`({success:true,status:200});`)},
+				})
+				var body map[string]interface{}
+				if route == "callme" {
+					vm := goja.New()
+					registerNyanFuncs(vm, currentAPISnapshot(), nil, nil)
+					argument := `{"api":"target"}`
+					if test.checkOnly {
+						argument = `{"api":"target","nyan_mode":"checkOnly"}`
+					}
+					value, err := vm.RunString("JSON.stringify(nyanCallMe(" + argument + "))")
+					if test.status == 400 || test.status == 404 {
+						want := "No script or SQL defined"
+						if test.status == 404 {
+							want = "No check script"
+						}
+						if err == nil || !strings.Contains(err.Error(), want) {
+							t.Fatalf("expected JavaScript exception %q, value=%v err=%v", want, value, err)
+						}
+					} else {
+						if err != nil {
+							t.Fatal(err)
+						}
+						body = decodeTestJSONObject(t, []byte(value.String()))
+					}
+				} else {
+					url := "/target?value=1"
+					if route == "root" {
+						url = "/?api=target"
+					}
+					if test.checkOnly {
+						url += "&nyan_mode=checkOnly"
+					}
+					req := httptest.NewRequest(http.MethodGet, url, nil)
+					req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+					rec := httptest.NewRecorder()
+					unifiedHandler(rec, req)
+					if rec.Code != test.status {
+						t.Fatalf("status=%d, want %d: %s", rec.Code, test.status, rec.Body.String())
+					}
+					body = decodeTestJSONObject(t, rec.Body.Bytes())
+				}
+				if body != nil {
+					if body["status"] != float64(test.status) || body["success"] != (test.status == 200) {
+						t.Fatalf("unexpected response: %#v", body)
+					}
+					if test.status == 200 || test.status == 403 {
+						if !reflect.DeepEqual(body["result"], map[string]interface{}{"checked": true}) {
+							t.Fatalf("check result lost: %#v", body)
+						}
+					} else if body["result"] != nil || body["error"] == nil {
+						t.Fatalf("expected error without check result: %#v", body)
+					}
+				}
+				for _, stage := range []string{"param", "out", "push"} {
+					data, err := os.ReadFile(filepath.Join(dir, stage))
+					if stage == "param" && test.check != "" {
+						if err != nil || string(data) != "ran" {
+							t.Fatalf("paramCheck did not run: data=%q err=%v", data, err)
+						}
+					} else if !os.IsNotExist(err) {
+						t.Fatalf("unexpected %s execution: data=%q err=%v", stage, data, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestPushRejectsAPIWithoutBody(t *testing.T) {
 	resetJavascriptInclude(t)
 	setTestSQLiteDB(t)
 	dir := t.TempDir()
@@ -7804,14 +7901,11 @@ nyanSaveFile(nyanBase64Encode("checked"), %q);
 			conn, testHub := newPushCheckSubscriber(t, "events")
 			performPush(currentAPISnapshot(), APIConfig{Push: "events"}, map[string]interface{}{})
 			data, err := os.ReadFile(marker)
-			if err != nil || string(data) != "checked" {
-				t.Fatalf("outCheck did not run: marker=%q err=%v", data, err)
+			if !os.IsNotExist(err) {
+				t.Fatalf("outCheck ran without an API body: marker=%q err=%v", data, err)
 			}
 			const sentinel = "param-only-push-complete"
 			testHub.Broadcast("events", []byte(sentinel))
-			if !reject {
-				assertPushCheckFrame(t, conn, body)
-			}
 			assertPushCheckFrame(t, conn, sentinel)
 		})
 	}
@@ -8287,7 +8381,8 @@ func TestWebSocketAPIChecks(t *testing.T) {
 		{name: "output_rejected", paramResult: allow, outResult: `({success:false,status:409,error:"denied"});`, wantBody: true, wantOut: true, wantStatus: 409},
 		{name: "output_exception", paramResult: allow, outResult: `throw new Error("output error");`, wantBody: true, wantOut: true, wantStatus: 500},
 		{name: "output_export_exception", paramResult: allow, outResult: `({get success(){throw new Error("output export error");}});`, wantBody: true, wantOut: true, wantStatus: 500},
-		{name: "param_only_output_rejected", paramResult: allow, outResult: `({success:false,status:409,error:"denied"});`, paramOnly: true, wantOut: true, wantStatus: 409},
+		{name: "missing_body", paramResult: allow, outResult: `({success:false,status:409,error:"denied"});`, paramOnly: true, wantStatus: 500},
+		{name: "check_only_without_body", paramResult: allow, outResult: allow, paramOnly: true, checkOnly: true, wantStatus: 200},
 		{name: "check_only", paramResult: allow, outResult: allow, checkOnly: true, wantStatus: 200},
 	} {
 		t.Run(test.name, func(t *testing.T) {

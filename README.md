@@ -871,6 +871,8 @@ if (!nyanAllParams.id) {
 
 `paramCheck` の戻り値は、JSON文字列またはオブジェクトにしてください。NyanQLは、そのJSONを読んで、`success` が `true` なら次の処理へ進みます。`false` の場合は、SQLやscriptを実行せずにエラーを返します。
 
+通常のAPI実行には本体の `script` または `sql` が必要です。入力チェック通過後、両方が未設定なら通常HTTP・ルートHTTPではHTTP 400を返し、`outCheck`・Pushは実行しません。`paramCheck` の成功結果を本体の代わりには使用しません。`nyanCallMe()` ではJavaScript例外になり、MCP・WebSocketでも実行エラーとなります。Push先のAPIに本体がない場合も配信しません。入力チェックの拒否結果と、明示的な `nyan_mode=checkOnly` の結果は、本体がなくても従来どおり返します。
+
 拒否結果には `result` と `error` の両方を指定できます。`result` は呼び出し元で使うデータや補足情報、`error` はエラーの詳細に使えます。失敗の判定はメッセージの有無ではなく `success` で行います。
 
 ```javascript

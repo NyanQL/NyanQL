@@ -5379,13 +5379,10 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 			w.Write([]byte(jsonStr))
 			return
 		}
-		if len(apiConfig.SQL) == 0 && apiConfig.Script == "" {
-			performPushForResponse(snapshot, apiConfig, params, statusCode, []byte(jsonStr))
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(statusCode)
-			w.Write([]byte(jsonStr))
-			return
-		}
+	}
+	if apiConfig.Script == "" && len(apiConfig.SQL) == 0 {
+		sendJSONError(w, fmt.Sprintf("No script or SQL defined for API %s", apiKey), http.StatusBadRequest)
+		return
 	}
 
 	if apiConfig.Script != "" {
@@ -7599,9 +7596,6 @@ func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allPara
 		if result.CheckOnly {
 			return result, nil
 		}
-		if apiConfig.Script == "" && len(apiConfig.SQL) == 0 {
-			statusCode = checkStatus
-		}
 	}
 	switch {
 	case apiConfig.Script != "":
@@ -7616,7 +7610,7 @@ func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allPara
 			return result, err
 		}
 		result.Body = string(body)
-	case checkScriptPath == "":
+	default:
 		return result, fmt.Errorf("No script or SQL defined for API %s", apiName)
 	}
 	if handled, _, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, statusCode, "application/json", []byte(result.Body)); handled {
