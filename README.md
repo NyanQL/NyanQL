@@ -1045,6 +1045,7 @@ JSON.stringify({
 | `nyanBase64Decode(base64)` | Base64を文字列に戻します。 |
 | `nyanRandomBase64URL(bytes)` | 1〜1024バイトの乱数を、末尾の `=` なしのBase64URL文字列として返します。引数省略時は32バイトです。 |
 | `nyanCrypto.randomBase64URL(bytes)` | 同じ形式の乱数を生成します。1〜1024バイトの指定が必須です。 |
+| `nyanSHA256Base64URL(value)` | 文字列のSHA-256を、パディングなしのBase64URL文字列で返します。引数省略時は `TypeError`。明示した空文字列は有効です。 |
 | `nyanSaveFile(base64, path)` | Base64文字列をデコードし、一番親の `api.json` のフォルダを基準に保存します。 |
 | `sha256(text)` | SHA-256のハッシュ文字列を返します。 |
 | `sha1(text)` | SHA-1のハッシュ文字列を返します。 |

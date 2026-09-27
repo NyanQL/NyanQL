@@ -4712,6 +4712,37 @@ JSON.stringify({transactionType:typeof nyanTx, value:rows[0].value});
 	}
 }
 
+func TestNyanSHA256Base64URLArguments(t *testing.T) {
+	vm := goja.New()
+	registerNyanCryptographicFunctions(vm)
+	value, err := vm.RunString(`
+(function () {
+  try { nyanSHA256Base64URL(); }
+  catch (error) {
+    return error instanceof TypeError && error.message === "nyanSHA256Base64URL requires a string";
+  }
+  return false;
+})()`)
+	if err != nil || !value.ToBoolean() {
+		t.Fatalf("missing argument must throw a catchable TypeError: value=%v error=%v", value, err)
+	}
+	for _, tc := range []struct{ argument, want string }{
+		{`""`, "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"},
+		{`"abc"`, "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0"},
+		{`undefined`, "6wRdeNJzEHNIsDAMAdKbdVLWIqu8b6-Bs-xVNZqplQw"},
+		{`null`, "dCNOmK_nSY-12vHzasLXiswzlGT5UHA7jAGYkvmCuQs"},
+		{`"dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"`, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"},
+		{`"abc", "ignored"`, "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0"},
+	} {
+		t.Run(tc.argument, func(t *testing.T) {
+			value, err := vm.RunString("nyanSHA256Base64URL(" + tc.argument + ")")
+			if err != nil || value.String() != tc.want {
+				t.Fatalf("hash=%v error=%v, want %q", value, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestGenericCryptographicPrimitives(t *testing.T) {
 	first, err := secureRandomBase64URL(32)
 	if err != nil {

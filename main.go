@@ -9045,7 +9045,12 @@ func registerNyanCryptographicFunctions(vm *goja.Runtime) {
 		}
 		return vm.ToValue(value)
 	})
-	vm.Set("nyanSHA256Base64URL", func(call goja.FunctionCall) goja.Value { return vm.ToValue(sha256Base64URL(call.Argument(0).String())) })
+	vm.Set("nyanSHA256Base64URL", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			panic(vm.NewTypeError("nyanSHA256Base64URL requires a string"))
+		}
+		return vm.ToValue(sha256Base64URL(call.Argument(0).String()))
+	})
 	vm.Set("nyanArgon2idHash", func(call goja.FunctionCall) goja.Value {
 		value, err := hashPasswordArgon2ID(call.Argument(0).String())
 		if err != nil {
