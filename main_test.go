@@ -4875,6 +4875,106 @@ func TestMCPCheckOnlyAcrossTransports(t *testing.T) {
 	}
 }
 
+func TestMCPValidatesResultBeforePush(t *testing.T) {
+	for _, transport := range []string{"streamable_http", "stdio"} {
+		for _, test := range []struct {
+			name, body, wantError string
+		}{
+			{name: "plain_text", body: "not JSON", wantError: "Tool returned invalid JSON"},
+			{name: "empty", wantError: "Tool returned invalid JSON"},
+			{name: "incomplete_object", body: `{"result":`, wantError: "Tool returned invalid JSON"},
+			{name: "trailing_data", body: `{} {}`, wantError: "Tool returned invalid JSON"},
+			{name: "object", body: `{"success":true,"result":"ok"}`},
+			{name: "array", body: `[1,"ok"]`},
+			{name: "number", body: `123`},
+			{name: "boolean", body: `true`},
+			{name: "null", body: `null`},
+			{name: "json_string", body: `"ok"`},
+			{name: "oversized", body: `"` + strings.Repeat("x", maxConfiguredHTTPResponseBytes/2) + `"`, wantError: "Tool result is too large"},
+		} {
+			t.Run(transport+"/"+test.name, func(t *testing.T) {
+				resetJavascriptInclude(t)
+				setTestSQLiteDB(t)
+				oldHub := hub
+				hub = NewHub()
+				t.Cleanup(func() { hub = oldHub })
+				dir := t.TempDir()
+				mark := func(stage string) string {
+					return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"), %q);`, filepath.Join(dir, stage))
+				}
+				const allow = `({success:true,status:200});`
+				snapshot := newAPIConfigSnapshot(map[string]APIConfig{
+					"tool": {
+						Script:   writeTestScript(t, mark("body")+fmt.Sprintf(`%q;`, test.body)),
+						OutCheck: writeTestScript(t, mark("out")+allow),
+						Push:     "events",
+					},
+					"events": {
+						ParamCheck: writeTestScript(t, mark("push_param")+allow),
+						Script:     writeTestScript(t, mark("push_body")+allow),
+						OutCheck:   writeTestScript(t, mark("push_out")+allow),
+					},
+				}, "", [sha256.Size]byte{})
+				server := APIConfig{Type: apiTypeMCP, Transport: transport, ProtocolVersions: []string{mcpProtocolVersion20251125}, Tools: []MCPToolConfig{{API: "tool"}}}
+				const message = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":{}}}`
+				var response map[string]interface{}
+				if transport == "stdio" {
+					state := mcpStdioReady
+					var reply bool
+					response, reply = handleMCPStdioMessage(snapshot, "test_mcp", server, &state, []byte(message))
+					if !reply {
+						t.Fatal("stdio did not reply")
+					}
+				} else {
+					rec := performTestMCPRequest(t, snapshot, server, message, "")
+					if rec.Code != http.StatusOK {
+						t.Fatalf("HTTP status=%d", rec.Code)
+					}
+					response = decodeTestJSONObject(t, rec.Body.Bytes())
+				}
+				encoded, err := json.Marshal(response)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var envelope struct {
+					Error  json.RawMessage `json:"error"`
+					Result struct {
+						IsError bool `json:"isError"`
+						Content []struct {
+							Type string `json:"type"`
+							Text string `json:"text"`
+						} `json:"content"`
+					} `json:"result"`
+				}
+				if err := json.Unmarshal(encoded, &envelope); err != nil {
+					t.Fatal(err)
+				}
+				if len(envelope.Error) != 0 || envelope.Result.IsError != (test.wantError != "") {
+					t.Fatalf("unexpected MCP error: %s", encoded)
+				}
+				wantText := test.body
+				if test.wantError != "" {
+					wantText = test.wantError
+				}
+				content := envelope.Result.Content
+				if len(content) != 1 || content[0].Type != "text" || content[0].Text != wantText {
+					t.Fatal("MCP result text differs from expected body or error")
+				}
+				for _, stage := range []string{"body", "out", "push_param", "push_body", "push_out"} {
+					_, err := os.Stat(filepath.Join(dir, stage))
+					if err != nil && !os.IsNotExist(err) {
+						t.Fatal(err)
+					}
+					want := stage == "body" || stage == "out" || test.wantError == ""
+					if (err == nil) != want {
+						t.Errorf("%s executed=%v, want %v", stage, err == nil, want)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestMCPCheckOnlyStillAuthenticates(t *testing.T) {
 	for _, test := range []struct {
 		name, token string

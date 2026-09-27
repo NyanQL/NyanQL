@@ -1499,10 +1499,11 @@ func executeMCPToolForStdio(snapshot *APIConfigSnapshot, tool MCPToolConfig, arg
 		delete(params, key)
 	}
 	params["mcp_principal"] = map[string]interface{}{"user_id": "local-process", "username": "local-process", "client_id": "stdio", "transport": "stdio", "scope": strings.Join(scopes, " "), "scopes": scopes}
-	resultJSON, err := callNyanAPIFromVMWithSnapshot(snapshot, tool.API, params)
+	execution, err := executeAPIWithSnapshot(snapshot, tool.API, params)
 	if err != nil {
 		return nil, fmt.Errorf("Tool execution failed")
 	}
+	resultJSON := execution.Body
 	if len(resultJSON) > maxConfiguredHTTPResponseBytes/2 {
 		return nil, fmt.Errorf("Tool result is too large")
 	}
@@ -1516,6 +1517,10 @@ func executeMCPToolForStdio(snapshot *APIConfigSnapshot, tool MCPToolConfig, arg
 		if success, ok := object["success"].(bool); ok && !success {
 			result["isError"] = true
 		}
+	}
+	// Validate the MCP result before starting this API's Push.
+	if !execution.CheckRejected && !execution.CheckOnly {
+		performPushForResponse(snapshot, apiConfig, execution.Params, execution.Status, []byte(resultJSON))
 	}
 	return result, nil
 }
@@ -1899,12 +1904,13 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 	if principal != nil {
 		executionParams["mcp_principal"] = cloneJSONCompatibleValue(principal)
 	}
-	resultJSON, err := callNyanAPIFromVMWithSnapshot(snapshot, toolConfig.API, executionParams)
+	execution, err := executeAPIWithSnapshot(snapshot, toolConfig.API, executionParams)
 	if err != nil {
 		logServiceError(slog.LevelError, "mcp_tool_execution_failed", err, "tool", toolConfig.Name)
 		writeMCPResult(w, request.ID, mcpToolErrorResult("Tool execution failed", nil))
 		return
 	}
+	resultJSON := execution.Body
 	if len(resultJSON) > maxConfiguredHTTPResponseBytes/2 {
 		writeMCPResult(w, request.ID, mcpToolErrorResult("Tool result is too large", nil))
 		return
@@ -1924,6 +1930,10 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 		if success, exists := resultObject["success"].(bool); exists && !success {
 			toolResult["isError"] = true
 		}
+	}
+	// Validate the MCP result before starting this API's Push.
+	if !execution.CheckRejected && !execution.CheckOnly {
+		performPushForResponse(snapshot, apiConfig, execution.Params, execution.Status, []byte(resultJSON))
 	}
 	writeMCPResult(w, request.ID, toolResult)
 }
