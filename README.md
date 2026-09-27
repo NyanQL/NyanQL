@@ -409,6 +409,8 @@ public定義がmount `sub` のinclude先にある場合、公開エンドポイ�
 
 `type: "public"` はBasic認証を通さずに配信します。認証や認可が必要なファイル公開では、`paramCheck` を指定してください。`paramCheck` と `outCheck` では、公開エンドポイント名とリクエストされた相対パスを参照できます。
 
+通常のファイル要求では、`paramCheck` が未設定なら配信処理へ進みます。設定されている場合は `success:true` で通過し、入力チェックの `status` が201や503でも配信を止めません。`success:false` ならチェック結果を返し、ファイル配信と `outCheck` は実行しません。通過した入力チェックの `status` をファイル応答へ引き継ぐことはなく、最終HTTPステータスはファイル配信処理、または設定された `outCheck` の結果で決まります。
+
 ```js
 var endpoint = nyanAllParams.nyan_public_endpoint;
 var path = nyanAllParams.nyan_public_path;

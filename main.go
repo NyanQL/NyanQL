@@ -4319,8 +4319,7 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 			sendJSONError(w, err.Error(), statusCode)
 			return
 		}
-		allowed := success && statusCode == http.StatusOK
-		if isCheckOnlyMode(params) || !allowed {
+		if isCheckOnlyMode(params) || !success {
 			if !success && errorObj != nil {
 				serviceLog(slog.LevelInfo, "public_param_check_rejected", "api", apiKey, "status", statusCode)
 			}

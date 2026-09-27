@@ -2198,6 +2198,63 @@ func TestPublicEndpointCheckOnlyWithoutParamCheck(t *testing.T) {
 	}
 }
 
+func TestPublicParamCheckUsesSuccess(t *testing.T) {
+	for _, test := range []struct {
+		name, check                 string
+		status                      int
+		outStatus                   int
+		checkOnly, legacy, wantFile bool
+	}{
+		{name: "unset", status: 200, wantFile: true},
+		{name: "success_200", check: `({success:true,status:200});`, status: 200, wantFile: true},
+		{name: "success_201", check: `({success:true,status:201});`, status: 200, wantFile: true},
+		{name: "success_503", check: `({success:true,status:503});`, status: 200, wantFile: true},
+		{name: "success_without_status", check: `({success:true});`, status: 200, wantFile: true},
+		{name: "legacy_check", check: `({success:true,status:201});`, status: 200, legacy: true, wantFile: true},
+		{name: "output_sets_status", check: `({success:true,status:503});`, status: 201, outStatus: 201, wantFile: true},
+		{name: "denied", check: `({success:false,status:403,result:"denied"});`, status: 403},
+		{name: "denied_with_200", check: `({success:false,status:200,result:"denied"});`, status: 200},
+		{name: "exception", check: `throw new Error("input failed");`, status: 500},
+		{name: "check_only", check: `({success:true,status:201,result:"checked"});`, status: 201, checkOnly: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetJavascriptInclude(t)
+			dir := t.TempDir()
+			writeTestFile(t, filepath.Join(dir, "test.txt"), "original file")
+			marker := filepath.Join(t.TempDir(), "out")
+			outStatus := test.outStatus
+			if outStatus == 0 {
+				outStatus = 200
+			}
+			definition := APIConfig{Type: apiTypePublic, Path: dir, OutCheck: writeTestScript(t, fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"),%q); ({success:true,status:%d});`, marker, outStatus))}
+			if test.check != "" {
+				definition.ParamCheck = writeTestScript(t, test.check)
+				if test.legacy {
+					definition.Check, definition.ParamCheck = definition.ParamCheck, ""
+				}
+			}
+			setTestSQLFiles(t, map[string]APIConfig{"assets": definition})
+			path := "/assets/test.txt"
+			if test.checkOnly {
+				path += "?nyan_mode=checkOnly"
+			}
+			w := httptest.NewRecorder()
+			unifiedHandler(w, httptest.NewRequest(http.MethodGet, path, nil))
+			if w.Code != test.status || (w.Body.String() == "original file") != test.wantFile {
+				t.Fatalf("HTTP %d body=%s, want status=%d file=%t", w.Code, w.Body.String(), test.status, test.wantFile)
+			}
+			data, err := os.ReadFile(marker)
+			if test.wantFile {
+				if err != nil || string(data) != "ran" {
+					t.Fatalf("outCheck did not run: %q %v", data, err)
+				}
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("outCheck ran after input check stopped request: %q %v", data, err)
+			}
+		})
+	}
+}
+
 func TestPublicEndpointOutCheckBlocksFile(t *testing.T) {
 	resetJavascriptInclude(t)
 	publicDir := t.TempDir()
