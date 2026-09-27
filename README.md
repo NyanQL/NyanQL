@@ -1257,6 +1257,8 @@ NyanQLは、WebSocketサーバとしてPushを配信するだけでなく、Nyan
 
 この設定を書くと、NyanQLは起動時またはホットリロードでの追加時に `connectURL` へ接続します。接続が切れた場合は、時間をあけながら再接続を試みます。
 
+`ws_client`では `paramCheck`・`outCheck` は不要であり、実行しません。これらにスクリプトを指定すると、起動時・ホットリロード時の設定読み込みで、クライアント名と対象項目を含むWARNログ（`ws_client_check_ignored`）を出力します。その指定は不要で適用できず、実行されないことと、設定の削除を案内します。互換名の `check`・`paramcheck`・`outcheck` も同じ扱いです。接続・受信・script実行・返信は従来どおり継続し、受信や再接続のたびにこの警告を繰り返すことはありません。受信内容や返信の検証はscript内で行ってください。script内から `nyanCallMe()` で通常APIを呼ぶ場合は、呼び出し先APIのチェックが通常どおり適用されます。
+
 ws_clientがinclude先にある場合、内部名と `nyanAllParams.ws_client` には `sub/receiveExternalMessage` のような完全名が入ります。mountを削除すると、その配下の接続と再接続処理も停止します。
 
 ホットリロードで `script` または `description` だけを変更した場合は、現在の接続を維持し、次に受信するメッセージから新しい設定を使用します。`connectURL` を変更した場合は現在の接続を閉じ、新しい接続先へ接続します。切り替え中に接続先から送信されたメッセージの受信は保証されません。

@@ -668,56 +668,71 @@ func TestLoadAPIConfigFileBuildsValidatedBackgroundConfigs(t *testing.T) {
 	}
 }
 
-func TestScheduleCheckSettingsWarnWithoutPreventingRegistration(t *testing.T) {
-	for _, tt := range []struct {
-		name   string
-		fields string
-		want   []string
+func TestBackgroundCheckSettingsWarnWithoutPreventingRegistration(t *testing.T) {
+	for _, background := range []struct {
+		apiType, nameField, settings string
 	}{
-		{"none", "", nil},
-		{"empty", `,"paramCheck":"","outCheck":""`, nil},
-		{"input", `,"paramCheck":"missing-input.js"`, []string{"paramCheck"}},
-		{"output", `,"outCheck":"missing-output.js"`, []string{"outCheck"}},
-		{"both", `,"paramCheck":"missing-input.js","outCheck":"missing-output.js"`, []string{"paramCheck", "outCheck"}},
-		{"legacy", `,"check":"missing-input.js"`, []string{"paramCheck"}},
-		{"lowercase", `,"paramcheck":"missing-input.js","outcheck":"missing-output.js"`, []string{"paramCheck", "outCheck"}},
+		{"schedule", "job", `"trigger":{"type":"cron","value":"0 10 * * *"}`},
+		{"ws_client", "client", `"connectURL":"ws://localhost:8080/events"`},
 	} {
-		t.Run(tt.name, func(t *testing.T) {
-			output := captureServiceLogs(t, slog.LevelInfo)
-			apiDir := t.TempDir()
-			apiPath := filepath.Join(apiDir, "api.json")
-			writeTestFile(t, apiPath, `{
-				"job":{"type":"schedule","script":"job.js","trigger":{"type":"cron","value":"0 10 * * *"}`+tt.fields+`},
-				"ordinary":{"script":"api.js","paramCheck":"input.js","outCheck":"output.js"},
-				"client":{"type":"ws_client","script":"client.js","connectURL":"ws://localhost:8080/events","paramCheck":"input.js","outCheck":"output.js"}
+		t.Run(background.apiType, func(t *testing.T) {
+			for _, tt := range []struct {
+				name   string
+				fields string
+				want   []string
+			}{
+				{"none", "", nil},
+				{"empty", `,"paramCheck":"","outCheck":""`, nil},
+				{"input", `,"paramCheck":"missing-input.js"`, []string{"paramCheck"}},
+				{"output", `,"outCheck":"missing-output.js"`, []string{"outCheck"}},
+				{"both", `,"paramCheck":"missing-input.js","outCheck":"missing-output.js"`, []string{"paramCheck", "outCheck"}},
+				{"legacy", `,"check":"missing-input.js"`, []string{"paramCheck"}},
+				{"lowercase", `,"paramcheck":"missing-input.js","outcheck":"missing-output.js"`, []string{"paramCheck", "outCheck"}},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					output := captureServiceLogs(t, slog.LevelInfo)
+					apiDir := t.TempDir()
+					apiPath := filepath.Join(apiDir, "api.json")
+					writeTestFile(t, apiPath, `{
+				"background":{"type":"`+background.apiType+`","script":"background.js",`+background.settings+tt.fields+`},
+				"ordinary":{"script":"api.js","paramCheck":"input.js","outCheck":"output.js"}
 			}`)
-			loaded, err := loadAPIConfigFile(apiPath)
-			if err != nil {
-				t.Fatalf("ignored checks prevented configuration loading: %v", err)
-			}
-			job, exists := loaded.Schedules["job"]
-			if !exists || job.scriptPath != filepath.Join(apiDir, "job.js") || job.trigger.Value != "0 10 * * *" {
-				t.Fatalf("schedule registration changed: %#v", loaded.Schedules)
-			}
-			decoder := json.NewDecoder(output)
-			for _, field := range tt.want {
-				var record map[string]interface{}
-				if err := decoder.Decode(&record); err != nil {
-					t.Fatalf("missing warning for %s: %v", field, err)
-				}
-				if record["level"] != "WARN" || record["msg"] != "schedule_check_ignored" || record["job"] != "job" || record["field"] != field {
-					t.Fatalf("unexpected warning: %#v", record)
-				}
-				message, _ := record["message"].(string)
-				for _, detail := range []string{"unnecessary", "unsupported", "will not be executed", "Remove this setting"} {
-					if !strings.Contains(message, detail) {
-						t.Fatalf("warning omits %q: %q", detail, message)
+					loaded, err := loadAPIConfigFile(apiPath)
+					if err != nil {
+						t.Fatalf("ignored checks prevented configuration loading: %v", err)
 					}
-				}
-			}
-			var extra interface{}
-			if err := decoder.Decode(&extra); err != io.EOF {
-				t.Fatalf("unexpected extra log: %#v (error: %v)", extra, err)
+					if background.apiType == "schedule" {
+						job, exists := loaded.Schedules["background"]
+						if !exists || job.scriptPath != filepath.Join(apiDir, "background.js") || job.trigger.Value != "0 10 * * *" {
+							t.Fatalf("schedule registration changed: %#v", loaded.Schedules)
+						}
+					} else {
+						client, exists := loaded.WSClients["background"]
+						if !exists || client.scriptPath != filepath.Join(apiDir, "background.js") || client.connectURL != "ws://localhost:8080/events" {
+							t.Fatalf("ws_client registration changed: %#v", loaded.WSClients)
+						}
+					}
+					decoder := json.NewDecoder(output)
+					for _, field := range tt.want {
+						var record map[string]interface{}
+						if err := decoder.Decode(&record); err != nil {
+							t.Fatalf("missing warning for %s: %v", field, err)
+						}
+						if record["level"] != "WARN" || record["msg"] != background.apiType+"_check_ignored" || record[background.nameField] != "background" || record["field"] != field {
+							t.Fatalf("unexpected warning: %#v", record)
+						}
+						message, _ := record["message"].(string)
+						for _, detail := range []string{"unnecessary", "unsupported", "will not be executed", "Remove this setting"} {
+							if !strings.Contains(message, detail) {
+								t.Fatalf("warning omits %q: %q", detail, message)
+							}
+						}
+					}
+					var extra interface{}
+					if err := decoder.Decode(&extra); err != io.EOF {
+						t.Fatalf("unexpected extra log: %#v (error: %v)", extra, err)
+					}
+				})
 			}
 		})
 	}

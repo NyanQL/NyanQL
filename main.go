@@ -4912,6 +4912,16 @@ func buildWSClientConfigs(files map[string]APIConfig, execDir string) (map[strin
 			continue
 		}
 
+		for _, check := range []struct{ field, path string }{
+			{"paramCheck", getParamCheckScriptPath(apiConfig)},
+			{"outCheck", apiConfig.OutCheck},
+		} {
+			if check.path != "" {
+				serviceLog(slog.LevelWarn, "ws_client_check_ignored", "client", name, "field", check.field,
+					"message", "Checks are unnecessary and unsupported for type:ws_client; this check will not be executed. Remove this setting.")
+			}
+		}
+
 		scriptPath := strings.TrimSpace(apiConfig.Script)
 		connectURLRaw := strings.TrimSpace(apiConfig.ConnectURL)
 
