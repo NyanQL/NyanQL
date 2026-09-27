@@ -2198,6 +2198,187 @@ func TestPublicEndpointCheckOnlyWithoutParamCheck(t *testing.T) {
 	}
 }
 
+func TestExecutionModeAcrossTransports(t *testing.T) {
+	for _, route := range []string{"http", "root", "public", "jsonrpc", "internal", "websocket", "ws_connect", "mcp_http", "mcp_stdio"} {
+		for _, test := range []struct {
+			name, mode string
+			invalid    bool
+		}{
+			{name: "omitted"},
+			{name: "empty", mode: `""`},
+			{name: "check_only", mode: `"checkOnly"`},
+			{name: "typo", mode: `"checkOnyl"`, invalid: true},
+			{name: "unknown", mode: `"normal"`, invalid: true},
+			{name: "case", mode: `"CHECKONLY"`, invalid: true},
+			{name: "whitespace", mode: `" checkOnly "`, invalid: true},
+			{name: "array", mode: `["checkOnly"]`, invalid: true},
+			{name: "null", mode: `null`, invalid: true},
+			{name: "number", mode: `1`, invalid: true},
+			{name: "boolean", mode: `true`, invalid: true},
+			{name: "object", mode: `{}`, invalid: true},
+		} {
+			t.Run(route+"/"+test.name, func(t *testing.T) {
+				resetJavascriptInclude(t)
+				setTestSQLiteDB(t)
+				oldHub := hub
+				hub = NewHub()
+				t.Cleanup(func() { hub = oldHub })
+				dir := t.TempDir()
+				marker := filepath.Join(dir, "stages")
+				mark := func(stage string) string {
+					return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode((nyanGetFile(%q)||"")+%q),%q);`, marker, stage+",", marker)
+				}
+				const allow = `({success:true,status:200});`
+				definition := APIConfig{ParamCheck: writeTestScript(t, mark("input")+allow), Script: writeTestScript(t, mark("body")+allow), OutCheck: writeTestScript(t, mark("out")+allow), Push: "events"}
+				if route == "public" {
+					definition.Type, definition.Path = apiTypePublic, dir
+					writeTestFile(t, filepath.Join(dir, "file.txt"), "file content")
+				}
+				setTestSQLFiles(t, map[string]APIConfig{"tool": definition, "events": {Script: writeTestScript(t, mark("push")+allow)}})
+				params := map[string]interface{}{"api": "tool"}
+				query := url.Values{"api": {"tool"}}
+				if test.mode != "" {
+					var mode interface{}
+					if err := json.Unmarshal([]byte(test.mode), &mode); err != nil {
+						t.Fatal(err)
+					}
+					params["nyan_mode"] = mode
+					value, ok := mode.(string)
+					if !ok {
+						value = test.mode
+					}
+					query.Set("nyan_mode", value)
+				}
+				encoded, err := json.Marshal(params)
+				if err != nil {
+					t.Fatal(err)
+				}
+				snapshot := currentAPISnapshot()
+				wantStatus := http.StatusOK
+				if test.invalid {
+					wantStatus = http.StatusBadRequest
+				}
+				switch route {
+				case "http", "root", "public", "jsonrpc", "ws_connect":
+					path := "/tool"
+					if route == "root" {
+						path = "/"
+					} else if route == "public" {
+						path = "/tool/file.txt"
+					}
+					req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encoded))
+					req.Header.Set("Content-Type", "application/json")
+					if route == "public" || route == "ws_connect" {
+						req = httptest.NewRequest(http.MethodGet, path+"?"+query.Encode(), nil)
+					} else if route == "jsonrpc" {
+						req = httptest.NewRequest(http.MethodPost, "/nyan-rpc", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tool","params":`+string(encoded)+`}`))
+					}
+					req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+					rec := httptest.NewRecorder()
+					if route == "jsonrpc" {
+						handleJSONRPCWithSnapshot(snapshot, rec, req)
+					} else if route == "ws_connect" {
+						allowed := checkWebSocketConnection(snapshot, rec, req)
+						if allowed != (!test.invalid && test.name != "check_only") {
+							t.Fatalf("connection allowed=%v", allowed)
+						}
+					} else {
+						unifiedHandler(rec, req)
+					}
+					if rec.Code != wantStatus {
+						t.Fatalf("status=%d want=%d body=%s", rec.Code, wantStatus, rec.Body.String())
+					}
+				case "internal":
+					vm := goja.New()
+					registerNyanFuncs(vm, snapshot, map[string]interface{}{}, nil)
+					_, err := vm.RunString(`nyanCallMe(` + string(encoded) + `);`)
+					if (err != nil) != test.invalid {
+						t.Fatalf("JavaScript error=%v, want error=%v", err, test.invalid)
+					}
+				case "websocket":
+					req := httptest.NewRequest(http.MethodGet, "/tool", nil)
+					req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+					response := decodeTestJSONObject(t, executeWebSocketAPIMessage(req, encoded))
+					if response["status"] != float64(wantStatus) {
+						t.Fatalf("WebSocket response=%#v", response)
+					}
+				case "mcp_http", "mcp_stdio":
+					server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocolVersion20251125}, Tools: []MCPToolConfig{{API: "tool"}}}
+					message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":` + string(encoded) + `}}`
+					var response map[string]interface{}
+					if route == "mcp_stdio" {
+						server.Transport = "stdio"
+						state := mcpStdioReady
+						response, _ = handleMCPStdioMessage(snapshot, "test_mcp", server, &state, []byte(message))
+					} else {
+						rec := performTestMCPRequest(t, snapshot, server, message, "")
+						if rec.Code != http.StatusOK {
+							t.Fatalf("MCP HTTP status=%d", rec.Code)
+						}
+						response = decodeTestJSONObject(t, rec.Body.Bytes())
+					}
+					result, ok := response["result"].(map[string]interface{})
+					if !ok || (result["isError"] == true) != test.invalid {
+						t.Fatalf("MCP response=%#v", response)
+					}
+				}
+				wantStages := "input,body,out,push,"
+				if test.invalid {
+					wantStages = ""
+				} else if test.name == "check_only" || route == "ws_connect" {
+					wantStages = "input,"
+				} else if route == "public" {
+					wantStages = "input,out,"
+				}
+				stages, err := os.ReadFile(marker)
+				if err != nil && !os.IsNotExist(err) {
+					t.Fatal(err)
+				}
+				if string(stages) != wantStages {
+					t.Fatalf("stages=%q want=%q", stages, wantStages)
+				}
+			})
+		}
+	}
+}
+
+func TestExecutionModeDuplicateValuesAndBodyPrecedence(t *testing.T) {
+	for _, test := range []struct {
+		name, query, body, contentType string
+		status                         int
+	}{
+		{name: "duplicate_query", query: "nyan_mode=checkOnly&nyan_mode=checkOnly", status: 400},
+		{name: "duplicate_form", body: "nyan_mode=checkOnly&nyan_mode=checkOnly", contentType: "application/x-www-form-urlencoded", status: 400},
+		{name: "comma_query", query: "nyan_mode=checkOnly,checkOnly", status: 400},
+		{name: "form_overrides_query", query: "nyan_mode=unknown", body: "nyan_mode=checkOnly", contentType: "application/x-www-form-urlencoded", status: 200},
+		{name: "json_overrides_query", query: "nyan_mode=checkOnly&nyan_mode=checkOnly", body: `{"nyan_mode":"checkOnly"}`, contentType: "application/json", status: 200},
+		{name: "invalid_body_overrides_query", query: "nyan_mode=checkOnly", body: `{"nyan_mode":null}`, contentType: "application/json", status: 400},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetJavascriptInclude(t)
+			marker := filepath.Join(t.TempDir(), "input")
+			setTestSQLFiles(t, map[string]APIConfig{"tool": {
+				ParamCheck: writeTestScript(t, fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"),%q); ({success:true,status:200});`, marker)),
+				Script:     writeTestScript(t, `throw new Error("body must not run");`),
+			}})
+			req := httptest.NewRequest(http.MethodPost, "/tool?"+test.query, strings.NewReader(test.body))
+			req.Header.Set("Content-Type", test.contentType)
+			rec := httptest.NewRecorder()
+			handleRequest(rec, req)
+			if rec.Code != test.status {
+				t.Fatalf("status=%d want=%d body=%s", rec.Code, test.status, rec.Body.String())
+			}
+			_, err := os.Stat(marker)
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			if (err == nil) != (test.status == 200) {
+				t.Fatalf("input check ran=%v", err == nil)
+			}
+		})
+	}
+}
+
 func TestCheckStatusIsRequiredAndValid(t *testing.T) {
 	resetJavascriptInclude(t)
 	for _, field := range []string{"", `,"status":null`, `,"status":0`, `,"status":-1`, `,"status":99`, `,"status":100`, `,"status":199`, `,"status":600`, `,"status":999`, `,"status":1000`, `,"status":200.5`, `,"status":"200"`, `,"status":true`, `,"status":[]`, `,"status":{}`, `,"status":1e100`, `,"status":200`, `,"status":201`, `,"status":503`, `,"status":599`} {
@@ -4961,7 +5142,7 @@ func TestMCPCheckOnlyAcrossTransports(t *testing.T) {
 			{name: "unknown_mode", arguments: `{"id":1,"nyan_mode":"checkOnyl"}`, wantError: true},
 			{name: "null_mode", arguments: `{"id":1,"nyan_mode":null}`, wantError: true},
 			{name: "array_mode", arguments: `{"id":1,"nyan_mode":["checkOnly"]}`, wantError: true},
-			{name: "empty_mode", arguments: `{"id":1,"nyan_mode":""}`, wantError: true},
+			{name: "empty_mode", arguments: `{"id":1,"nyan_mode":""}`, wantCheck: true, wantBody: true},
 		} {
 			t.Run(transport+"/"+test.name, func(t *testing.T) {
 				resetJavascriptInclude(t)

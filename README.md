@@ -906,7 +906,11 @@ if (!nyanAllParams.id) {
 
 通常HTTP・JSON-RPC・`nyanCallMe()`・WebSocket・MCP（HTTP／stdio）からのAPI呼び出しで `nyan_mode=checkOnly` を指定すると、`paramCheck` だけを実行し、その結果を返します。本体のscript／SQL・`outCheck`・Pushは実行しません。`check` で指定した古い設定も、`paramCheck` として同じように実行されます。`paramCheck`（または `check`）が未設定の場合は、本体を実行せずエラーを返します。
 
-MCPでは `tools/call` の `arguments` に `"nyan_mode":"checkOnly"` を指定します。MCP用の入力スキーマには、この制御項目を任意の文字列プロパティ（許可値は `checkOnly` のみ）として追加し、`tools/list` でも公開します。通常実行では `nyan_mode` を省略してください。APIの入力スキーマが `additionalProperties:false` でも指定できますが、必須項目・型など、その他のスキーマ制約は引き続き適用されます。認証・認可も省略しません。不正な `nyan_mode` はToolエラーとなり、本体を実行しません。入力チェック自身が行うDB更新などの副作用を取り消す機能ではありません。
+`nyan_mode` は省略または空文字列なら通常実行、文字列 `"checkOnly"` ならチェックのみです。それ以外の文字列・配列・`null`・数値・真偽値・オブジェクトは不正な指定として、`paramCheck`を実行する前に拒否します。大文字・小文字と前後の空白は区別するため、`"CHECKONLY"` や `" checkOnly "` もエラーです。通常HTTP・ルートHTTP・public・OAuth・WebSocket接続前はHTTP 400、JSON-RPCはHTTP 400と `error.code:-32602`、WebSocketのAPI実行はstatus 400のエラー応答、`nyanCallMe()`はJavaScript例外になります。本体・`outCheck`・Push・publicのファイル配信は開始しません。認証・認可は従来どおり適用します。
+
+クエリやフォーム内で `nyan_mode` を重複指定すると配列になり、エラーになります。クエリと本文の両方にある場合は、既存の本文優先ルールで統合した最終値を検証します。例えばクエリが `checkOnly` でも本文が空文字列なら通常実行、本文が `null` ならエラーです。
+
+MCPでは `tools/call` の `arguments` に `"nyan_mode":"checkOnly"` を指定します。MCP用の入力スキーマには、この制御項目を任意の文字列プロパティ（許可値は空文字列と `checkOnly`）として追加し、`tools/list` でも公開します。通常実行では省略または空文字列を指定できます。APIの入力スキーマが `additionalProperties:false` でも指定できますが、必須項目・型など、その他のスキーマ制約は引き続き適用されます。認証・認可も省略しません。不正な `nyan_mode` はToolエラーとなり、入力チェック・本体を実行しません。入力チェック自身が行うDB更新などの副作用を取り消す機能ではありません。
 
 ```bash
 curl -u admin:secret "http://localhost:8080/getItem?id=1&nyan_mode=checkOnly"

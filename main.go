@@ -1812,8 +1812,8 @@ func normalizedMCPInputSchema(schema map[string]interface{}) map[string]interfac
 	if properties, ok := normalized["properties"].(map[string]interface{}); ok {
 		properties["nyan_mode"] = map[string]interface{}{
 			"type":        "string",
-			"enum":        []interface{}{"checkOnly"},
-			"description": "Run only paramCheck; do not execute the API body, outCheck, or Push. Omit for normal execution.",
+			"enum":        []interface{}{"", "checkOnly"},
+			"description": "Run only paramCheck with checkOnly; do not execute the API body, outCheck, or Push. Omit or use an empty string for normal execution.",
 		}
 	}
 	return normalized
@@ -2118,25 +2118,15 @@ func isMCPOAuthMetadataRole(role string) bool {
 // separately exposed OAuth query/form/body data. Internal verification never
 // reads these values and must always complete authentication.
 func mcpOAuthHTTPMode(params map[string]interface{}) (string, error) {
-	var raw interface{}
+	control := make(map[string]interface{})
 	for _, source := range []string{"query", "form", "body"} {
 		if values, ok := params[source].(map[string]interface{}); ok {
 			if value, exists := values["nyan_mode"]; exists {
-				raw = value
-				if raw == nil {
-					return "", fmt.Errorf("nyan_mode must be a string")
-				}
+				control["nyan_mode"] = value
 			}
 		}
 	}
-	if raw == nil {
-		return "", nil
-	}
-	mode, ok := raw.(string)
-	if !ok || (mode != "" && mode != "checkOnly") {
-		return "", fmt.Errorf("invalid nyan_mode")
-	}
-	return mode, nil
+	return parseExecutionMode(control)
 }
 
 func prepareMCPOAuthHTTPResponse(value interface{}) (mcpOAuthHTTPResponse, error) {
@@ -2552,14 +2542,10 @@ func checkWebSocketConnection(snapshot *APIConfigSnapshot, w http.ResponseWriter
 	params := urlValuesToInterfaceMap(query)
 	params["nyan_request"] = scriptHTTPRequestContext(r)
 	params["api"] = apiName
-	mode := ""
-	if raw, exists := params["nyan_mode"]; exists {
-		var ok bool
-		mode, ok = raw.(string)
-		if !ok || (mode != "" && mode != "checkOnly") {
-			sendJSONError(w, "Invalid nyan_mode", http.StatusBadRequest)
-			return false
-		}
+	mode, err := parseExecutionMode(params)
+	if err != nil {
+		sendJSONError(w, err.Error(), http.StatusBadRequest)
+		return false
 	}
 	apiConfig, exists := snapshot.Definitions[apiName]
 	checkPath := ""
@@ -2708,6 +2694,9 @@ func executeWebSocketAPIMessage(r *http.Request, message []byte) (response []byt
 		if _, exists := params[key]; exists {
 			return webSocketAPIError(http.StatusBadRequest, "Reserved request parameter: "+key)
 		}
+	}
+	if _, err := parseExecutionMode(params); err != nil {
+		return webSocketAPIError(http.StatusBadRequest, err.Error())
 	}
 	snapshot := currentAPISnapshot()
 	if snapshot == nil {
@@ -4234,11 +4223,18 @@ func runOutCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiConfig APICon
 	return true, checkStatusCode, jsonStr, nil
 }
 
-func isCheckOnlyMode(params map[string]interface{}) bool {
-	if params == nil {
-		return false
+// Validate the effective control value after body-over-query parameter merging.
+// Do not silently turn malformed or unknown modes into normal API execution.
+func parseExecutionMode(params map[string]interface{}) (string, error) {
+	raw, exists := params["nyan_mode"]
+	if !exists {
+		return "", nil
 	}
-	return strings.EqualFold(strings.TrimSpace(fmt.Sprint(params["nyan_mode"])), "checkOnly")
+	mode, ok := raw.(string)
+	if !ok || (mode != "" && mode != "checkOnly") {
+		return "", fmt.Errorf("Invalid nyan_mode: expected an empty string or checkOnly")
+	}
+	return mode, nil
 }
 
 func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
@@ -4338,9 +4334,14 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 	params["api"] = apiKey
 	params["nyan_public_endpoint"] = apiKey
 	params["nyan_public_path"] = requestedPath
+	mode, err := parseExecutionMode(params)
+	if err != nil {
+		sendJSONError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	checkScriptPath := getParamCheckScriptPath(apiConfig)
-	if checkScriptPath == "" && isCheckOnlyMode(params) {
+	if checkScriptPath == "" && mode == "checkOnly" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"success":true,"status":200,"result":null}`))
@@ -4353,7 +4354,7 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 			sendJSONError(w, err.Error(), statusCode)
 			return
 		}
-		if isCheckOnlyMode(params) || !success {
+		if mode == "checkOnly" || !success {
 			if !success && errorObj != nil {
 				serviceLog(slog.LevelInfo, "public_param_check_rejected", "api", apiKey, "status", statusCode)
 			}
@@ -5402,7 +5403,11 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiKey)
 		acceptedKeys = []string{}
 	}
-	nyanMode, _ := params["nyan_mode"].(string)
+	nyanMode, err := parseExecutionMode(params)
+	if err != nil {
+		sendJSONError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	checkScriptPath := getParamCheckScriptPath(apiConfig)
 	if nyanMode == "checkOnly" && checkScriptPath == "" {
 		sendJSONError(w, "No check script for this API", http.StatusNotFound)
@@ -7641,7 +7646,10 @@ func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allPara
 	params := cloneParams(allParams)
 	params["api"] = apiName
 	result.Params = params
-	nyanMode, _ := params["nyan_mode"].(string)
+	nyanMode, err := parseExecutionMode(params)
+	if err != nil {
+		return result, err
+	}
 	result.CheckOnly = nyanMode == "checkOnly"
 	checkScriptPath := getParamCheckScriptPath(apiConfig)
 	if result.CheckOnly && checkScriptPath == "" {
@@ -8450,7 +8458,11 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	}
 
 	// 4) チェックスクリプトが設定されていれば実行
-	nyanMode, _ := allParams["nyan_mode"].(string)
+	nyanMode, err := parseExecutionMode(allParams)
+	if err != nil {
+		respondJSONRPCError(w, rpcReq.ID, -32602, "Invalid params", err.Error())
+		return
+	}
 	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
 	if err != nil {
 		logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiKey)
