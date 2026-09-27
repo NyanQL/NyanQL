@@ -1312,6 +1312,8 @@ scriptが空文字を返した場合、接続先へ返信しません。空で�
 
 この例では、毎日10:00に `./javascript/daily_job.js` が実行されます。`type: "schedule"` の定義はHTTP APIとしては公開されないため、外部リクエストから直接実行されません。
 
+scheduleでは `paramCheck`・`outCheck` は不要であり、実行しません。これらにスクリプトを指定すると、起動時・ホットリロード時の設定読み込みで、ジョブ名と対象項目を含むWARNログ（`schedule_check_ignored`）を出力します。ログには、その指定は不要で適用できず、実行されないことと、設定の削除を案内します。互換名の `check`・`paramcheck`・`outcheck` も同じ扱いです。ジョブ自体の登録・実行は継続し、定期実行のたびにこの警告を繰り返すことはありません。script内から `nyanCallMe()` で通常APIを呼ぶ場合は、呼び出し先APIのチェックが通常どおり適用されます。
+
 scheduleがinclude先にある場合、ジョブ名と `nyanAllParams.nyan_job_name` には `sub/dailyJob` のような完全名が入ります。mountを削除すると、その配下のジョブも次回以降実行されません。
 
 cronは5フィールド形式です。

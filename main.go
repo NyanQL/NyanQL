@@ -4718,6 +4718,16 @@ func buildScheduleJobConfigs(files map[string]APIConfig, execDir string) (map[st
 			continue
 		}
 
+		for _, check := range []struct{ field, path string }{
+			{"paramCheck", getParamCheckScriptPath(apiConfig)},
+			{"outCheck", apiConfig.OutCheck},
+		} {
+			if check.path != "" {
+				serviceLog(slog.LevelWarn, "schedule_check_ignored", "job", name, "field", check.field,
+					"message", "Checks are unnecessary and unsupported for type:schedule; this check will not be executed. Remove this setting.")
+			}
+		}
+
 		scriptPath := strings.TrimSpace(apiConfig.Script)
 		triggerType := strings.TrimSpace(apiConfig.Trigger.Type)
 		triggerValue := strings.TrimSpace(apiConfig.Trigger.Value)
