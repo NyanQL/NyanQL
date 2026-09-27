@@ -25,7 +25,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -107,7 +106,6 @@ type APIConfig struct {
 	Title                      string               `json:"title,omitempty"`
 	Type                       string               `json:"type,omitempty"`
 	ConnectURL                 string               `json:"connectURL,omitempty"`
-	HTTP                       *HTTPAPIConfig       `json:"http,omitempty"`
 	Runtime                    APIRuntimeConfig     `json:"runtime,omitempty"`
 	Transport                  string               `json:"transport,omitempty"`
 	ProtocolVersions           []string             `json:"protocolVersions,omitempty"`
@@ -123,16 +121,6 @@ type APIConfig struct {
 	SecuritySchemes            []MCPSecurityScheme  `json:"securitySchemes,omitempty"`
 	Annotations                MCPToolAnnotations   `json:"annotations,omitempty"`
 	Scopes                     []string             `json:"scopes,omitempty"`
-}
-
-type HTTPAPIConfig struct {
-	Path             string               `json:"path,omitempty"`
-	Methods          []string             `json:"methods,omitempty"`
-	Access           string               `json:"access,omitempty"`
-	ResponseMode     string               `json:"responseMode,omitempty"`
-	AllowedRemoteIPs []string             `json:"allowedRemoteIPs,omitempty"`
-	AllowedOrigins   []string             `json:"allowedOrigins,omitempty"`
-	RateLimit        *HTTPRateLimitConfig `json:"rateLimit,omitempty"`
 }
 
 type HTTPRateLimitConfig struct {
@@ -201,7 +189,6 @@ func (apiConfig *APIConfig) UnmarshalJSON(data []byte) error {
 		Title                      string               `json:"title,omitempty"`
 		Type                       string               `json:"type,omitempty"`
 		ConnectURL                 string               `json:"connectURL,omitempty"`
-		HTTP                       *HTTPAPIConfig       `json:"http,omitempty"`
 		Runtime                    APIRuntimeConfig     `json:"runtime,omitempty"`
 		Transport                  string               `json:"transport,omitempty"`
 		ProtocolVersions           []string             `json:"protocolVersions,omitempty"`
@@ -245,7 +232,6 @@ func (apiConfig *APIConfig) UnmarshalJSON(data []byte) error {
 	apiConfig.Title = raw.Title
 	apiConfig.Type = raw.Type
 	apiConfig.ConnectURL = raw.ConnectURL
-	apiConfig.HTTP = raw.HTTP
 	apiConfig.Runtime = raw.Runtime
 	apiConfig.Transport = raw.Transport
 	apiConfig.ProtocolVersions = raw.ProtocolVersions
@@ -269,8 +255,17 @@ func (apiConfig *APIConfig) UnmarshalJSON(data []byte) error {
 }
 
 type Hub struct {
-	mu      sync.Mutex
-	clients map[string]map[*websocket.Conn]bool // チャネル名ごとのクライアント一覧
+	mu           sync.Mutex
+	clients      map[string]map[*websocket.Conn]*hubClient
+	connections  map[*websocket.Conn]*hubClient
+	writeTimeout time.Duration
+}
+
+type hubClient struct {
+	conn     *websocket.Conn
+	writeMu  sync.Mutex
+	closed   atomic.Bool
+	channels map[string]struct{} // protected by Hub.mu
 }
 
 type SQLResponse struct {
@@ -321,6 +316,7 @@ type APISchema struct {
 // configuration. Maps and slices reachable from a published snapshot must not
 // be modified.
 type APIConfigSnapshot struct {
+	RootPath    string // Absolute reference path of the top-level API JSON file.
 	Definitions map[string]APIConfig
 	APIs        map[string]APIDetails
 	Sources     map[string]string
@@ -383,7 +379,7 @@ var db *sql.DB
 var apiSnapshot atomic.Pointer[APIConfigSnapshot]
 var backgroundRuntimes *backgroundRuntimeManager
 var dbType string
-var buildVersion = "v0.0.21"
+var buildVersion = "v0.0.22"
 
 type serviceFilePath struct {
 	Path   string
@@ -404,11 +400,6 @@ const (
 	apiTypeSchedule                  = "schedule"
 	apiTypeMCP                       = "mcp"
 	defaultAPIHotReloadCheckInterval = time.Second
-	configuredHTTPAccessBasic        = "basic"
-	configuredHTTPAccessAnonymous    = "anonymous"
-	configuredHTTPAccessInternal     = "internal"
-	configuredHTTPResponseNyan       = "nyan"
-	configuredHTTPResponseRaw        = "raw"
 	mcpProtocolVersion20250326       = "2025-03-26"
 	mcpProtocolVersion20250618       = "2025-06-18"
 	mcpProtocolVersion20251125       = "2025-11-25"
@@ -419,19 +410,20 @@ const (
 	maxRestrictedScriptRuntime       = 15 * time.Second
 	maxWebSocketMessageBytes         = 1 << 20
 	maxWebSocketConnections          = 128
+	webSocketWriteTimeout            = 5 * time.Second
 )
 
-type configuredHTTPRateBucket struct {
+type mcpRateBucket struct {
 	StartedAt time.Time
 	Window    time.Duration
 	Count     int
 }
 
-var configuredHTTPRateBuckets = struct {
+var mcpRateBuckets = struct {
 	sync.Mutex
-	Buckets     map[string]configuredHTTPRateBucket
+	Buckets     map[string]mcpRateBucket
 	LastCleanup time.Time
-}{Buckets: make(map[string]configuredHTTPRateBucket)}
+}{Buckets: make(map[string]mcpRateBucket)}
 
 var mcpConcurrencyLimiters = struct {
 	sync.Mutex
@@ -617,31 +609,58 @@ func main() {
 }
 
 func (h *Hub) AddClient(channel string, conn *websocket.Conn) {
+	if conn == nil {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.clients == nil {
-		h.clients = make(map[string]map[*websocket.Conn]bool)
+		h.clients = make(map[string]map[*websocket.Conn]*hubClient)
+	}
+	if h.connections == nil {
+		h.connections = make(map[*websocket.Conn]*hubClient)
+	}
+	client := h.connections[conn]
+	if client == nil {
+		client = &hubClient{conn: conn, channels: make(map[string]struct{})}
+		h.connections[conn] = client
 	}
 	if _, ok := h.clients[channel]; !ok {
-		h.clients[channel] = make(map[*websocket.Conn]bool)
+		h.clients[channel] = make(map[*websocket.Conn]*hubClient)
 	}
-	h.clients[channel][conn] = true
+	h.clients[channel][conn] = client
+	client.channels[channel] = struct{}{}
 }
 
 func (h *Hub) RemoveClient(channel string, conn *websocket.Conn) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	if clients, ok := h.clients[channel]; ok {
+	client := h.clients[channel][conn]
+	closeConnection := false
+	if client != nil {
+		clients := h.clients[channel]
 		delete(clients, conn)
+		delete(client.channels, channel)
 		if len(clients) == 0 {
 			delete(h.clients, channel)
 		}
+		if len(client.channels) == 0 {
+			delete(h.connections, conn)
+			client.closed.Store(true)
+			closeConnection = true
+		}
+	}
+	h.mu.Unlock()
+	// Closing must not wait for the write lock: it interrupts a blocked write.
+	if closeConnection {
+		_ = conn.Close()
 	}
 }
 
 func NewHub() *Hub {
 	return &Hub{
-		clients: make(map[string]map[*websocket.Conn]bool),
+		clients:      make(map[string]map[*websocket.Conn]*hubClient),
+		connections:  make(map[*websocket.Conn]*hubClient),
+		writeTimeout: webSocketWriteTimeout,
 	}
 }
 
@@ -655,11 +674,7 @@ func unifiedHandler(w http.ResponseWriter, r *http.Request) {
 		handleMCPRequestWithSnapshot(snapshot, w, r, apiName, apiConfig)
 		return
 	}
-	if apiName, apiConfig, ok := findConfiguredHTTPAPIForPathInSnapshot(snapshot, r.URL.Path); ok {
-		handleConfiguredHTTPRequestWithSnapshot(snapshot, w, r, apiName, apiConfig)
-		return
-	}
-	// WebSocketアップグレード要求なら認証後、handleWebSocketに処理を委譲
+	// WebSocket購読は接続先の入力チェックを適用する。API実行のBasic認証はメッセージ受信時に行う。
 	if isWebSocketRequest(r) {
 		if !webSocketEndpointConfigured(snapshot, r.URL.Path) {
 			http.NotFound(w, r)
@@ -669,7 +684,7 @@ func unifiedHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "forbidden origin", http.StatusForbidden)
 			return
 		}
-		handleWebSocket(w, r)
+		handleWebSocketWithSnapshot(snapshot, w, r)
 		return
 	}
 	if apiKey, requestedPath, apiConfig, ok := findPublicAPIForPathInSnapshot(snapshot, r.URL.Path); ok {
@@ -686,10 +701,10 @@ func webSocketEndpointConfigured(snapshot *APIConfigSnapshot, requestPath string
 	if snapshot == nil {
 		return false
 	}
-	// Match the full channel name used by handleWebSocket, including include mounts.
+	// Match the full channel name used by handleWebSocketWithSnapshot, including include mounts.
 	apiName := strings.TrimPrefix(requestPath, "/")
 	if apiName != "" {
-		if apiConfig, exists := snapshot.Definitions[apiName]; exists && getAPIType(apiConfig) == apiTypeAPI && apiConfig.HTTP == nil {
+		if apiConfig, exists := snapshot.Definitions[apiName]; exists && getAPIType(apiConfig) == apiTypeAPI {
 			return true
 		}
 	}
@@ -715,32 +730,6 @@ func validateWebSocketOrigin(r *http.Request) bool {
 		return false
 	}
 	return strings.EqualFold(originURL.Host, r.Host)
-}
-
-type configuredAPIDispatchContextKey struct{}
-
-type configuredHTTPResponse struct {
-	Status  int                    `json:"status"`
-	Headers map[string]interface{} `json:"headers"`
-	Body    interface{}            `json:"body"`
-}
-
-func findConfiguredHTTPAPIForPathInSnapshot(snapshot *APIConfigSnapshot, requestPath string) (string, APIConfig, bool) {
-	if snapshot == nil {
-		return "", APIConfig{}, false
-	}
-	for apiName, apiConfig := range snapshot.Definitions {
-		if getAPIType(apiConfig) != apiTypeAPI || apiConfig.HTTP == nil {
-			continue
-		}
-		if configuredHTTPAccess(apiConfig) == configuredHTTPAccessInternal {
-			continue
-		}
-		if apiConfig.HTTP.Path == requestPath {
-			return apiName, apiConfig, true
-		}
-	}
-	return "", APIConfig{}, false
 }
 
 func findMCPServerForRequestInSnapshot(snapshot *APIConfigSnapshot, r *http.Request) (string, APIConfig, bool) {
@@ -788,198 +777,6 @@ func findMCPOAuthAPIForRequest(snapshot *APIConfigSnapshot, r *http.Request) (st
 	return "", APIConfig{}, "", "", false
 }
 
-func handleConfiguredHTTPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, apiName string, apiConfig APIConfig) {
-	if !configuredHTTPOriginAllowed(r, apiConfig) {
-		http.Error(w, "forbidden origin", http.StatusForbidden)
-		return
-	}
-	if !configuredHTTPMethodAllowed(apiConfig, r.Method) {
-		w.Header().Set("Allow", strings.Join(configuredHTTPMethods(apiConfig), ", "))
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if !configuredHTTPRemoteAllowed(apiConfig, r.RemoteAddr) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	if allowed, retryAfter := configuredHTTPRateLimitAllows(apiName, apiConfig, r.RemoteAddr, time.Now()); !allowed {
-		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(retryAfter.Seconds()))))
-		sendJSONError(w, "too many requests", http.StatusTooManyRequests)
-		return
-	}
-
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		if configuredHTTPResponseMode(apiConfig) == configuredHTTPResponseNyan {
-			clonedRequest := r.Clone(context.WithValue(r.Context(), configuredAPIDispatchContextKey{}, apiName))
-			clonedURL := *r.URL
-			clonedURL.Path = "/" + strings.TrimPrefix(apiName, "/")
-			clonedRequest.URL = &clonedURL
-			handleRequestWithSnapshot(snapshot, w, clonedRequest)
-			return
-		}
-		handleRawScriptHTTPRequestWithSnapshot(snapshot, w, r, apiName, apiConfig)
-	}
-
-	if configuredHTTPAccess(apiConfig) == configuredHTTPAccessBasic {
-		basicAuth(handler, config)(w, r)
-		return
-	}
-	handler(w, r)
-}
-
-func configuredHTTPOriginAllowed(r *http.Request, apiConfig APIConfig) bool {
-	if apiConfig.HTTP == nil {
-		return strings.TrimSpace(r.Header.Get("Origin")) == ""
-	}
-	requestScheme := "http"
-	if r.TLS != nil {
-		requestScheme = "https"
-	}
-	return requestOriginAllowed(r.Header.Get("Origin"), requestScheme+"://"+r.Host, apiConfig.HTTP.AllowedOrigins)
-}
-
-func configuredHTTPRemoteAllowed(apiConfig APIConfig, remoteAddress string) bool {
-	if apiConfig.HTTP == nil || len(apiConfig.HTTP.AllowedRemoteIPs) == 0 {
-		return true
-	}
-	host := remoteAddress
-	if parsedHost, _, err := net.SplitHostPort(remoteAddress); err == nil {
-		host = parsedHost
-	}
-	remoteIP := net.ParseIP(strings.TrimSpace(host))
-	if remoteIP == nil {
-		return false
-	}
-	for _, allowed := range apiConfig.HTTP.AllowedRemoteIPs {
-		if allowedIP := net.ParseIP(allowed); allowedIP != nil && allowedIP.Equal(remoteIP) {
-			return true
-		}
-	}
-	return false
-}
-
-func configuredHTTPMethods(apiConfig APIConfig) []string {
-	if apiConfig.HTTP == nil || len(apiConfig.HTTP.Methods) == 0 {
-		return []string{http.MethodGet, http.MethodPost}
-	}
-	return append([]string(nil), apiConfig.HTTP.Methods...)
-}
-
-func configuredHTTPMethodAllowed(apiConfig APIConfig, method string) bool {
-	for _, allowed := range configuredHTTPMethods(apiConfig) {
-		if method == allowed || (method == http.MethodHead && allowed == http.MethodGet) {
-			return true
-		}
-	}
-	return false
-}
-
-func handleRawScriptHTTPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, apiName string, apiConfig APIConfig) {
-	requestContext, params, err := buildScriptHTTPRequest(w, r, apiName)
-	if err != nil {
-		var maxBytesError *http.MaxBytesError
-		if errors.As(err, &maxBytesError) {
-			sendJSONError(w, "request body is too large", http.StatusRequestEntityTooLarge)
-			return
-		}
-		sendJSONError(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-	params["nyan_request"] = requestContext
-
-	scriptResult, err := runScriptWithRuntimeWithSnapshot(snapshot, []string{apiConfig.Script}, params, apiConfig.Runtime, true)
-	if err != nil {
-		if errors.Is(err, errRestrictedRuntimeBusy) {
-			w.Header().Set("Retry-After", "1")
-			sendJSONError(w, "configured API is busy", http.StatusServiceUnavailable)
-			return
-		}
-		logServiceError(slog.LevelError, "http_script_failed", err, "api", apiName)
-		sendJSONError(w, "configured API execution failed", http.StatusInternalServerError)
-		return
-	}
-	response, err := parseConfiguredHTTPResponse(scriptResult)
-	if err != nil {
-		logServiceError(slog.LevelError, "http_script_response_invalid", err, "api", apiName)
-		sendJSONError(w, "configured API returned an invalid response", http.StatusInternalServerError)
-		return
-	}
-	if err := writeConfiguredHTTPResponse(w, r, response); err != nil {
-		logServiceError(slog.LevelError, "http_script_response_rejected", err, "api", apiName)
-		sendJSONError(w, "configured API returned an invalid response", http.StatusInternalServerError)
-	}
-}
-
-func buildScriptHTTPRequest(w http.ResponseWriter, r *http.Request, apiName string) (map[string]interface{}, map[string]interface{}, error) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxConfiguredHTTPBodyBytes)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	query := urlValuesToInterfaceMap(r.URL.Query())
-	form := map[string]interface{}{}
-	var jsonBody interface{}
-	contentType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	switch contentType {
-	case "application/json":
-		if len(bytes.TrimSpace(body)) > 0 {
-			if err := json.Unmarshal(body, &jsonBody); err != nil {
-				return nil, nil, err
-			}
-		}
-	case "application/x-www-form-urlencoded":
-		values, err := url.ParseQuery(string(body))
-		if err != nil {
-			return nil, nil, err
-		}
-		form = urlValuesToInterfaceMap(values)
-	}
-
-	headers := make(map[string]interface{}, len(r.Header))
-	for name, values := range r.Header {
-		if strings.EqualFold(name, "Authorization") {
-			continue
-		}
-		key := strings.ToLower(name)
-		if len(values) == 1 {
-			headers[key] = values[0]
-		} else {
-			headers[key] = append([]string(nil), values...)
-		}
-	}
-	cookies := make(map[string]interface{})
-	for _, cookie := range r.Cookies() {
-		cookies[cookie.Name] = cookie.Value
-	}
-	requestContext := map[string]interface{}{
-		"method":        r.Method,
-		"path":          r.URL.Path,
-		"query":         query,
-		"form":          form,
-		"json":          jsonBody,
-		"headers":       headers,
-		"cookies":       cookies,
-		"body":          string(body),
-		"remoteAddress": r.RemoteAddr,
-	}
-	params := make(map[string]interface{})
-	mergeInterfaceMaps(params, query)
-	mergeInterfaceMaps(params, form)
-	if jsonObject, ok := jsonBody.(map[string]interface{}); ok {
-		mergeInterfaceMaps(params, jsonObject)
-	}
-	params["api"] = apiName
-	return requestContext, params, nil
-}
-
-func configuredHTTPRateLimitAllows(apiName string, apiConfig APIConfig, remoteAddress string, now time.Time) (bool, time.Duration) {
-	if apiConfig.HTTP == nil || apiConfig.HTTP.RateLimit == nil {
-		return true, 0
-	}
-	return configuredRateLimitAllows("http:"+apiName, apiConfig.HTTP.RateLimit, remoteAddress, now)
-}
-
 func configuredRateLimitAllows(bucketName string, rateLimit *HTTPRateLimitConfig, remoteAddress string, now time.Time) (bool, time.Duration) {
 	if rateLimit == nil {
 		return true, 0
@@ -994,26 +791,26 @@ func configuredRateLimitAllows(bucketName string, rateLimit *HTTPRateLimitConfig
 	}
 	key := bucketName + "\x00" + host + "\x00" + strconv.Itoa(rateLimit.Requests) + "\x00" + window.String()
 
-	configuredHTTPRateBuckets.Lock()
-	defer configuredHTTPRateBuckets.Unlock()
-	if configuredHTTPRateBuckets.LastCleanup.IsZero() || now.Sub(configuredHTTPRateBuckets.LastCleanup) >= time.Minute {
-		for bucketKey, bucket := range configuredHTTPRateBuckets.Buckets {
+	mcpRateBuckets.Lock()
+	defer mcpRateBuckets.Unlock()
+	if mcpRateBuckets.LastCleanup.IsZero() || now.Sub(mcpRateBuckets.LastCleanup) >= time.Minute {
+		for bucketKey, bucket := range mcpRateBuckets.Buckets {
 			if now.Sub(bucket.StartedAt) >= bucket.Window*2 {
-				delete(configuredHTTPRateBuckets.Buckets, bucketKey)
+				delete(mcpRateBuckets.Buckets, bucketKey)
 			}
 		}
-		configuredHTTPRateBuckets.LastCleanup = now
+		mcpRateBuckets.LastCleanup = now
 	}
-	bucket, exists := configuredHTTPRateBuckets.Buckets[key]
+	bucket, exists := mcpRateBuckets.Buckets[key]
 	if !exists || now.Sub(bucket.StartedAt) >= window || now.Before(bucket.StartedAt) {
-		configuredHTTPRateBuckets.Buckets[key] = configuredHTTPRateBucket{StartedAt: now, Window: window, Count: 1}
+		mcpRateBuckets.Buckets[key] = mcpRateBucket{StartedAt: now, Window: window, Count: 1}
 		return true, 0
 	}
 	if bucket.Count >= rateLimit.Requests {
 		return false, window - now.Sub(bucket.StartedAt)
 	}
 	bucket.Count++
-	configuredHTTPRateBuckets.Buckets[key] = bucket
+	mcpRateBuckets.Buckets[key] = bucket
 	return true, 0
 }
 
@@ -1029,79 +826,65 @@ func urlValuesToInterfaceMap(values url.Values) map[string]interface{} {
 	return result
 }
 
-func mergeInterfaceMaps(destination, source map[string]interface{}) {
-	for key, value := range source {
-		destination[key] = value
+// Only server code populates this context key after reading an HTTP body.
+// API arguments (including client-supplied nyan_request) cannot populate it.
+type scriptHTTPRequestContextKey struct{}
+
+func newScriptHTTPRequestContext(r *http.Request, body []byte) map[string]interface{} {
+	if r == nil {
+		return map[string]interface{}{}
+	}
+	headers := map[string]interface{}{}
+	for key, values := range r.Header {
+		var value interface{} = append([]string(nil), values...)
+		if len(values) == 1 {
+			value = values[0]
+		}
+		// Prefer lowercase names; retain canonical aliases for existing OAuth scripts.
+		headers[strings.ToLower(key)] = value
+		headers[http.CanonicalHeaderKey(key)] = value
+	}
+	cookies := map[string]interface{}{}
+	for _, cookie := range r.Cookies() {
+		cookies[cookie.Name] = cookie.Value
+	}
+	remoteIP := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(remoteIP); err == nil {
+		remoteIP = host
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	var jsonBody interface{}
+	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mediaType == "application/json" && len(body) > 0 {
+		_ = json.Unmarshal(body, &jsonBody)
+	}
+	form := urlValuesToInterfaceMap(r.PostForm)
+	if mediaType == "application/x-www-form-urlencoded" && len(body) > 0 {
+		if values, err := url.ParseQuery(string(body)); err == nil {
+			form = urlValuesToInterfaceMap(values)
+		}
+	}
+	return map[string]interface{}{
+		"method": r.Method, "path": r.URL.Path, "host": r.Host, "scheme": scheme,
+		"query": urlValuesToInterfaceMap(r.URL.Query()), "form": form, "json": jsonBody,
+		"headers": headers, "cookies": cookies, "body": string(body),
+		"remoteAddress": r.RemoteAddr, "remoteIP": remoteIP, "userAgent": r.UserAgent(),
 	}
 }
 
-func parseConfiguredHTTPResponse(scriptResult string) (configuredHTTPResponse, error) {
-	var response configuredHTTPResponse
-	decoder := json.NewDecoder(strings.NewReader(scriptResult))
-	decoder.UseNumber()
-	if err := decoder.Decode(&response); err != nil {
-		return configuredHTTPResponse{}, err
-	}
-	var trailing interface{}
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return configuredHTTPResponse{}, fmt.Errorf("response contains more than one JSON value")
+func scriptHTTPRequestContext(r *http.Request) map[string]interface{} {
+	if r != nil {
+		if value, ok := r.Context().Value(scriptHTTPRequestContextKey{}).(map[string]interface{}); ok {
+			return cloneJSONCompatibleValue(value).(map[string]interface{})
 		}
-		return configuredHTTPResponse{}, fmt.Errorf("response contains trailing data: %w", err)
 	}
-	if response.Status == 0 {
-		response.Status = http.StatusOK
-	}
-	if response.Status < 100 || response.Status > 599 {
-		return configuredHTTPResponse{}, fmt.Errorf("status code is out of range: %d", response.Status)
-	}
-	return response, nil
+	return newScriptHTTPRequestContext(r, nil)
 }
 
-func writeConfiguredHTTPResponse(w http.ResponseWriter, r *http.Request, response configuredHTTPResponse) error {
-	validatedHeaders := make(map[string][]string, len(response.Headers))
-	for name, rawValue := range response.Headers {
-		if !isHTTPToken(name) {
-			return fmt.Errorf("invalid response header name %q", name)
-		}
-		canonicalName := http.CanonicalHeaderKey(name)
-		if isForbiddenScriptResponseHeader(canonicalName) {
-			return fmt.Errorf("response header %q is not allowed", canonicalName)
-		}
-		values, err := configuredHTTPHeaderValues(rawValue)
-		if err != nil {
-			return fmt.Errorf("response header %q: %w", canonicalName, err)
-		}
-		for _, value := range values {
-			if strings.ContainsAny(value, "\r\n") {
-				return fmt.Errorf("response header %q contains a newline", canonicalName)
-			}
-		}
-		validatedHeaders[canonicalName] = append(validatedHeaders[canonicalName], values...)
-	}
-	body, err := configuredHTTPResponseBody(response.Body)
-	if err != nil {
-		return err
-	}
-	if len(body) > maxConfiguredHTTPResponseBytes {
-		return fmt.Errorf("response body is too large")
-	}
-	for name, values := range validatedHeaders {
-		for _, value := range values {
-			w.Header().Add(name, value)
-		}
-	}
-	if w.Header().Get("Content-Type") == "" {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	}
-	w.WriteHeader(response.Status)
-	if r.Method != http.MethodHead && response.Status != http.StatusNoContent && response.Status != http.StatusNotModified {
-		_, err = w.Write(body)
-	}
-	return err
-}
-
-func configuredHTTPHeaderValues(value interface{}) ([]string, error) {
+func scriptResponseHeaderValues(value interface{}) ([]string, error) {
 	switch value := value.(type) {
 	case string:
 		return []string{value}, nil
@@ -1122,7 +905,7 @@ func configuredHTTPHeaderValues(value interface{}) ([]string, error) {
 	}
 }
 
-func configuredHTTPResponseBody(value interface{}) ([]byte, error) {
+func scriptResponseBody(value interface{}) ([]byte, error) {
 	if value == nil {
 		return nil, nil
 	}
@@ -1301,6 +1084,7 @@ func handleMCPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 	case "tools/list":
 		handleMCPToolsList(snapshot, w, request, serverConfig)
 	case "tools/call":
+		r = r.WithContext(context.WithValue(r.Context(), scriptHTTPRequestContextKey{}, newScriptHTTPRequestContext(r, body)))
 		handleMCPToolCall(snapshot, w, r, request, serverName, serverConfig, runtimeURLs)
 	default:
 		writeMCPError(w, request.ID, -32601, "Method not found", nil)
@@ -1386,29 +1170,6 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 			return
 		}
 	}
-	if role == "authorizationServerMetadata" || role == "protectedResourceMetadata" {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", "GET, OPTIONS")
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		scopes := snapshot.Definitions[serverConfig.OAuth.VerifyAccess].Scopes
-		if role == "authorizationServerMetadata" {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"issuer": runtimeURLs.Issuer, "authorization_endpoint": runtimeURLs.AuthorizationEndpoint,
-				"token_endpoint": runtimeURLs.TokenEndpoint, "registration_endpoint": runtimeURLs.RegistrationEndpoint,
-				"response_types_supported": []string{"code"}, "grant_types_supported": []string{"authorization_code", "refresh_token"},
-				"token_endpoint_auth_methods_supported": []string{"none"}, "code_challenge_methods_supported": []string{"S256"}, "scopes_supported": scopes,
-			})
-		} else {
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"resource": runtimeURLs.Resource, "authorization_servers": []string{runtimeURLs.Issuer},
-				"scopes_supported": scopes, "bearer_methods_supported": []string{"header"},
-			})
-		}
-		return
-	}
 	if !mcpOAuthMethodAllowed(role, r.Method) {
 		w.Header().Set("Allow", mcpOAuthAllowedMethods(role))
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1432,6 +1193,12 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		http.Error(w, err.Error(), status)
 		return
 	}
+	mode, err := mcpOAuthHTTPMode(params)
+	if err != nil {
+		http.Error(w, "invalid nyan_mode", http.StatusBadRequest)
+		return
+	}
+	params["nyan_mode"] = mode
 	release, acquired := acquireMCPExecutionSlot(serverName+":oauth:"+role, mcpOAuthMaxConcurrent(serverConfig, role))
 	if !acquired {
 		w.Header().Set("Retry-After", "1")
@@ -1439,72 +1206,27 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		return
 	}
 	defer release()
-	value, err := invokeMCPOAuthHook(snapshot, serverName, serverConfig, runtimeURLs, role, params)
+	result, err := invokeMCPOAuthHook(snapshot, serverName, serverConfig, runtimeURLs, role, params)
 	if err != nil {
 		logServiceError(slog.LevelError, "oauth_hook_failed", err, "api", apiName, "role", role)
 		http.Error(w, "OAuth hook failed", http.StatusInternalServerError)
 		return
 	}
-	response, ok := value.(map[string]interface{})
-	if !ok {
-		http.Error(w, "OAuth hook returned an invalid response", http.StatusInternalServerError)
-		return
-	}
-	status := http.StatusOK
-	if raw, exists := response["status"]; exists {
-		if number, ok := raw.(json.Number); ok {
-			parsed, _ := strconv.Atoi(number.String())
-			status = parsed
-		} else if number, ok := raw.(float64); ok {
-			status = int(number)
+	// No script headers reach the client until all response validation and
+	// output checks have completed. A rejection carries only its own JSON.
+	for name, values := range result.Response.Headers {
+		for _, value := range values {
+			w.Header().Add(name, value)
 		}
 	}
-	if status < 100 || status > 599 {
-		http.Error(w, "OAuth hook returned an invalid status", http.StatusInternalServerError)
-		return
-	}
-	if headers, ok := response["headers"].(map[string]interface{}); ok {
-		for name, raw := range headers {
-			if !isHTTPToken(name) || isForbiddenScriptResponseHeader(name) {
-				http.Error(w, "OAuth hook returned an invalid header", http.StatusInternalServerError)
-				return
-			}
-			values, err := configuredHTTPHeaderValues(raw)
-			if err != nil {
-				http.Error(w, "OAuth hook returned an invalid header", http.StatusInternalServerError)
-				return
-			}
-			for _, value := range values {
-				if strings.ContainsAny(value, "\r\n") {
-					http.Error(w, "OAuth hook returned an invalid header", http.StatusInternalServerError)
-					return
-				}
-				w.Header().Add(http.CanonicalHeaderKey(name), value)
-			}
-		}
-	}
-	if rawContentType, exists := response["contentType"]; exists {
-		contentType, ok := rawContentType.(string)
-		if !ok {
-			http.Error(w, "OAuth hook returned an invalid content type", http.StatusInternalServerError)
-			return
-		}
-		if _, _, err := mime.ParseMediaType(contentType); err != nil || strings.ContainsAny(contentType, "\r\n") {
-			http.Error(w, "OAuth hook returned an invalid content type", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", contentType)
-	}
-	body, err := configuredHTTPResponseBody(response["body"])
-	if err != nil || len(body) > maxConfiguredHTTPResponseBytes {
-		http.Error(w, "OAuth hook returned an invalid body", http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	w.WriteHeader(result.Response.Status)
+	_, _ = w.Write(result.Response.Body)
 }
 
 func mcpOAuthMethodAllowed(role, method string) bool {
+	if isMCPOAuthMetadataRole(role) {
+		return method == http.MethodGet
+	}
 	if role == "oauthAuthorize" {
 		return method == http.MethodGet || method == http.MethodPost
 	}
@@ -1512,6 +1234,9 @@ func mcpOAuthMethodAllowed(role, method string) bool {
 }
 
 func mcpOAuthAllowedMethods(role string) string {
+	if isMCPOAuthMetadataRole(role) {
+		return "GET, OPTIONS"
+	}
 	if role == "oauthAuthorize" {
 		return "GET, POST, OPTIONS"
 	}
@@ -1576,6 +1301,7 @@ func mcpOAuthRequestParams(w http.ResponseWriter, r *http.Request) (map[string]i
 		cookies[cookie.Name] = cookie.Value
 	}
 	params["cookies"] = cookies
+	params["nyan_request"] = newScriptHTTPRequestContext(r, nil)
 	if r.Method != http.MethodPost {
 		return params, nil
 	}
@@ -1603,6 +1329,7 @@ func mcpOAuthRequestParams(w http.ResponseWriter, r *http.Request) (map[string]i
 		}
 		params["form"] = urlValuesToInterfaceMap(values)
 	}
+	params["nyan_request"] = newScriptHTTPRequestContext(r, body)
 	return params, nil
 }
 
@@ -1728,7 +1455,7 @@ func handleMCPStdioMessage(snapshot *APIConfigSnapshot, serverName string, serve
 		if params.Arguments == nil {
 			params.Arguments = map[string]interface{}{}
 		}
-		result, err := executeMCPToolForStdio(snapshot, tool, params.Arguments)
+		result, err := executeMCPToolForStdio(snapshot, tool, params.Arguments, request.ID)
 		if err != nil {
 			return mcpStdioResult(request.ID, mcpToolErrorResult(err.Error(), nil)), true
 		}
@@ -1754,7 +1481,7 @@ func mcpInitializeResult(serverName string, serverConfig APIConfig, protocolVers
 	return result
 }
 
-func executeMCPToolForStdio(snapshot *APIConfigSnapshot, tool MCPToolConfig, arguments map[string]interface{}) (map[string]interface{}, error) {
+func executeMCPToolForStdio(snapshot *APIConfigSnapshot, tool MCPToolConfig, arguments map[string]interface{}, requestID json.RawMessage) (map[string]interface{}, error) {
 	apiConfig := snapshot.Definitions[tool.API]
 	schema, err := resolveAPISchema(apiConfig)
 	if err != nil {
@@ -1768,14 +1495,15 @@ func executeMCPToolForStdio(snapshot *APIConfigSnapshot, tool MCPToolConfig, arg
 		scopes = mcpRequiredScopes(apiConfig.SecuritySchemes)
 	}
 	params := cloneParams(arguments)
-	for _, key := range []string{"api", "nyan_guard", "nyan_mode", "nyan_request", "mcp_principal"} {
+	for _, key := range []string{"api", "nyan_guard", "nyan_request", "mcp_principal"} {
 		delete(params, key)
 	}
 	params["mcp_principal"] = map[string]interface{}{"user_id": "local-process", "username": "local-process", "client_id": "stdio", "transport": "stdio", "scope": strings.Join(scopes, " "), "scopes": scopes}
-	resultJSON, err := callNyanAPIFromVMWithSnapshot(snapshot, tool.API, params)
+	execution, err := executeAPIWithSnapshot(snapshot, tool.API, params)
 	if err != nil {
 		return nil, fmt.Errorf("Tool execution failed")
 	}
+	resultJSON := execution.Body
 	if len(resultJSON) > maxConfiguredHTTPResponseBytes/2 {
 		return nil, fmt.Errorf("Tool result is too large")
 	}
@@ -1783,15 +1511,19 @@ func executeMCPToolForStdio(snapshot *APIConfigSnapshot, tool MCPToolConfig, arg
 	if json.Unmarshal([]byte(resultJSON), &structured) != nil {
 		return nil, fmt.Errorf("Tool returned invalid JSON")
 	}
-	if schema.OutputSource != schemaSourceUnknown && validateJSONSchemaValue(schema.Output, structured) != nil {
-		return nil, fmt.Errorf("Tool result did not match its output schema")
-	}
 	result := map[string]interface{}{"content": []map[string]interface{}{{"type": "text", "text": resultJSON}}}
 	if object, ok := structured.(map[string]interface{}); ok {
 		result["structuredContent"] = object
 		if success, ok := object["success"].(bool); ok && !success {
 			result["isError"] = true
 		}
+	}
+	if err := validateMCPToolResponse(mcpStdioResult(requestID, result)); err != nil {
+		return nil, err
+	}
+	// Validate the complete MCP response before starting this API's Push.
+	if !execution.CheckRejected && !execution.CheckOnly {
+		performPushForResponse(snapshot, apiConfig, execution.Params, execution.Status, []byte(resultJSON))
 	}
 	return result, nil
 }
@@ -2061,14 +1793,30 @@ func buildMCPToolDefinition(snapshot *APIConfigSnapshot, toolConfig MCPToolConfi
 }
 
 func normalizedMCPInputSchema(schema map[string]interface{}) map[string]interface{} {
+	var normalized map[string]interface{}
 	if len(schema) == 0 {
-		return map[string]interface{}{
+		normalized = map[string]interface{}{
 			"type":                 "object",
 			"properties":           map[string]interface{}{},
 			"additionalProperties": true,
 		}
+	} else {
+		normalized = cloneJSONCompatibleValue(schema).(map[string]interface{})
 	}
-	return cloneJSONCompatibleValue(schema).(map[string]interface{})
+	// Publish and validate the same optional execution control for both MCP
+	// transports, including APIs whose schema disallows additional properties.
+	// Keep malformed properties intact so schema compilation still rejects them.
+	if _, exists := normalized["properties"]; !exists {
+		normalized["properties"] = map[string]interface{}{}
+	}
+	if properties, ok := normalized["properties"].(map[string]interface{}); ok {
+		properties["nyan_mode"] = map[string]interface{}{
+			"type":        "string",
+			"enum":        []interface{}{"", "checkOnly"},
+			"description": "Run only paramCheck with checkOnly; do not execute the API body, outCheck, or Push. Omit or use an empty string for normal execution.",
+		}
+	}
+	return normalized
 }
 
 func mcpAnnotationsMap(annotations MCPToolAnnotations) map[string]interface{} {
@@ -2121,7 +1869,7 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 	}
 	principal := interface{}(map[string]interface{}{"anonymous": true, "transport": "streamable_http"})
 	if mcpOAuthConfigured(serverConfig.OAuth) {
-		verifiedPrincipal, authenticated, forbidden := validateMCPAccessToken(snapshot, serverName, serverConfig, runtimeURLs, r.Header.Get("Authorization"), toolConfig.API, requiredScopes)
+		verifiedPrincipal, authenticated, forbidden := validateMCPAccessToken(snapshot, serverName, serverConfig, runtimeURLs, r, toolConfig.API, requiredScopes)
 		if !authenticated {
 			status := http.StatusUnauthorized
 			errorCode := "invalid_token"
@@ -2152,18 +1900,20 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 	}
 
 	executionParams := cloneParams(params.Arguments)
-	for _, reservedName := range []string{"api", "nyan_guard", "nyan_mode", "nyan_request", "mcp_principal"} {
+	for _, reservedName := range []string{"api", "nyan_guard", "nyan_request", "mcp_principal"} {
 		delete(executionParams, reservedName)
 	}
+	executionParams["nyan_request"] = scriptHTTPRequestContext(r)
 	if principal != nil {
 		executionParams["mcp_principal"] = cloneJSONCompatibleValue(principal)
 	}
-	resultJSON, err := callNyanAPIFromVMWithSnapshot(snapshot, toolConfig.API, executionParams)
+	execution, err := executeAPIWithSnapshot(snapshot, toolConfig.API, executionParams)
 	if err != nil {
 		logServiceError(slog.LevelError, "mcp_tool_execution_failed", err, "tool", toolConfig.Name)
 		writeMCPResult(w, request.ID, mcpToolErrorResult("Tool execution failed", nil))
 		return
 	}
+	resultJSON := execution.Body
 	if len(resultJSON) > maxConfiguredHTTPResponseBytes/2 {
 		writeMCPResult(w, request.ID, mcpToolErrorResult("Tool result is too large", nil))
 		return
@@ -2172,13 +1922,6 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 	if err := json.Unmarshal([]byte(resultJSON), &result); err != nil {
 		writeMCPResult(w, request.ID, mcpToolErrorResult("Tool returned invalid JSON", nil))
 		return
-	}
-	if apiSchema.OutputSource != schemaSourceUnknown {
-		if err := validateJSONSchemaValue(apiSchema.Output, result); err != nil {
-			logServiceError(slog.LevelError, "mcp_tool_output_invalid", err, "tool", toolConfig.Name)
-			writeMCPResult(w, request.ID, mcpToolErrorResult("Tool result did not match its output schema", nil))
-			return
-		}
 	}
 	toolResult := map[string]interface{}{
 		"content": []map[string]interface{}{
@@ -2191,7 +1934,35 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 			toolResult["isError"] = true
 		}
 	}
+	if err := validateMCPToolResponse(MCPJSONRPCResponse{
+		JSONRPC: "2.0",
+		ID:      normalizedMCPID(request.ID),
+		Result:  toolResult,
+	}); err != nil {
+		writeMCPResult(w, request.ID, mcpToolErrorResult(err.Error(), nil))
+		return
+	}
+	// Validate the complete MCP response before starting this API's Push.
+	if !execution.CheckRejected && !execution.CheckOnly {
+		performPushForResponse(snapshot, apiConfig, execution.Params, execution.Status, []byte(resultJSON))
+	}
 	writeMCPResult(w, request.ID, toolResult)
+}
+
+// The body limit alone cannot bound the response: content.text escapes the JSON
+// again, structuredContent duplicates objects, and the request ID adds bytes.
+// Check the actual transport envelope before Push. Its JSON-compatible values
+// are independent of the parameters passed to Push and remain unchanged until
+// the transport serializes them for delivery.
+func validateMCPToolResponse(response interface{}) error {
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("Tool response could not be encoded")
+	}
+	if len(encoded) > maxConfiguredHTTPResponseBytes {
+		return fmt.Errorf("Tool response is too large")
+	}
+	return nil
 }
 
 func findMCPToolConfig(tools []MCPToolConfig, name string) (MCPToolConfig, bool) {
@@ -2220,21 +1991,7 @@ func runMCPGuard(snapshot *APIConfigSnapshot, r *http.Request, serverConfig APIC
 	if !exists || guardConfig.Script == "" {
 		return MCPGuardDecision{}, fmt.Errorf("guard API is unavailable")
 	}
-	headers := map[string]interface{}{}
-	if authorization := strings.TrimSpace(r.Header.Get("Authorization")); authorization != "" {
-		headers["authorization"] = authorization
-	}
-	requestContext := map[string]interface{}{
-		"method":        r.Method,
-		"path":          r.URL.Path,
-		"query":         urlValuesToInterfaceMap(r.URL.Query()),
-		"form":          map[string]interface{}{},
-		"json":          nil,
-		"headers":       headers,
-		"cookies":       map[string]interface{}{},
-		"body":          "",
-		"remoteAddress": r.RemoteAddr,
-	}
+	requestContext := scriptHTTPRequestContext(r)
 	params := map[string]interface{}{
 		"api":                  serverConfig.Guard.API,
 		"nyan_request":         requestContext,
@@ -2270,14 +2027,15 @@ func runMCPGuard(snapshot *APIConfigSnapshot, r *http.Request, serverConfig APIC
 	return decision, nil
 }
 
-func validateMCPAccessToken(snapshot *APIConfigSnapshot, serverName string, serverConfig APIConfig, runtimeURLs mcpRuntimeURLs, authorization, tool string, requiredScopes []string) (interface{}, bool, bool) {
-	value, err := invokeMCPOAuthHook(snapshot, serverName, serverConfig, runtimeURLs, "oauthValidateAccessToken", map[string]interface{}{
-		"authorization": authorization, "tool": tool, "required_scopes": requiredScopes,
+func validateMCPAccessToken(snapshot *APIConfigSnapshot, serverName string, serverConfig APIConfig, runtimeURLs mcpRuntimeURLs, r *http.Request, tool string, requiredScopes []string) (interface{}, bool, bool) {
+	execution, err := invokeMCPOAuthHook(snapshot, serverName, serverConfig, runtimeURLs, "oauthValidateAccessToken", map[string]interface{}{
+		"authorization": r.Header.Get("Authorization"), "tool": tool, "required_scopes": requiredScopes,
+		"nyan_request": scriptHTTPRequestContext(r),
 	})
-	if err != nil {
+	if err != nil || execution.CheckRejected || execution.CheckOnly {
 		return nil, false, false
 	}
-	result, ok := value.(map[string]interface{})
+	result, ok := execution.Value.(map[string]interface{})
 	if !ok {
 		return nil, false, false
 	}
@@ -2320,6 +2078,10 @@ func mcpOAuthChallenge(runtimeURLs mcpRuntimeURLs, scopes []string, errorCode, d
 
 func mcpOAuthAPIForRole(serverConfig APIConfig, role string) string {
 	switch role {
+	case "authorizationServerMetadata":
+		return serverConfig.OAuth.AuthorizationServerMetadata
+	case "protectedResourceMetadata":
+		return serverConfig.OAuth.ProtectedResourceMetadata
 	case "oauthAuthorize":
 		return serverConfig.OAuth.Authorize
 	case "oauthToken":
@@ -2335,11 +2097,134 @@ func mcpOAuthAPIForRole(serverConfig APIConfig, role string) string {
 	}
 }
 
-func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverConfig APIConfig, runtimeURLs mcpRuntimeURLs, role string, extra map[string]interface{}) (interface{}, error) {
+type mcpOAuthHTTPResponse struct {
+	Status  int
+	Headers http.Header
+	Body    []byte
+}
+
+type mcpOAuthExecutionResult struct {
+	Value         interface{}
+	Response      mcpOAuthHTTPResponse
+	CheckRejected bool
+	CheckOnly     bool
+}
+
+func isMCPOAuthMetadataRole(role string) bool {
+	return role == "authorizationServerMetadata" || role == "protectedResourceMetadata"
+}
+
+// HTTP control values use body-over-query precedence without merging the
+// separately exposed OAuth query/form/body data. Internal verification never
+// reads these values and must always complete authentication.
+func mcpOAuthHTTPMode(params map[string]interface{}) (string, error) {
+	control := make(map[string]interface{})
+	for _, source := range []string{"query", "form", "body"} {
+		if values, ok := params[source].(map[string]interface{}); ok {
+			if value, exists := values["nyan_mode"]; exists {
+				control["nyan_mode"] = value
+			}
+		}
+	}
+	return parseExecutionMode(control)
+}
+
+func prepareMCPOAuthHTTPResponse(value interface{}) (mcpOAuthHTTPResponse, error) {
+	prepared := mcpOAuthHTTPResponse{Status: http.StatusOK, Headers: make(http.Header)}
+	response, ok := value.(map[string]interface{})
+	if !ok {
+		return prepared, fmt.Errorf("OAuth hook returned an invalid response")
+	}
+	if raw, exists := response["status"]; exists {
+		number, ok := raw.(json.Number)
+		if !ok {
+			return prepared, fmt.Errorf("OAuth hook returned an invalid status")
+		}
+		status, err := strconv.Atoi(number.String())
+		if err != nil || status < 100 || status > 599 {
+			return prepared, fmt.Errorf("OAuth hook returned an invalid status")
+		}
+		prepared.Status = status
+	}
+	if raw, exists := response["headers"]; exists {
+		headers, ok := raw.(map[string]interface{})
+		if !ok {
+			return prepared, fmt.Errorf("OAuth hook returned invalid headers")
+		}
+		for name, raw := range headers {
+			if !isHTTPToken(name) || isForbiddenScriptResponseHeader(name) {
+				return prepared, fmt.Errorf("OAuth hook returned an invalid header")
+			}
+			values, err := scriptResponseHeaderValues(raw)
+			if err != nil {
+				return prepared, err
+			}
+			for _, value := range values {
+				if strings.ContainsAny(value, "\r\n") {
+					return prepared, fmt.Errorf("OAuth hook returned an invalid header")
+				}
+				prepared.Headers.Add(name, value)
+			}
+		}
+	}
+	if raw, exists := response["contentType"]; exists {
+		contentType, ok := raw.(string)
+		if !ok || contentType == "" {
+			return prepared, fmt.Errorf("OAuth hook returned an invalid content type")
+		}
+		prepared.Headers.Set("Content-Type", contentType)
+	}
+	for _, contentType := range prepared.Headers.Values("Content-Type") {
+		if _, _, err := mime.ParseMediaType(contentType); err != nil || strings.ContainsAny(contentType, "\r\n") {
+			return prepared, fmt.Errorf("OAuth hook returned an invalid content type")
+		}
+	}
+	body, err := scriptResponseBody(response["body"])
+	if err != nil || len(body) > maxConfiguredHTTPResponseBytes {
+		return prepared, fmt.Errorf("OAuth hook returned an invalid body")
+	}
+	prepared.Body = body
+	if prepared.Headers.Get("Content-Type") == "" && len(body) > 0 {
+		prepared.Headers.Set("Content-Type", http.DetectContentType(body))
+	}
+	return prepared, nil
+}
+
+func runMCPOAuthCheck(snapshot *APIConfigSnapshot, path string, params map[string]interface{}, runtimeConfig APIRuntimeConfig) (bool, mcpOAuthHTTPResponse, error) {
+	response := mcpOAuthHTTPResponse{}
+	// Each check has its own restricted VM, transaction and time limit. It
+	// receives a copy so inspection cannot rewrite the response or credentials.
+	copyParams := cloneJSONCompatibleValue(params).(map[string]interface{})
+	body, err := runScriptWithRuntimeWithSnapshot(snapshot, []string{path}, copyParams, runtimeConfig, true)
+	if err != nil {
+		return false, response, err
+	}
+	if len(body) > maxConfiguredHTTPResponseBytes {
+		return false, response, fmt.Errorf("OAuth check result is too large")
+	}
+	var check struct {
+		Success *bool `json:"success"`
+		Status  *int  `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(body), &check); err != nil || check.Success == nil || check.Status == nil || *check.Status < 200 || *check.Status > 599 {
+		return false, response, fmt.Errorf("OAuth check returned an invalid result")
+	}
+	response = mcpOAuthHTTPResponse{Status: *check.Status, Headers: http.Header{"Content-Type": {"application/json"}}, Body: []byte(body)}
+	return *check.Success, response, nil
+}
+
+func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverConfig APIConfig, runtimeURLs mcpRuntimeURLs, role string, extra map[string]interface{}) (execution mcpOAuthExecutionResult, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			execution = mcpOAuthExecutionResult{}
+			err = fmt.Errorf("OAuth execution panic: %v", recovered)
+		}
+	}()
 	apiName := mcpOAuthAPIForRole(serverConfig, role)
 	definition, exists := snapshot.Definitions[apiName]
-	if !exists || getAPIType(definition) != apiTypeAPI || definition.Script == "" {
-		return nil, fmt.Errorf("OAuth API is unavailable")
+	metadata := isMCPOAuthMetadataRole(role)
+	if !exists || getAPIType(definition) != apiTypeAPI || (!metadata && definition.Script == "") {
+		return execution, fmt.Errorf("OAuth API is unavailable")
 	}
 	endpointPath, _ := canonicalAPIEndpointPath(apiName)
 	params := map[string]interface{}{
@@ -2355,9 +2240,13 @@ func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverCo
 	for key, value := range extra {
 		params[key] = value
 	}
-	requestContext := map[string]interface{}{
-		"method": extra["method"], "path": extra["request_path"], "query": extra["query"],
-		"form": extra["form"], "json": extra["body"], "headers": extra["headers"], "cookies": extra["cookies"],
+	if role == "oauthValidateAccessToken" {
+		delete(params, "nyan_mode")
+	}
+	execution.CheckOnly = params["nyan_mode"] == "checkOnly"
+	requestContext, ok := extra["nyan_request"].(map[string]interface{})
+	if !ok || requestContext == nil {
+		requestContext = map[string]interface{}{}
 	}
 	params["nyan_request"] = requestContext
 	runtimeConfig := definition.Runtime
@@ -2375,17 +2264,89 @@ func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverCo
 	runtimeConfig.Settings["authorizationCookiePath"], _ = canonicalAPIEndpointPath(serverConfig.OAuth.Authorize)
 	runtimeConfig.Settings["scopes"] = append([]string(nil), snapshot.Definitions[serverConfig.OAuth.VerifyAccess].Scopes...)
 	runtimeConfig.Settings["redirectURIAllowedPrefixes"] = append([]string(nil), serverConfig.RedirectURIAllowedPrefixes...)
-	result, err := runScriptWithRuntimeWithSnapshot(snapshot, []string{definition.Script}, params, runtimeConfig, true)
-	if err != nil {
-		return nil, err
+	checkPath := getParamCheckScriptPath(definition)
+	if execution.CheckOnly && checkPath == "" {
+		return execution, fmt.Errorf("OAuth API has no input check")
 	}
-	var value interface{}
-	decoder := json.NewDecoder(strings.NewReader(result))
-	decoder.UseNumber()
-	if err := decoder.Decode(&value); err != nil {
-		return nil, fmt.Errorf("decode OAuth hook result: %w", err)
+	if checkPath != "" {
+		allowed, checked, err := runMCPOAuthCheck(snapshot, checkPath, params, runtimeConfig)
+		if err != nil {
+			return execution, err
+		}
+		// Keep NyanQL's input-check contract: success determines acceptance.
+		if !allowed || execution.CheckOnly {
+			execution.CheckRejected, execution.Response = !allowed, checked
+			return execution, nil
+		}
 	}
-	return value, nil
+	if metadata {
+		scopes := snapshot.Definitions[serverConfig.OAuth.VerifyAccess].Scopes
+		value := map[string]interface{}{
+			"resource": runtimeURLs.Resource, "authorization_servers": []string{runtimeURLs.Issuer},
+			"scopes_supported": scopes, "bearer_methods_supported": []string{"header"},
+		}
+		if role == "authorizationServerMetadata" {
+			value = map[string]interface{}{
+				"issuer": runtimeURLs.Issuer, "authorization_endpoint": runtimeURLs.AuthorizationEndpoint,
+				"token_endpoint": runtimeURLs.TokenEndpoint, "registration_endpoint": runtimeURLs.RegistrationEndpoint,
+				"response_types_supported": []string{"code"}, "grant_types_supported": []string{"authorization_code", "refresh_token"},
+				"token_endpoint_auth_methods_supported": []string{"none"}, "code_challenge_methods_supported": []string{"S256"}, "scopes_supported": scopes,
+			}
+		}
+		body, err := json.Marshal(value)
+		if err != nil || len(body) > maxConfiguredHTTPResponseBytes {
+			return execution, fmt.Errorf("OAuth metadata is invalid or too large")
+		}
+		execution.Response = mcpOAuthHTTPResponse{Status: http.StatusOK, Headers: http.Header{"Content-Type": {"application/json"}}, Body: body}
+	} else {
+		bodyParams := cloneJSONCompatibleValue(params).(map[string]interface{})
+		result, err := runScriptWithRuntimeWithSnapshot(snapshot, []string{definition.Script}, bodyParams, runtimeConfig, true)
+		if err != nil {
+			return execution, err
+		}
+		if !json.Valid([]byte(result)) {
+			return execution, fmt.Errorf("OAuth hook returned invalid JSON")
+		}
+		decoder := json.NewDecoder(strings.NewReader(result))
+		decoder.UseNumber()
+		if err := decoder.Decode(&execution.Value); err != nil {
+			return execution, err
+		}
+		if role == "oauthValidateAccessToken" {
+			if len(result) > maxConfiguredHTTPResponseBytes {
+				return execution, fmt.Errorf("OAuth verification result is too large")
+			}
+			// Inspect the whole authentication decision, not an HTTP envelope.
+			execution.Response = mcpOAuthHTTPResponse{Status: http.StatusOK, Headers: http.Header{"Content-Type": {"application/json"}}, Body: []byte(result)}
+		} else {
+			execution.Response, err = prepareMCPOAuthHTTPResponse(execution.Value)
+			if err != nil {
+				return execution, err
+			}
+		}
+	}
+	if path := strings.TrimSpace(definition.OutCheck); path != "" {
+		response := execution.Response
+		body, encoded := string(response.Body), base64.StdEncoding.EncodeToString(response.Body)
+		checkParams := cloneParams(params)
+		checkParams["nyan_output"] = map[string]interface{}{
+			"status": response.Status, "contentType": response.Headers.Get("Content-Type"),
+			"headers": urlValuesToInterfaceMap(url.Values(response.Headers)),
+			"body":    body, "bodyBase64": encoded, "bodyLength": len(response.Body), "bodyLengthBytes": len(response.Body),
+		}
+		checkParams["nyan_output_status"], checkParams["nyan_output_content_type"] = response.Status, response.Headers.Get("Content-Type")
+		checkParams["nyan_output_body"], checkParams["nyan_output_body_base64"] = body, encoded
+		allowed, checked, err := runMCPOAuthCheck(snapshot, path, checkParams, runtimeConfig)
+		if err != nil {
+			return execution, err
+		}
+		if !allowed {
+			execution.CheckRejected, execution.Response = true, checked
+		} else {
+			execution.Response.Status = checked.Status
+		}
+	}
+	return execution, nil
 }
 
 func mcpRequiredScopes(schemes []MCPSecurityScheme) []string {
@@ -2411,7 +2372,7 @@ func applyMCPGuardHeaders(w http.ResponseWriter, headers map[string]interface{})
 		if !isHTTPToken(name) || isForbiddenScriptResponseHeader(http.CanonicalHeaderKey(name)) {
 			continue
 		}
-		values, err := configuredHTTPHeaderValues(rawValue)
+		values, err := scriptResponseHeaderValues(rawValue)
 		if err != nil {
 			continue
 		}
@@ -2562,13 +2523,75 @@ func isWebSocketRequest(r *http.Request) bool {
 	return strings.ToLower(upgrade) == "websocket"
 }
 
+// checkWebSocketConnection returns true only when the connection may be upgraded.
+// Check-only responses and failures are completed as HTTP responses, before Hub registration.
+func checkWebSocketConnection(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request) (allowed bool) {
+	apiName := strings.TrimPrefix(r.URL.Path, "/")
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logServiceError(slog.LevelError, "websocket_param_check_panicked", fmt.Errorf("check panic: %v", recovered), "api", apiName)
+			sendJSONError(w, "WebSocket connection check failed", http.StatusInternalServerError)
+			allowed = false
+		}
+	}()
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		sendJSONError(w, "Invalid query parameters", http.StatusBadRequest)
+		return false
+	}
+	params := urlValuesToInterfaceMap(query)
+	params["nyan_request"] = scriptHTTPRequestContext(r)
+	params["api"] = apiName
+	mode, err := parseExecutionMode(params)
+	if err != nil {
+		sendJSONError(w, err.Error(), http.StatusBadRequest)
+		return false
+	}
+	apiConfig, exists := snapshot.Definitions[apiName]
+	checkPath := ""
+	if exists && getAPIType(apiConfig) == apiTypeAPI {
+		checkPath = getParamCheckScriptPath(apiConfig)
+	}
+	if checkPath == "" {
+		if mode == "checkOnly" {
+			sendJSONError(w, "No check script for this API", http.StatusNotFound)
+			return false
+		}
+		return true // Includes legacy ws_client subscription paths without an API definition.
+	}
+	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
+	if err != nil {
+		logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiName)
+		acceptedKeys = []string{}
+	}
+	success, status, _, body, err := runCheckScriptWithSnapshot(snapshot, checkPath, params, acceptedKeys)
+	if err != nil || status < 200 || status > 599 {
+		if err == nil {
+			err = fmt.Errorf("invalid connection check status: %d", status)
+		}
+		logServiceError(slog.LevelError, "websocket_param_check_failed", err, "api", apiName)
+		sendJSONError(w, "WebSocket connection check failed", http.StatusInternalServerError)
+		return false
+	}
+	if !success || mode == "checkOnly" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+		return false
+	}
+	return true
+}
+
 // WebSocketアップグレードと接続管理を行う関数
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+func handleWebSocketWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request) {
 	select {
 	case websocketConnectionSlots <- struct{}{}:
 		defer func() { <-websocketConnectionSlots }()
 	default:
 		http.Error(w, "too many WebSocket connections", http.StatusServiceUnavailable)
+		return
+	}
+	if !checkWebSocketConnection(snapshot, w, r) {
 		return
 	}
 	channel := strings.TrimPrefix(r.URL.Path, "/")
@@ -2582,8 +2605,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-	hub.AddClient(channel, conn)
-	defer hub.RemoveClient(channel, conn)
+	connectionHub := hub
+	connectionHub.AddClient(channel, conn)
+	defer connectionHub.RemoveClient(channel, conn)
 	conn.SetReadLimit(maxWebSocketMessageBytes)
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 	conn.SetPongHandler(func(string) error {
@@ -2612,15 +2636,83 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// シンプルな読み込みループ（ここで受信したメッセージを必要に応じて処理可能）
+	// Execute each requested API with its input and output checks before replying.
 	for {
-		_, msg, err := conn.ReadMessage()
+		messageType, msg, err := conn.ReadMessage()
 		if err != nil {
 			logWebSocketDisconnect("websocket_disconnected", channel, err)
 			break
 		}
 		serviceLog(slog.LevelDebug, "websocket_message_received", "channel", channel, "bytes", len(msg))
+		if messageType != websocket.TextMessage {
+			continue
+		}
+		if response := executeWebSocketAPIMessage(r, msg); response != nil {
+			if err := connectionHub.Send(conn, response); err != nil {
+				logWebSocketDisconnect("websocket_response_failed", channel, err)
+				break
+			}
+		}
 	}
+}
+
+func webSocketAPIError(status int, message string) []byte {
+	response := JSONErrorResponse{Success: false, Status: status}
+	response.Error.Message = message
+	encoded, _ := json.Marshal(response)
+	return encoded
+}
+
+func executeWebSocketAPIMessage(r *http.Request, message []byte) (response []byte) {
+	apiName := ""
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logServiceError(slog.LevelError, "websocket_api_panicked", fmt.Errorf("API execution panic: %v", recovered), "api", apiName)
+			response = webSocketAPIError(http.StatusInternalServerError, "API execution failed")
+		}
+	}()
+	var params map[string]interface{}
+	if err := json.Unmarshal(message, &params); err != nil || params == nil {
+		return webSocketAPIError(http.StatusBadRequest, "API request must be a JSON object")
+	}
+	requestedAPI, requested := params["api"]
+	if !requested {
+		// Messages without an API request remain compatible with Push subscribers.
+		return nil
+	}
+	apiName, ok := requestedAPI.(string)
+	apiName = strings.TrimSpace(apiName)
+	if !ok || apiName == "" {
+		return webSocketAPIError(http.StatusBadRequest, "API key is required and must be a string")
+	}
+	user, password, authenticated := r.BasicAuth()
+	if !authenticated || !checkPassword(user, password, config) {
+		return webSocketAPIError(http.StatusUnauthorized, "Unauthorized")
+	}
+	// Client messages must not supply trusted runtime or MCP authentication context.
+	for _, key := range []string{"nyan_request", "nyan_guard", "mcp_principal"} {
+		if _, exists := params[key]; exists {
+			return webSocketAPIError(http.StatusBadRequest, "Reserved request parameter: "+key)
+		}
+	}
+	if _, err := parseExecutionMode(params); err != nil {
+		return webSocketAPIError(http.StatusBadRequest, err.Error())
+	}
+	snapshot := currentAPISnapshot()
+	if snapshot == nil {
+		return webSocketAPIError(http.StatusServiceUnavailable, "API configuration is not loaded")
+	}
+	apiConfig, exists := snapshot.Definitions[apiName]
+	if !exists || getAPIType(apiConfig) != apiTypeAPI {
+		return webSocketAPIError(http.StatusNotFound, "API not found")
+	}
+	params["nyan_request"] = scriptHTTPRequestContext(r)
+	result, err := callNyanAPIFromVMWithSnapshot(snapshot, apiName, params)
+	if err != nil {
+		logServiceError(slog.LevelError, "websocket_api_failed", err, "api", apiName)
+		return webSocketAPIError(http.StatusInternalServerError, "API execution failed")
+	}
+	return []byte(result)
 }
 
 func parseAPIHotReloadInterval(value string) (time.Duration, error) {
@@ -2705,7 +2797,7 @@ func loadAPIConfigStateAttempt(rootState APIFileState, data []byte) (*apiConfigL
 		return nil, fileStates, err
 	}
 	hash := sha256.Sum256(data)
-	snapshot := newLoadedAPIConfigSnapshot(files, sources, fileStates, schedules, wsClients)
+	snapshot := newLoadedAPIConfigSnapshot(rootState.Path, files, sources, fileStates, schedules, wsClients)
 	result := &apiConfigLoadResult{
 		Snapshot:  snapshot,
 		Schedules: snapshot.Schedules,
@@ -2840,23 +2932,6 @@ func decodeAPIConfigDefinition(apiKey string, rawDefinition json.RawMessage, api
 	for i := range apiConfig.Runtime.SQLFiles {
 		apiConfig.Runtime.SQLFiles[i] = resolvePathFromBase(apiBaseDir, strings.TrimSpace(apiConfig.Runtime.SQLFiles[i]))
 	}
-	if apiConfig.HTTP != nil {
-		apiConfig.HTTP.Path = strings.TrimSpace(apiConfig.HTTP.Path)
-		apiConfig.HTTP.Access = strings.ToLower(strings.TrimSpace(apiConfig.HTTP.Access))
-		apiConfig.HTTP.ResponseMode = strings.ToLower(strings.TrimSpace(apiConfig.HTTP.ResponseMode))
-		if apiConfig.HTTP.RateLimit != nil {
-			apiConfig.HTTP.RateLimit.Window = strings.TrimSpace(apiConfig.HTTP.RateLimit.Window)
-		}
-		for i := range apiConfig.HTTP.AllowedRemoteIPs {
-			apiConfig.HTTP.AllowedRemoteIPs[i] = strings.TrimSpace(apiConfig.HTTP.AllowedRemoteIPs[i])
-		}
-		for i := range apiConfig.HTTP.AllowedOrigins {
-			apiConfig.HTTP.AllowedOrigins[i] = strings.TrimSpace(apiConfig.HTTP.AllowedOrigins[i])
-		}
-		for i := range apiConfig.HTTP.Methods {
-			apiConfig.HTTP.Methods[i] = strings.ToUpper(strings.TrimSpace(apiConfig.HTTP.Methods[i]))
-		}
-	}
 	for toolIndex := range apiConfig.Tools {
 		tool := &apiConfig.Tools[toolIndex]
 		tool.Name = strings.TrimSpace(tool.Name)
@@ -2879,7 +2954,7 @@ func decodeAPIConfigDefinition(apiKey string, rawDefinition json.RawMessage, api
 func validateAPIConfigKnownFields(apiKey string, rawDefinition json.RawMessage) error {
 	topLevel, err := decodeKnownJSONObject(rawDefinition, "definition "+strconv.Quote(apiKey), stringSet(
 		"sql", "script", "path", "paramCheck", "paramcheck", "check", "outCheck", "outcheck",
-		"push", "trigger", "title", "description", "type", "connectURL", "http", "runtime", "transport",
+		"push", "trigger", "title", "description", "type", "connectURL", "runtime", "transport",
 		"protocolVersions", "tools", "instructions", "allowedOrigins", "redirectURIAllowedPrefixes",
 		"rateLimit", "maxConcurrent", "oauth", "securitySchemes", "annotations", "scopes",
 	))
@@ -2889,19 +2964,6 @@ func validateAPIConfigKnownFields(apiKey string, rawDefinition json.RawMessage) 
 	if raw, exists := topLevel["trigger"]; exists {
 		if _, err := decodeKnownJSONObject(raw, "definition "+strconv.Quote(apiKey)+".trigger", stringSet("type", "value")); err != nil {
 			return fmt.Errorf("decode api JSON: %w", err)
-		}
-	}
-	if raw, exists := topLevel["http"]; exists {
-		httpFields, err := decodeKnownJSONObject(raw, "definition "+strconv.Quote(apiKey)+".http", stringSet(
-			"path", "methods", "access", "responseMode", "allowedRemoteIPs", "allowedOrigins", "rateLimit",
-		))
-		if err != nil {
-			return fmt.Errorf("decode api JSON: %w", err)
-		}
-		if rateLimit, exists := httpFields["rateLimit"]; exists {
-			if _, err := decodeKnownJSONObject(rateLimit, "definition "+strconv.Quote(apiKey)+".http.rateLimit", stringSet("requests", "window")); err != nil {
-				return fmt.Errorf("decode api JSON: %w", err)
-			}
 		}
 	}
 	if raw, exists := topLevel["runtime"]; exists {
@@ -2977,31 +3039,11 @@ func decodeKnownJSONObject(raw json.RawMessage, contextName string, allowed map[
 func validateConfiguredAPIExtensions(definitions map[string]APIConfig) error {
 	routes := make(map[string]string)
 	oauthOwners := make(map[string]string)
-	reservedRoutes := map[string]struct{}{
-		"/nyan-rpc": {},
-		"/nyan":     {},
-		"/nyan/":    {},
-	}
 
 	for _, apiName := range sortedAPIConfigNames(definitions) {
 		apiConfig := definitions[apiName]
 		if err := validateAPIConfigFieldPlacement(apiName, apiConfig); err != nil {
 			return err
-		}
-		if apiConfig.HTTP != nil {
-			if err := validateConfiguredHTTPAPI(apiName, apiConfig); err != nil {
-				return err
-			}
-			if configuredHTTPAccess(apiConfig) != configuredHTTPAccessInternal {
-				routePath := apiConfig.HTTP.Path
-				if _, reserved := reservedRoutes[routePath]; reserved {
-					return fmt.Errorf("configuration error for API %q: HTTP path %q is reserved", apiName, routePath)
-				}
-				if previous, exists := routes[routePath]; exists {
-					return fmt.Errorf("configuration error for API %q: HTTP path %q conflicts with %q", apiName, routePath, previous)
-				}
-				routes[routePath] = apiName
-			}
 		}
 		if getAPIType(apiConfig) == apiTypeMCP {
 			if err := validateMCPServerConfig(apiName, apiConfig, definitions); err != nil {
@@ -3041,7 +3083,7 @@ func validateConfiguredAPIExtensions(definitions map[string]APIConfig) error {
 		publicRoute := "/" + strings.Trim(strings.TrimSpace(apiName), "/")
 		for routePath, routeOwner := range routes {
 			if routePath == publicRoute || strings.HasPrefix(routePath, publicRoute+"/") || strings.HasPrefix(publicRoute, routePath+"/") {
-				return fmt.Errorf("configuration error: configured HTTP path %q for %q conflicts with public API %q", routePath, routeOwner, apiName)
+				return fmt.Errorf("configuration error: MCP/OAuth path %q for %q conflicts with public API %q", routePath, routeOwner, apiName)
 			}
 		}
 	}
@@ -3060,82 +3102,14 @@ func validateAPIConfigFieldPlacement(apiName string, apiConfig APIConfig) error 
 		if apiConfig.Path != "" || apiConfig.Resource != "" || apiConfig.Guard.API != "" {
 			return fmt.Errorf("configuration error for MCP server %q: path, resource, and guard are not supported; endpoints and OAuth are API-name based", apiName)
 		}
-		if apiConfig.HTTP != nil {
-			return fmt.Errorf("configuration error for MCP server %q: http settings are not allowed; use the MCP top-level path and allowedOrigins fields", apiName)
-		}
 		if apiConfig.Script != "" || len(apiConfig.SQL) > 0 || apiConfig.ParamCheck != "" || apiConfig.OutCheck != "" || apiConfig.Push != "" || apiConfig.ConnectURL != "" || apiConfig.Trigger.Type != "" || apiConfig.Trigger.Value != "" || len(apiConfig.Runtime.Capabilities) > 0 || len(apiConfig.Runtime.SQLFiles) > 0 || len(apiConfig.Runtime.Settings) > 0 {
 			return fmt.Errorf("configuration error for MCP server %q: API execution fields are not allowed on an MCP server definition", apiName)
 		}
 	}
-	if definitionType == apiTypeAPI && apiConfig.HTTP == nil {
+	if definitionType == apiTypeAPI {
 		if err := validateRuntimeConfig(apiName, apiConfig.Runtime); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-func validateConfiguredHTTPAPI(apiName string, apiConfig APIConfig) error {
-	httpConfig := apiConfig.HTTP
-	if httpConfig == nil {
-		return nil
-	}
-	access := configuredHTTPAccess(apiConfig)
-	switch access {
-	case configuredHTTPAccessBasic, configuredHTTPAccessAnonymous, configuredHTTPAccessInternal:
-	default:
-		return fmt.Errorf("configuration error for API %q: unsupported http.access %q", apiName, httpConfig.Access)
-	}
-	responseMode := configuredHTTPResponseMode(apiConfig)
-	switch responseMode {
-	case configuredHTTPResponseNyan, configuredHTTPResponseRaw:
-	default:
-		return fmt.Errorf("configuration error for API %q: unsupported http.responseMode %q", apiName, httpConfig.ResponseMode)
-	}
-	if access != configuredHTTPAccessInternal {
-		if err := validateConfiguredHTTPPath(httpConfig.Path); err != nil {
-			return fmt.Errorf("configuration error for API %q: %w", apiName, err)
-		}
-	}
-	if responseMode == configuredHTTPResponseRaw && strings.TrimSpace(apiConfig.Script) == "" {
-		return fmt.Errorf("configuration error for API %q: raw HTTP responses require script", apiName)
-	}
-	if httpConfig.RateLimit != nil {
-		if httpConfig.RateLimit.Requests < 1 || httpConfig.RateLimit.Requests > 10000 {
-			return fmt.Errorf("configuration error for API %q: http.rateLimit.requests must be between 1 and 10000", apiName)
-		}
-		window, err := time.ParseDuration(httpConfig.RateLimit.Window)
-		if err != nil || window < time.Second || window > 24*time.Hour {
-			return fmt.Errorf("configuration error for API %q: http.rateLimit.window must be between 1s and 24h", apiName)
-		}
-	}
-	seenRemoteIPs := make(map[string]struct{})
-	for _, allowedRemoteIP := range httpConfig.AllowedRemoteIPs {
-		parsedIP := net.ParseIP(allowedRemoteIP)
-		if parsedIP == nil {
-			return fmt.Errorf("configuration error for API %q: invalid http.allowedRemoteIPs value %q", apiName, allowedRemoteIP)
-		}
-		canonicalIP := parsedIP.String()
-		if _, exists := seenRemoteIPs[canonicalIP]; exists {
-			return fmt.Errorf("configuration error for API %q: duplicate http.allowedRemoteIPs value %q", apiName, allowedRemoteIP)
-		}
-		seenRemoteIPs[canonicalIP] = struct{}{}
-	}
-	if err := validateAllowedOrigins("API "+strconv.Quote(apiName)+" http", httpConfig.AllowedOrigins); err != nil {
-		return err
-	}
-	seenMethods := make(map[string]struct{})
-	for _, method := range httpConfig.Methods {
-		if !isHTTPToken(method) {
-			return fmt.Errorf("configuration error for API %q: invalid HTTP method %q", apiName, method)
-		}
-		if _, exists := seenMethods[method]; exists {
-			return fmt.Errorf("configuration error for API %q: duplicate HTTP method %q", apiName, method)
-		}
-		seenMethods[method] = struct{}{}
-	}
-	if err := validateRuntimeConfig(apiName, apiConfig.Runtime); err != nil {
-		return err
 	}
 	return nil
 }
@@ -3399,30 +3373,6 @@ func validateRateLimitConfig(owner string, rateLimit *HTTPRateLimitConfig) error
 	window, err := time.ParseDuration(rateLimit.Window)
 	if err != nil || window < time.Second || window > 24*time.Hour {
 		return fmt.Errorf("configuration error for %s: rateLimit.window must be between 1s and 24h", owner)
-	}
-	return nil
-}
-
-func configuredHTTPAccess(apiConfig APIConfig) string {
-	if apiConfig.HTTP == nil || apiConfig.HTTP.Access == "" {
-		return configuredHTTPAccessBasic
-	}
-	return apiConfig.HTTP.Access
-}
-
-func configuredHTTPResponseMode(apiConfig APIConfig) string {
-	if apiConfig.HTTP == nil || apiConfig.HTTP.ResponseMode == "" {
-		return configuredHTTPResponseNyan
-	}
-	return apiConfig.HTTP.ResponseMode
-}
-
-func validateConfiguredHTTPPath(routePath string) error {
-	if routePath == "" || !strings.HasPrefix(routePath, "/") {
-		return fmt.Errorf("HTTP path must be an absolute path")
-	}
-	if strings.ContainsAny(routePath, "?#\\") || path.Clean(routePath) != routePath || routePath == "/" {
-		return fmt.Errorf("HTTP path %q is not canonical", routePath)
 	}
 	return nil
 }
@@ -3851,17 +3801,6 @@ func cloneAPIConfig(apiConfig APIConfig) APIConfig {
 	if apiConfig.Runtime.Settings != nil {
 		cloned.Runtime.Settings = cloneJSONCompatibleValue(apiConfig.Runtime.Settings).(map[string]interface{})
 	}
-	if apiConfig.HTTP != nil {
-		httpConfig := *apiConfig.HTTP
-		httpConfig.Methods = append([]string(nil), apiConfig.HTTP.Methods...)
-		httpConfig.AllowedRemoteIPs = append([]string(nil), apiConfig.HTTP.AllowedRemoteIPs...)
-		httpConfig.AllowedOrigins = append([]string(nil), apiConfig.HTTP.AllowedOrigins...)
-		if apiConfig.HTTP.RateLimit != nil {
-			rateLimit := *apiConfig.HTTP.RateLimit
-			httpConfig.RateLimit = &rateLimit
-		}
-		cloned.HTTP = &httpConfig
-	}
 	cloned.Tools = make([]MCPToolConfig, len(apiConfig.Tools))
 	for toolIndex, tool := range apiConfig.Tools {
 		clonedTool := tool
@@ -3930,20 +3869,20 @@ func newAPIConfigSnapshot(files map[string]APIConfig, sourcePath string, sourceH
 		}
 	}
 
-	return newAPIConfigSnapshotFromParts(files, sources, fileStates)
+	return newAPIConfigSnapshotFromParts(sourcePath, files, sources, fileStates)
 }
 
-func newAPIConfigSnapshotFromParts(files map[string]APIConfig, sources map[string]string, fileStates map[string]APIFileState) *APIConfigSnapshot {
-	return newLoadedAPIConfigSnapshot(files, sources, fileStates, nil, nil)
+func newAPIConfigSnapshotFromParts(rootPath string, files map[string]APIConfig, sources map[string]string, fileStates map[string]APIFileState) *APIConfigSnapshot {
+	return newLoadedAPIConfigSnapshot(rootPath, files, sources, fileStates, nil, nil)
 }
 
-func newLoadedAPIConfigSnapshot(files map[string]APIConfig, sources map[string]string, fileStates map[string]APIFileState, schedules map[string]scheduleJobConfig, wsClients map[string]wsClientConfig) *APIConfigSnapshot {
+func newLoadedAPIConfigSnapshot(rootPath string, files map[string]APIConfig, sources map[string]string, fileStates map[string]APIFileState, schedules map[string]scheduleJobConfig, wsClients map[string]wsClientConfig) *APIConfigSnapshot {
 	definitions := make(map[string]APIConfig, len(files))
 	apis := make(map[string]APIDetails)
 	for name, apiConfig := range files {
 		cloned := cloneAPIConfig(apiConfig)
 		definitions[name] = cloned
-		if getAPIType(cloned) == apiTypeAPI && cloned.HTTP == nil {
+		if getAPIType(cloned) == apiTypeAPI {
 			apis[name] = APIDetails{Description: cloned.Description}
 		}
 	}
@@ -3964,6 +3903,7 @@ func newLoadedAPIConfigSnapshot(files map[string]APIConfig, sources map[string]s
 		clonedWSClients[name] = wsClient
 	}
 	return &APIConfigSnapshot{
+		RootPath:    rootPath,
 		Definitions: definitions,
 		APIs:        apis,
 		Sources:     clonedSources,
@@ -4100,7 +4040,8 @@ func verifyAPIFileStates(expected map[string]APIFileState) error {
 }
 
 func sameAPIConfigSnapshot(left, right *APIConfigSnapshot) bool {
-	return reflect.DeepEqual(left.Definitions, right.Definitions) &&
+	return left.RootPath == right.RootPath &&
+		reflect.DeepEqual(left.Definitions, right.Definitions) &&
 		reflect.DeepEqual(left.APIs, right.APIs) &&
 		reflect.DeepEqual(left.Sources, right.Sources) &&
 		reflect.DeepEqual(left.Files, right.Files) &&
@@ -4209,6 +4150,19 @@ func resolvePathFromBase(baseDir, pathValue string) string {
 	return filepath.Join(baseDir, pathValue)
 }
 
+// Runtime file helpers share the top-level API directory, including calls from
+// included APIs. Use the execution snapshot so reloads cannot change this base
+// midway through a request or nested nyanCallMe invocation.
+func resolveRuntimeFilePath(snapshot *APIConfigSnapshot, pathValue string) (string, error) {
+	if filepath.IsAbs(pathValue) {
+		return pathValue, nil
+	}
+	if snapshot == nil || snapshot.RootPath == "" {
+		return "", fmt.Errorf("root api.json path is not available for relative file path %q", pathValue)
+	}
+	return filepath.Join(filepath.Dir(snapshot.RootPath), pathValue), nil
+}
+
 func getAPIType(apiConfig APIConfig) string {
 	t := strings.TrimSpace(apiConfig.Type)
 	if t == "" {
@@ -4263,23 +4217,29 @@ func runOutCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiConfig APICon
 	if err != nil {
 		return true, http.StatusInternalServerError, "", err
 	}
-	if checkStatusCode < 100 || checkStatusCode > 599 {
-		return true, http.StatusInternalServerError, "", fmt.Errorf("outCheck response status is out of range: %d", checkStatusCode)
-	}
-	if success && checkStatusCode == http.StatusOK {
-		return false, statusCode, "", nil
+	if success {
+		return false, checkStatusCode, "", nil
 	}
 	return true, checkStatusCode, jsonStr, nil
 }
 
-func isCheckOnlyMode(params map[string]interface{}) bool {
-	if params == nil {
-		return false
+// Validate the effective control value after body-over-query parameter merging.
+// Do not silently turn malformed or unknown modes into normal API execution.
+func parseExecutionMode(params map[string]interface{}) (string, error) {
+	raw, exists := params["nyan_mode"]
+	if !exists {
+		return "", nil
 	}
-	return strings.EqualFold(strings.TrimSpace(fmt.Sprint(params["nyan_mode"])), "checkOnly")
+	mode, ok := raw.(string)
+	if !ok || (mode != "" && mode != "checkOnly") {
+		return "", fmt.Errorf("Invalid nyan_mode: expected an empty string or checkOnly")
+	}
+	return mode, nil
 }
 
 func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
+	params := make(map[string]interface{})
+	mergeRequestParameterValues(params, r.URL.Query())
 	contentType := r.Header.Get("Content-Type")
 	if strings.HasPrefix(contentType, "application/json") {
 		body, err := io.ReadAll(r.Body)
@@ -4293,14 +4253,37 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 			return nil, fmt.Errorf("error parsing JSON data: %v", err)
 		}
 
-		return data, nil
+		for key, value := range data {
+			params[key] = value
+		}
+		params["nyan_request"] = newScriptHTTPRequestContext(r, body)
+		return params, nil
 	}
 
+	// Capture only the body consumed by the existing form parser.
+	var formBody bytes.Buffer
+	if r.Body != nil {
+		r.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.TeeReader(r.Body, &formBody), r.Body}
+	}
 	if err := r.ParseForm(); err != nil {
 		return nil, fmt.Errorf("error parsing form data: %v", err)
 	}
-	params := make(map[string]interface{})
-	for key, values := range r.Form {
+	// PostForm contains only body fields, so a body value replaces the query
+	// value instead of combining values from the two sources into an array.
+	mergeRequestParameterValues(params, r.PostForm)
+	params["nyan_request"] = newScriptHTTPRequestContext(r, formBody.Bytes())
+	return params, nil
+}
+
+// Preserve NyanQL's value conversions independently for each input source.
+func mergeRequestParameterValues(params map[string]interface{}, source url.Values) {
+	for key, values := range source {
+		if len(values) == 0 {
+			continue
+		}
 		if len(values) > 1 {
 			params[key] = values
 			continue
@@ -4325,7 +4308,6 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 			params[key] = val
 		}
 	}
-	return params, nil
 }
 
 func handlePublicRequest(w http.ResponseWriter, r *http.Request, apiKey string, requestedPath string, apiConfig APIConfig) {
@@ -4352,9 +4334,14 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 	params["api"] = apiKey
 	params["nyan_public_endpoint"] = apiKey
 	params["nyan_public_path"] = requestedPath
+	mode, err := parseExecutionMode(params)
+	if err != nil {
+		sendJSONError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	checkScriptPath := getParamCheckScriptPath(apiConfig)
-	if checkScriptPath == "" && isCheckOnlyMode(params) {
+	if checkScriptPath == "" && mode == "checkOnly" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"success":true,"status":200,"result":null}`))
@@ -4367,8 +4354,7 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 			sendJSONError(w, err.Error(), statusCode)
 			return
 		}
-		allowed := success && statusCode == http.StatusOK
-		if isCheckOnlyMode(params) || !allowed {
+		if mode == "checkOnly" || !success {
 			if !success && errorObj != nil {
 				serviceLog(slog.LevelInfo, "public_param_check_rejected", "api", apiKey, "status", statusCode)
 			}
@@ -4408,7 +4394,8 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 		return
 	}
 	contentType := http.DetectContentType(fileContent)
-	if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, contentType, fileContent); handled {
+	handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, contentType, fileContent)
+	if handled {
 		if err != nil {
 			logServiceError(slog.LevelError, "public_out_check_failed", err, "api", apiKey)
 			sendJSONError(w, err.Error(), outStatusCode)
@@ -4417,6 +4404,14 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(outStatusCode)
 		w.Write([]byte(outJSON))
+		return
+	}
+	if outStatusCode != http.StatusOK {
+		w.Header().Set("Content-Type", contentType)
+		w.WriteHeader(outStatusCode)
+		if r.Method != http.MethodHead {
+			w.Write(fileContent)
+		}
 		return
 	}
 	http.ServeContent(w, r, fileInfo.Name(), fileInfo.ModTime(), bytes.NewReader(fileContent))
@@ -4723,6 +4718,16 @@ func buildScheduleJobConfigs(files map[string]APIConfig, execDir string) (map[st
 			continue
 		}
 
+		for _, check := range []struct{ field, path string }{
+			{"paramCheck", getParamCheckScriptPath(apiConfig)},
+			{"outCheck", apiConfig.OutCheck},
+		} {
+			if check.path != "" {
+				serviceLog(slog.LevelWarn, "schedule_check_ignored", "job", name, "field", check.field,
+					"message", "Checks are unnecessary and unsupported for type:schedule; this check will not be executed. Remove this setting.")
+			}
+		}
+
 		scriptPath := strings.TrimSpace(apiConfig.Script)
 		triggerType := strings.TrimSpace(apiConfig.Trigger.Type)
 		triggerValue := strings.TrimSpace(apiConfig.Trigger.Value)
@@ -4905,6 +4910,16 @@ func buildWSClientConfigs(files map[string]APIConfig, execDir string) (map[strin
 	for name, apiConfig := range files {
 		if getAPIType(apiConfig) != apiTypeWSClient {
 			continue
+		}
+
+		for _, check := range []struct{ field, path string }{
+			{"paramCheck", getParamCheckScriptPath(apiConfig)},
+			{"outCheck", apiConfig.OutCheck},
+		} {
+			if check.path != "" {
+				serviceLog(slog.LevelWarn, "ws_client_check_ignored", "client", name, "field", check.field,
+					"message", "Checks are unnecessary and unsupported for type:ws_client; this check will not be executed. Remove this setting.")
+			}
 		}
 
 		scriptPath := strings.TrimSpace(apiConfig.Script)
@@ -5383,20 +5398,10 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		sendJSONError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	dispatchedAPI, _ := r.Context().Value(configuredAPIDispatchContextKey{}).(string)
-	if dispatchedAPI != "" {
-		// The router has already checked this API's access policy. Request
-		// parameters must not select a different API or affect paramCheck's API.
-		if params == nil {
-			params = make(map[string]interface{})
-		}
-		params["api"] = dispatchedAPI
-	} else if r.URL.Path != "/" {
+	if r.URL.Path != "/" {
 		apiName := strings.TrimPrefix(r.URL.Path, "/")
 		if apiName != "" {
-			if _, exists := params["api"]; !exists {
-				params["api"] = apiName
-			}
+			params["api"] = apiName
 		}
 	}
 	apiKey, ok := params["api"].(string)
@@ -5413,58 +5418,49 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		sendJSONError(w, fmt.Sprintf("API %s is not an HTTP/WebSocket endpoint", apiKey), http.StatusBadRequest)
 		return
 	}
-	if apiConfig.HTTP != nil {
-		if dispatchedAPI != apiKey || configuredHTTPAccess(apiConfig) == configuredHTTPAccessInternal {
-			sendJSONError(w, "API not found", http.StatusNotFound)
-			return
-		}
-	}
 	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
 	if err != nil {
 		logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiKey)
 		acceptedKeys = []string{}
 	}
-	nyanMode, _ := params["nyan_mode"].(string)
+	nyanMode, err := parseExecutionMode(params)
+	if err != nil {
+		sendJSONError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	checkScriptPath := getParamCheckScriptPath(apiConfig)
 	if nyanMode == "checkOnly" && checkScriptPath == "" {
 		sendJSONError(w, "No check script for this API", http.StatusNotFound)
 		return
 	}
 	if checkScriptPath != "" {
-		success, statusCode, errorObj, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, acceptedKeys)
+		success, statusCode, _, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, acceptedKeys)
 		if err != nil {
 			logServiceError(slog.LevelError, "param_check_failed", err, "api", apiKey)
 			sendJSONError(w, err.Error(), statusCode)
 			return
 		}
 		if !success {
-			if errorObj == nil {
-				errorObj = "Request check failed"
-			}
-			response := map[string]interface{}{
-				"success": success,
-				"status":  statusCode,
-				"error":   errorObj,
+			response, err := paramCheckRejectionJSON(statusCode, jsonStr)
+			if err != nil {
+				sendJSONError(w, "Failed to encode check response", http.StatusInternalServerError)
+				return
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
-			json.NewEncoder(w).Encode(response)
+			_, _ = fmt.Fprintln(w, response)
 			return
 		}
 		if nyanMode == "checkOnly" {
-			performPush(snapshot, apiConfig, params)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(statusCode)
 			w.Write([]byte(jsonStr))
 			return
 		}
-		if len(apiConfig.SQL) == 0 && apiConfig.Script == "" {
-			performPush(snapshot, apiConfig, params)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(statusCode)
-			w.Write([]byte(jsonStr))
-			return
-		}
+	}
+	if apiConfig.Script == "" && len(apiConfig.SQL) == 0 {
+		sendJSONError(w, fmt.Sprintf("No script or SQL defined for API %s", apiKey), http.StatusBadRequest)
+		return
 	}
 
 	if apiConfig.Script != "" {
@@ -5475,7 +5471,13 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 			return
 		}
 		body := []byte(scriptResult)
-		if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", body); handled {
+		statusCode, err := apiResponseStatus(body)
+		if err != nil {
+			sendJSONError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, statusCode, "application/json", body)
+		if handled {
 			if err != nil {
 				logServiceError(slog.LevelError, "out_check_failed", err, "api", apiKey)
 				sendJSONError(w, err.Error(), outStatusCode)
@@ -5486,9 +5488,10 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 			w.Write([]byte(outJSON))
 			return
 		}
-		performPush(snapshot, apiConfig, params)
+		statusCode = outStatusCode
+		performPushForResponse(snapshot, apiConfig, params, statusCode, body)
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(statusCode)
 		w.Write(body)
 		return
 	}
@@ -5592,7 +5595,8 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		sendJSONError(w, "Error formatting results", http.StatusInternalServerError)
 		return
 	}
-	if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", body); handled {
+	handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", body)
+	if handled {
 		if err != nil {
 			logServiceError(slog.LevelError, "out_check_failed", err, "api", apiKey)
 			sendJSONError(w, err.Error(), outStatusCode)
@@ -5603,8 +5607,9 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		w.Write([]byte(outJSON))
 		return
 	}
-	performPush(snapshot, apiConfig, params)
+	performPushForResponse(snapshot, apiConfig, params, outStatusCode, body)
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(outStatusCode)
 	w.Write(body)
 }
 
@@ -5985,10 +5990,6 @@ func handleNyanDetailWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 		return
 	}
 	if getAPIType(apiConfig) != apiTypeAPI {
-		sendJSONError(w, "API not found", http.StatusNotFound)
-		return
-	}
-	if apiConfig.HTTP != nil {
 		sendJSONError(w, "API not found", http.StatusNotFound)
 		return
 	}
@@ -7180,16 +7181,19 @@ type nyanSQLExecer interface {
 	Exec(query string, args ...interface{}) (sql.Result, error)
 }
 
-func nyanRunSQLHandler(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
-	return nyanRunSQLHandlerWithExecer(vm, call, db, nil)
+func nyanRunSQLHandler(snapshot *APIConfigSnapshot, vm *goja.Runtime, call goja.FunctionCall) goja.Value {
+	return nyanRunSQLHandlerWithExecer(snapshot, vm, call, db, nil)
 }
 
-func nyanRunSQLHandlerWithExecer(vm *goja.Runtime, call goja.FunctionCall, execer nyanSQLExecer, allowedSQLFiles map[string]struct{}) goja.Value {
+func nyanRunSQLHandlerWithExecer(snapshot *APIConfigSnapshot, vm *goja.Runtime, call goja.FunctionCall, execer nyanSQLExecer, allowedSQLFiles map[string]struct{}) goja.Value {
 	// 第一引数: SQLファイルのパス
 	if len(call.Arguments) < 1 {
 		panic(vm.ToValue("nyanRunSQL requires at least the SQL file path as argument"))
 	}
-	sqlFilePath := call.Argument(0).String()
+	sqlFilePath, err := resolveRuntimeFilePath(snapshot, call.Argument(0).String())
+	if err != nil {
+		panic(vm.ToValue(err.Error()))
+	}
 	if allowedSQLFiles != nil {
 		canonicalPath, err := filepath.Abs(sqlFilePath)
 		if err != nil {
@@ -7276,6 +7280,27 @@ func runCheckScript(apiCheckScriptPath string, params map[string]interface{}, ac
 	return runCheckScriptWithSnapshot(currentAPISnapshot(), apiCheckScriptPath, params, acceptedParamsKeys)
 }
 
+// Preserve the two supported payload fields on input rejection. Keep the
+// existing default error for absent/null error; an absent result stays absent.
+func paramCheckRejectionJSON(status int, checkJSON string) (string, error) {
+	var payload struct {
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(checkJSON), &payload); err != nil {
+		return "", err
+	}
+	if len(payload.Error) == 0 || bytes.Equal(bytes.TrimSpace(payload.Error), []byte("null")) {
+		payload.Error = json.RawMessage(`"Request check failed"`)
+	}
+	response := map[string]interface{}{"success": false, "status": status, "error": payload.Error}
+	if len(payload.Result) != 0 {
+		response["result"] = payload.Result
+	}
+	body, err := json.Marshal(response)
+	return string(body), err
+}
+
 func runCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, string, error) {
 	var combinedScript strings.Builder
 	for _, includePath := range config.JavascriptInclude {
@@ -7305,14 +7330,25 @@ func runCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiCheckScriptPath 
 		return false, 500, nil, "", err
 	}
 	var result struct {
-		Success bool        `json:"success"`
-		Status  int         `json:"status"`
+		Success *bool       `json:"success"`
+		Status  *int        `json:"status"`
 		Error   interface{} `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
 		return false, 500, nil, jsonStr, fmt.Errorf("failed to unmarshal check result: %v", err)
 	}
-	return result.Success, result.Status, result.Error, jsonStr, nil
+	if result.Success == nil {
+		return false, http.StatusInternalServerError, nil, jsonStr, fmt.Errorf("check result success is required and must be boolean")
+	}
+	// A check result may be sent directly (rejection or checkOnly). Require a
+	// final HTTP status even when success=true; never pass zero to WriteHeader.
+	if result.Status == nil {
+		return false, http.StatusInternalServerError, nil, jsonStr, fmt.Errorf("check result status is required and must not be null")
+	}
+	if *result.Status < 200 || *result.Status > 599 {
+		return false, http.StatusInternalServerError, nil, jsonStr, fmt.Errorf("check result status must be an integer between 200 and 599: %d", *result.Status)
+	}
+	return *result.Success, *result.Status, result.Error, jsonStr, nil
 }
 
 func checkResultToJSONString(value goja.Value) (string, error) {
@@ -7466,7 +7502,11 @@ func runScriptWithRuntimeWithSnapshot(snapshot *APIConfigSnapshot, scriptPaths [
 	if restricted {
 		allowedSQLFiles = make(map[string]struct{}, len(runtimeConfig.SQLFiles))
 		for _, sqlFile := range runtimeConfig.SQLFiles {
-			canonicalPath, pathErr := filepath.Abs(sqlFile)
+			resolvedPath, pathErr := resolveRuntimeFilePath(snapshot, sqlFile)
+			if pathErr != nil {
+				return "", pathErr
+			}
+			canonicalPath, pathErr := filepath.Abs(resolvedPath)
 			if pathErr != nil {
 				return "", fmt.Errorf("resolve allowed SQL file path: %w", pathErr)
 			}
@@ -7474,7 +7514,7 @@ func runScriptWithRuntimeWithSnapshot(snapshot *APIConfigSnapshot, scriptPaths [
 		}
 	}
 	vm.Set("nyanRunSQL", func(call goja.FunctionCall) goja.Value {
-		return nyanRunSQLHandlerWithExecer(vm, call, tx, allowedSQLFiles)
+		return nyanRunSQLHandlerWithExecer(snapshot, vm, call, tx, allowedSQLFiles)
 	})
 	if runtimeConfig.Settings == nil {
 		vm.Set("nyanRuntimeSettings", map[string]interface{}{})
@@ -7589,113 +7629,123 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string
 	return callNyanAPIFromVMWithSnapshot(currentAPISnapshot(), apiName, allParams)
 }
 
-func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allParams map[string]interface{}) (string, error) {
-	if strings.TrimSpace(apiName) == "" {
-		return "", fmt.Errorf("api name is required")
-	}
+type apiExecutionResult struct {
+	Body          string
+	Status        int
+	Params        map[string]interface{}
+	CheckRejected bool
+	CheckOnly     bool
+}
 
+func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allParams map[string]interface{}) (string, error) {
+	result, err := executeAPIWithSnapshot(snapshot, apiName, allParams)
+	if err != nil {
+		return "", err
+	}
+	if !result.CheckRejected && !result.CheckOnly {
+		performPushForResponse(snapshot, snapshot.Definitions[apiName], result.Params, result.Status, []byte(result.Body))
+	}
+	return result.Body, nil
+}
+
+// executeAPIWithSnapshot runs the API checks and body without dispatching Push.
+// Callers decide whether to return the result or broadcast it, and whether to
+// invoke the API's own Push target.
+func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allParams map[string]interface{}) (apiExecutionResult, error) {
+	result := apiExecutionResult{}
+	if strings.TrimSpace(apiName) == "" {
+		return result, fmt.Errorf("api name is required")
+	}
 	apiConfig, exists := snapshot.Definitions[apiName]
 	if !exists {
-		return "", fmt.Errorf("API config not found: %s", apiName)
+		return result, fmt.Errorf("API config not found: %s", apiName)
 	}
 	if getAPIType(apiConfig) != apiTypeAPI {
-		return "", fmt.Errorf("API %s is not an HTTP/WebSocket endpoint", apiName)
+		return result, fmt.Errorf("API %s is not an HTTP/WebSocket endpoint", apiName)
 	}
-
-	params := map[string]interface{}{}
-	for k, v := range allParams {
-		params[k] = v
-	}
+	params := cloneParams(allParams)
 	params["api"] = apiName
-
-	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
+	result.Params = params
+	nyanMode, err := parseExecutionMode(params)
 	if err != nil {
-		logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiName)
-		acceptedKeys = []string{}
+		return result, err
 	}
-	nyanMode, _ := params["nyan_mode"].(string)
+	result.CheckOnly = nyanMode == "checkOnly"
 	checkScriptPath := getParamCheckScriptPath(apiConfig)
-	if nyanMode == "checkOnly" && checkScriptPath == "" {
-		return "", fmt.Errorf("No check script for API %s", apiName)
+	if result.CheckOnly && checkScriptPath == "" {
+		return result, fmt.Errorf("No check script for API %s", apiName)
 	}
-
 	if checkScriptPath != "" {
-		success, statusCode, errorObj, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, acceptedKeys)
+		acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
 		if err != nil {
-			return "", fmt.Errorf("check script error: %v", err)
+			logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiName)
+			acceptedKeys = []string{}
 		}
+		success, checkStatus, _, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, acceptedKeys)
+		if err != nil {
+			return result, fmt.Errorf("check script error: %v", err)
+		}
+		result.Status = checkStatus
 		if !success {
-			if errorObj == nil {
-				errorObj = "Request check failed"
-			}
-			response := map[string]interface{}{
-				"success": false,
-				"status":  statusCode,
-				"error":   errorObj,
-			}
-			b, err := json.Marshal(response)
+			body, err := paramCheckRejectionJSON(checkStatus, jsonStr)
 			if err != nil {
-				return "", fmt.Errorf("failed to marshal check response for API %s: %v", apiName, err)
+				return result, fmt.Errorf("failed to marshal check response for API %s: %v", apiName, err)
 			}
-			return string(b), nil
-		}
-		if nyanMode == "checkOnly" {
-			performPush(snapshot, apiConfig, params)
-			return jsonStr, nil
-		}
-		if apiConfig.Script != "" {
-			result, err := runScriptWithSnapshot(snapshot, []string{apiConfig.Script}, params)
-			if err != nil {
-				return "", fmt.Errorf("failed to run API %s: %v", apiName, err)
-			}
-			if handled, _, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", []byte(result)); handled {
-				if err != nil {
-					return "", fmt.Errorf("outCheck script error: %v", err)
-				}
-				return outJSON, nil
-			}
-			performPush(snapshot, apiConfig, params)
+			result.Body, result.CheckRejected = body, true
 			return result, nil
 		}
-		if len(apiConfig.SQL) == 0 && apiConfig.Script == "" {
-			performPush(snapshot, apiConfig, params)
-			return jsonStr, nil
+		result.Body = jsonStr
+		if result.CheckOnly {
+			return result, nil
 		}
 	}
-
-	if apiConfig.Script != "" {
-		result, err := runScriptWithSnapshot(snapshot, []string{apiConfig.Script}, params)
+	switch {
+	case apiConfig.Script != "":
+		body, err := runScriptWithSnapshot(snapshot, []string{apiConfig.Script}, params)
 		if err != nil {
-			return "", fmt.Errorf("failed to run API %s: %v", apiName, err)
+			return result, fmt.Errorf("failed to run API %s: %v", apiName, err)
 		}
-		if handled, _, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", []byte(result)); handled {
-			if err != nil {
-				return "", fmt.Errorf("outCheck script error: %v", err)
-			}
-			return outJSON, nil
+		result.Body = body
+	case len(apiConfig.SQL) > 0:
+		body, err := executeSQLAPI(apiName, apiConfig.SQL, params)
+		if err != nil {
+			return result, err
 		}
-		performPush(snapshot, apiConfig, params)
-		return result, nil
+		result.Body = string(body)
+	default:
+		return result, fmt.Errorf("No script or SQL defined for API %s", apiName)
 	}
-
-	if len(apiConfig.SQL) == 0 {
-		return "", fmt.Errorf("No script or SQL defined for API %s", apiName)
+	statusCode, err := apiResponseStatus([]byte(result.Body))
+	if err != nil {
+		return result, err
 	}
+	handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, statusCode, "application/json", []byte(result.Body))
+	result.Status = outStatusCode
+	if handled {
+		if err != nil {
+			return result, fmt.Errorf("outCheck script error: %v", err)
+		}
+		result.Body, result.CheckRejected = outJSON, true
+	}
+	return result, nil
+}
 
+func executeSQLAPI(apiName string, sqlFiles []string, params map[string]interface{}) ([]byte, error) {
 	var tx *sql.Tx
-	if len(apiConfig.SQL) > 1 {
+	var err error
+	if len(sqlFiles) > 1 {
 		tx, err = db.Begin()
 		if err != nil {
-			return "", fmt.Errorf("failed to start transaction for API %s: %v", apiName, err)
+			return nil, fmt.Errorf("failed to start transaction for API %s: %v", apiName, err)
 		}
 		defer tx.Rollback()
 	}
 
 	var lastJSON []byte
-	for _, sqlPath := range apiConfig.SQL {
+	for _, sqlPath := range sqlFiles {
 		query, err := os.ReadFile(sqlPath)
 		if err != nil {
-			return "", fmt.Errorf("failed to read SQL file for API %s: %v", apiName, err)
+			return nil, fmt.Errorf("failed to read SQL file for API %s: %v", apiName, err)
 		}
 		processed := processWhereBlock(string(query), params)
 		processed = processConditionals(processed, params)
@@ -7709,16 +7759,16 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 				rows, err = db.Query(queryStr, args...)
 			}
 			if err != nil {
-				return "", fmt.Errorf("failed to execute SQL query for API %s: %v", apiName, err)
+				return nil, fmt.Errorf("failed to execute SQL query for API %s: %v", apiName, err)
 			}
 
 			lastJSON, err = RowsToJSON(rows)
 			closeErr := rows.Close()
 			if err != nil {
-				return "", fmt.Errorf("failed to format SQL result for API %s: %v", apiName, err)
+				return nil, fmt.Errorf("failed to format SQL result for API %s: %v", apiName, err)
 			}
 			if closeErr != nil {
-				return "", fmt.Errorf("failed to close SQL rows for API %s: %v", apiName, closeErr)
+				return nil, fmt.Errorf("failed to close SQL rows for API %s: %v", apiName, closeErr)
 			}
 		} else {
 			var result sql.Result
@@ -7728,11 +7778,11 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 				result, err = db.Exec(queryStr, args...)
 			}
 			if err != nil {
-				return "", fmt.Errorf("failed to execute SQL statement for API %s: %v", apiName, err)
+				return nil, fmt.Errorf("failed to execute SQL statement for API %s: %v", apiName, err)
 			}
 			rowsAffected, err := result.RowsAffected()
 			if err != nil {
-				return "", fmt.Errorf("failed to get rows affected for API %s: %v", apiName, err)
+				return nil, fmt.Errorf("failed to get rows affected for API %s: %v", apiName, err)
 			}
 			serviceLog(slog.LevelDebug, "sql_mutation_completed", "api", apiName, "file", sqlPath, "rows_affected", rowsAffected)
 			lastJSON = []byte("{}")
@@ -7741,7 +7791,7 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 
 	if tx != nil {
 		if err := tx.Commit(); err != nil {
-			return "", fmt.Errorf("failed to commit transaction for API %s: %v", apiName, err)
+			return nil, fmt.Errorf("failed to commit transaction for API %s: %v", apiName, err)
 		}
 	}
 
@@ -7756,16 +7806,9 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 	}
 	b, err := json.Marshal(response)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal SQL response for API %s: %v", apiName, err)
+		return nil, fmt.Errorf("failed to marshal SQL response for API %s: %v", apiName, err)
 	}
-	if handled, _, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", b); handled {
-		if err != nil {
-			return "", fmt.Errorf("outCheck script error: %v", err)
-		}
-		return outJSON, nil
-	}
-	performPush(snapshot, apiConfig, params)
-	return string(b), nil
+	return b, nil
 }
 
 // evaluateCondition は、条件文字列（例："id != null OR date != null" や "id != null AND date != null"）を解析して評価します。
@@ -7913,50 +7956,68 @@ func normalizeSQL(sqlText string) string {
 	return regexp.MustCompile(`\s+`).ReplaceAllString(withoutLineComments, " ")
 }
 
-func executeAPIConfig(apiConfig APIConfig) ([]byte, error) {
-	return executeAPIConfigWithSnapshot(currentAPISnapshot(), apiConfig)
+// Send serializes API replies with Push broadcasts on the same connection.
+func (h *Hub) Send(conn *websocket.Conn, message []byte) error {
+	h.mu.Lock()
+	client := h.connections[conn]
+	h.mu.Unlock()
+	if client == nil {
+		return net.ErrClosed
+	}
+	return h.send(client, message)
 }
 
-func executeAPIConfigWithSnapshot(snapshot *APIConfigSnapshot, apiConfig APIConfig) ([]byte, error) {
-	// ここでは、SQLが設定されている場合、最初のSQLファイルを実行する例です
-	if len(apiConfig.SQL) > 0 {
-		query, err := os.ReadFile(apiConfig.SQL[0])
-		if err != nil {
-			return nil, fmt.Errorf("failed to read SQL file: %v", err)
-		}
-		// パラメータが必要な場合は適宜設定してください
-		rows, err := db.Query(string(query))
-		if err != nil {
-			return nil, fmt.Errorf("failed to execute query: %v", err)
-		}
-		defer rows.Close()
-		return RowsToJSON(rows)
+func (h *Hub) send(client *hubClient, message []byte) error {
+	client.writeMu.Lock()
+	defer client.writeMu.Unlock()
+	if client.closed.Load() {
+		return net.ErrClosed
 	}
-	// Scriptが設定されている場合は runScript を使う例
-	if apiConfig.Script != "" {
-		result, err := runScriptWithSnapshot(snapshot, []string{apiConfig.Script}, make(map[string]interface{}))
-		if err != nil {
-			return nil, err
-		}
-		return []byte(result), nil
+	timeout := h.writeTimeout
+	if timeout <= 0 {
+		timeout = webSocketWriteTimeout
 	}
-	return nil, fmt.Errorf("no executable configuration found")
+	err := client.conn.SetWriteDeadline(time.Now().Add(timeout))
+	if err == nil {
+		err = client.conn.WriteMessage(websocket.TextMessage, message)
+	}
+	if err != nil {
+		h.removeFailedClient(client)
+	}
+	return err
+}
+
+func (h *Hub) removeFailedClient(client *hubClient) {
+	h.mu.Lock()
+	if h.connections[client.conn] != client {
+		h.mu.Unlock()
+		return
+	}
+	for channel := range client.channels {
+		delete(h.clients[channel], client.conn)
+		if len(h.clients[channel]) == 0 {
+			delete(h.clients, channel)
+		}
+	}
+	delete(h.connections, client.conn)
+	client.closed.Store(true)
+	h.mu.Unlock()
+	_ = client.conn.Close()
 }
 
 func (h *Hub) Broadcast(channel string, message []byte) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	clients, ok := h.clients[channel]
-	if !ok {
+	clients := make([]*hubClient, 0, len(h.clients[channel]))
+	for _, client := range h.clients[channel] {
+		clients = append(clients, client)
+	}
+	h.mu.Unlock()
+	if len(clients) == 0 {
 		serviceLog(slog.LevelDebug, "push_no_subscribers", "channel", channel)
 		return
 	}
-	for conn := range clients {
-		if conn == nil {
-			// nil の接続があればスキップ
-			continue
-		}
-		if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
+	for _, client := range clients {
+		if err := h.send(client, message); err != nil {
 			logServiceError(slog.LevelWarn, "push_send_failed", err, "channel", channel)
 		}
 	}
@@ -7985,11 +8046,12 @@ func execCommand(commandLine string) (*ExecResult, error) {
 	}
 
 	if err != nil {
+		// A command's nonzero exit is a result the script can inspect.
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			result.ExitCode = exitErr.ExitCode()
-		} else {
-			result.ExitCode = -1
+			return result, nil
 		}
+		result.ExitCode = -1
 		return result, fmt.Errorf("failed to exec: %w", err)
 	}
 
@@ -8040,21 +8102,16 @@ func adjustPaths(configBaseDir string, config *Config) {
 }
 
 // nyanGetFile
-func nyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+func nyanGetFile(vm *goja.Runtime, snapshot *APIConfigSnapshot) func(call goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		// 引数のチェック
 		if len(call.Arguments) < 1 {
 			panic(vm.NewTypeError("nyanGetFileには1つの引数（ファイルパス）が必要です"))
 		}
-		relativePath := call.Arguments[0].String()
-
-		// 実行中のバイナリのディレクトリからの相対パスに解決
-		exePath, err := os.Executable()
+		fullPath, err := resolveRuntimeFilePath(snapshot, call.Arguments[0].String())
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
-		exeDir := filepath.Dir(exePath)
-		fullPath := filepath.Join(exeDir, relativePath)
 
 		// ディレクトリ指定なら null
 		if fi, err := os.Stat(fullPath); err == nil && fi.IsDir() {
@@ -8406,14 +8463,9 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	for k, v := range rpcReq.Params {
 		allParams[k] = v
 	}
-	if _, ok := allParams["api"]; !ok {
-		allParams["api"] = rpcReq.Method
-	}
-	apiKey, ok := allParams["api"].(string)
-	if !ok || apiKey == "" {
-		respondJSONRPCError(w, rpcReq.ID, -32602, "API key is required and must be a string", nil)
-		return
-	}
+	allParams["nyan_request"] = newScriptHTTPRequestContext(r, body)
+	apiKey := rpcReq.Method
+	allParams["api"] = apiKey
 
 	apiConfig, exists := snapshot.Definitions[apiKey]
 	if !exists {
@@ -8424,19 +8476,23 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		respondJSONRPCError(w, rpcReq.ID, -32601, "Method not found", nil)
 		return
 	}
-	if apiConfig.HTTP != nil {
-		respondJSONRPCError(w, rpcReq.ID, -32601, "Method not found", nil)
-		return
-	}
 
 	// 4) チェックスクリプトが設定されていれば実行
-	nyanMode, _ := allParams["nyan_mode"].(string)
+	nyanMode, err := parseExecutionMode(allParams)
+	if err != nil {
+		respondJSONRPCError(w, rpcReq.ID, -32602, "Invalid params", err.Error())
+		return
+	}
 	acceptedKeys, err := getAcceptedParamsKeys(apiConfig.SQL)
 	if err != nil {
 		logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiKey)
 		acceptedKeys = []string{}
 	}
 	checkScriptPath := getParamCheckScriptPath(apiConfig)
+	if nyanMode == "checkOnly" && checkScriptPath == "" {
+		respondJSONRPCError(w, rpcReq.ID, -32602, "No check script for this API", nil)
+		return
+	}
 	if checkScriptPath != "" {
 		success, statusCode, errorObj, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, allParams, acceptedKeys)
 		if err != nil {
@@ -8444,9 +8500,15 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 			return
 		}
 		if !success {
+			checkResult, err := paramCheckRejectionJSON(statusCode, jsonStr)
+			if err != nil {
+				respondJSONRPCError(w, rpcReq.ID, -32603, "Failed to encode check response", nil)
+				return
+			}
 			errData := map[string]interface{}{
-				"message": "Request check failed",
-				"detail":  errorObj,
+				"message":     "Request check failed",
+				"detail":      errorObj,
+				"checkResult": json.RawMessage(checkResult),
 			}
 			respondJSONRPCError(w, rpcReq.ID, -32602, "Invalid params", errData)
 			return
@@ -8566,13 +8628,13 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		return
 	}
 
-	statusCode := 200
-	if st, ok := finalResult["status"].(float64); ok {
-		statusCode = int(st)
-	} else if st, ok := finalResult["status"].(int); ok {
-		statusCode = st
+	statusCode, err := apiResponseStatus(finalBody)
+	if err != nil {
+		respondJSONRPCError(w, rpcReq.ID, -32603, "Invalid API response status", err.Error())
+		return
 	}
-	if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, allParams, statusCode, "application/json", finalBody); handled {
+	handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, allParams, statusCode, "application/json", finalBody)
+	if handled {
 		if err != nil {
 			respondJSONRPCError(w, rpcReq.ID, -32603, "outCheck script error", err.Error())
 			return
@@ -8580,17 +8642,13 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		respondJSONRPCResultJSON(w, rpcReq.ID, outStatusCode, outJSON)
 		return
 	}
+	statusCode = outStatusCode
 
 	// 6) Push処理（必要な場合）
-	performPush(snapshot, apiConfig, allParams)
+	performPushForResponse(snapshot, apiConfig, allParams, statusCode, finalBody)
 
 	// 7) 最終レスポンスの返却
-	if st, ok := finalResult["status"].(float64); ok {
-		statusCode = int(st)
-		delete(finalResult, "status")
-	} else if _, ok := finalResult["status"].(int); ok {
-		delete(finalResult, "status")
-	}
+	delete(finalResult, "status")
 	rpcResp := JSONRPCResponse{
 		JSONRPC: "2.0",
 		Result:  finalResult,
@@ -8603,57 +8661,108 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	}
 }
 
-func performPush(snapshot *APIConfigSnapshot, apiConfig APIConfig, allParams map[string]interface{}) {
-	if apiConfig.Push != "" {
-		pushConfig, exists := snapshot.Definitions[apiConfig.Push]
-		if exists {
-			var pushResult []byte
-			var err error
-			if pushConfig.Script != "" {
-				s, err := runScriptWithSnapshot(snapshot, []string{pushConfig.Script}, allParams)
-				if err != nil {
-					logServiceError(slog.LevelError, "push_script_failed", err, "api", apiConfig.Push)
-				} else {
-					pushResult = []byte(s)
-				}
-			} else {
-				pushResult, err = executeAPIConfigWithSnapshot(snapshot, pushConfig)
-				if err != nil {
-					logServiceError(slog.LevelError, "push_api_failed", err, "api", apiConfig.Push)
-				} else {
-					type SQLResponse struct {
-						Success bool            `json:"success"`
-						Status  int             `json:"status"`
-						Result  json.RawMessage `json:"result"`
-					}
-					response := SQLResponse{
-						Success: true,
-						Status:  200,
-						Result:  pushResult,
-					}
-					pushResult, err = json.Marshal(response)
-					if err != nil {
-						logServiceError(slog.LevelError, "push_response_encode_failed", err, "api", apiConfig.Push)
-					}
-				}
-			}
-			if pushResult != nil {
-				serviceLog(slog.LevelDebug, "push_broadcast", "channel", apiConfig.Push, "bytes", len(pushResult))
-				hub.Broadcast(apiConfig.Push, pushResult)
-			}
-		} else {
-			serviceLog(slog.LevelWarn, "push_api_missing", "api", apiConfig.Push)
-		}
+// API bodies may be plain text or JSON without status. An explicit status is
+// the final response code; informational 1xx codes cannot complete the response.
+func apiResponseStatus(body []byte) (int, error) {
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(body, &result); err != nil {
+		return http.StatusOK, nil
+	}
+	raw, exists := result["status"]
+	if !exists {
+		return http.StatusOK, nil
+	}
+	var status float64
+	if err := json.Unmarshal(raw, &status); err != nil || status < 200 || status > 599 || math.Trunc(status) != status {
+		return 0, fmt.Errorf("API response status must be an integer between 200 and 599")
+	}
+	return int(status), nil
+}
+
+// Gate only the source API's Push. A Push target may intentionally return an
+// error notification; its own checks, rather than this predicate, gate delivery.
+// Inspecting the result must not change the source response or skip outCheck.
+func responseAllowsPush(statusCode int, body []byte) bool {
+	if statusCode < http.StatusOK || statusCode >= http.StatusBadRequest {
+		return false
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return true // Text and non-object results retain the transport status.
+	}
+	if success, ok := result["success"].(bool); ok && !success {
+		return false
+	}
+	if status, ok := result["status"].(float64); ok {
+		return status >= http.StatusOK && status < http.StatusBadRequest && math.Trunc(status) == status
+	}
+	return true
+}
+
+func performPushForResponse(snapshot *APIConfigSnapshot, apiConfig APIConfig, allParams map[string]interface{}, statusCode int, body []byte) {
+	if apiConfig.Push != "" && responseAllowsPush(statusCode, body) {
+		performPush(snapshot, apiConfig, allParams)
 	}
 }
 
+func performPush(snapshot *APIConfigSnapshot, apiConfig APIConfig, allParams map[string]interface{}) {
+	if apiConfig.Push == "" {
+		return
+	}
+	// Push failures must not interrupt the originating API, including JavaScript
+	// exceptions raised while exporting a script or check result.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logServiceError(slog.LevelError, "push_execution_panicked", fmt.Errorf("push execution panic: %v", recovered), "api", apiConfig.Push)
+		}
+	}()
+	_, exists := snapshot.Definitions[apiConfig.Push]
+	if !exists {
+		serviceLog(slog.LevelWarn, "push_api_missing", "api", apiConfig.Push)
+		return
+	}
+	// Copy JSON request parameters so Push scripts cannot mutate their caller.
+	// Encoding also rejects cycles introduced by scripts without recursive copying.
+	encodedParams, err := json.Marshal(allParams)
+	if err != nil {
+		logServiceError(slog.LevelError, "push_params_copy_failed", err, "api", apiConfig.Push)
+		return
+	}
+	params := make(map[string]interface{})
+	if err := json.Unmarshal(encodedParams, &params); err != nil {
+		logServiceError(slog.LevelError, "push_params_copy_failed", err, "api", apiConfig.Push)
+		return
+	}
+	if params == nil {
+		params = make(map[string]interface{})
+	}
+	result, err := executeAPIWithSnapshot(snapshot, apiConfig.Push, params)
+	if err != nil {
+		logServiceError(slog.LevelError, "push_api_failed", err, "api", apiConfig.Push)
+		return
+	}
+	if result.CheckRejected {
+		serviceLog(slog.LevelWarn, "push_check_rejected", "api", apiConfig.Push)
+		return
+	}
+	if result.CheckOnly {
+		return
+	}
+	pushResult := []byte(result.Body)
+	serviceLog(slog.LevelDebug, "push_broadcast", "channel", apiConfig.Push, "bytes", len(pushResult))
+	hub.Broadcast(apiConfig.Push, pushResult)
+}
+
 // saveBase64ToFile decodes a Base64 string and writes it to destPath.
-// If destPath is relative, it is treated as relative to the executable directory.
+// Relative paths use the directory of the top-level API JSON file.
 func saveBase64ToFile(destPath, b64 string) error {
-	// 1) パス解決（実行ファイルのディレクトリ基準）
-	if !filepath.IsAbs(destPath) {
-		exe, _ := os.Executable()
-		destPath = filepath.Join(filepath.Dir(exe), destPath)
+	return saveBase64ToFileWithSnapshot(currentAPISnapshot(), destPath, b64)
+}
+
+func saveBase64ToFileWithSnapshot(snapshot *APIConfigSnapshot, destPath, b64 string) error {
+	destPath, err := resolveRuntimeFilePath(snapshot, destPath)
+	if err != nil {
+		return err
 	}
 	// 2) デコード
 	data, err := base64.StdEncoding.DecodeString(b64)
@@ -8669,13 +8778,17 @@ func saveBase64ToFile(destPath, b64 string) error {
 }
 
 func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map[string]interface{}, acceptedParamsKeys []string) {
+	if params == nil {
+		params = make(map[string]interface{})
+	}
+	requestContext, ok := params["nyan_request"].(map[string]interface{})
+	if !ok || requestContext == nil {
+		requestContext = map[string]interface{}{}
+	}
+	params["nyan_request"] = requestContext
 	vm.Set("nyanAllParams", params)
 	vm.Set("nyanAcceptedParamsKeys", acceptedParamsKeys)
-	if requestContext, ok := params["nyan_request"]; ok {
-		vm.Set("nyanRequest", requestContext)
-	} else {
-		vm.Set("nyanRequest", map[string]interface{}{})
-	}
+	vm.Set("nyanRequest", requestContext)
 	vm.Set("console", map[string]interface{}{
 		"log": func(call goja.FunctionCall) goja.Value {
 			if serviceLogLevel.Level() > slog.LevelDebug {
@@ -8765,9 +8878,9 @@ func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map
 		return nyanHostExecWrapper(vm, call)
 	})
 	vm.Set("nyanRunSQL", func(call goja.FunctionCall) goja.Value {
-		return nyanRunSQLHandler(vm, call)
+		return nyanRunSQLHandler(snapshot, vm, call)
 	})
-	vm.Set("nyanGetFile", nyanGetFile(vm))
+	vm.Set("nyanGetFile", nyanGetFile(vm, snapshot))
 	vm.Set("nyanCallMe", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
 			panic(vm.ToValue("nyanCallMe(params) requires an object argument"))
@@ -8799,7 +8912,11 @@ func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map
 			panic(vm.ToValue("nyanCallMe(params) requires params.api as non-empty string"))
 		}
 		apiName = strings.TrimSpace(apiName)
+		params = cloneParams(params)
 		params["api"] = apiName
+		// Business arguments are explicit; the originating request is inherited
+		// separately and cannot be replaced by a nyanCallMe argument.
+		params["nyan_request"] = requestContext
 
 		result, err := callNyanAPIFromVMWithSnapshot(snapshot, apiName, params)
 		if err != nil {
@@ -8839,7 +8956,7 @@ func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map
 		}
 		b64 := call.Argument(0).String()
 		path := call.Argument(1).String()
-		if err := saveBase64ToFile(path, b64); err != nil {
+		if err := saveBase64ToFileWithSnapshot(snapshot, path, b64); err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
 		return goja.Undefined() // 成功時は undefined を返すだけ
@@ -8918,7 +9035,11 @@ func registerNyanCryptographicFunctions(vm *goja.Runtime) {
 		},
 	})
 	vm.Set("nyanRandomBase64URL", func(call goja.FunctionCall) goja.Value {
-		value, err := secureRandomBase64URL(int(call.Argument(0).ToInteger()))
+		size := 32
+		if len(call.Arguments) > 0 {
+			size = int(call.Argument(0).ToInteger())
+		}
+		value, err := secureRandomBase64URL(size)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
@@ -8947,8 +9068,8 @@ const (
 )
 
 func secureRandomBase64URL(size int) (string, error) {
-	if size < 16 || size > 128 {
-		return "", fmt.Errorf("random byte size must be between 16 and 128")
+	if size < 1 || size > 1024 {
+		return "", fmt.Errorf("random byte size must be between 1 and 1024")
 	}
 	value := make([]byte, size)
 	if _, err := io.ReadFull(rand.Reader, value); err != nil {
