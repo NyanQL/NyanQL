@@ -2222,10 +2222,37 @@ func TestCheckStatusIsRequiredAndValid(t *testing.T) {
 	}
 }
 
-func TestInvalidCheckStatusStopsExecutionAcrossTransports(t *testing.T) {
+func TestCheckSuccessIsRequiredAndBoolean(t *testing.T) {
+	resetJavascriptInclude(t)
+	for _, field := range []string{"", `,"success":null`, `,"success":"true"`, `,"success":"false"`, `,"success":0`, `,"success":1`, `,"success":[]`, `,"success":{}`, `,"success":true`, `,"success":false`} {
+		for _, format := range []string{"object", "json_string"} {
+			t.Run(format+"/"+field, func(t *testing.T) {
+				body := `{"status":200,"result":"kept","error":"detail"` + field + `}`
+				script := "(" + body + ");"
+				if format == "json_string" {
+					script = fmt.Sprintf(`%q;`, body)
+				}
+				success, status, detail, gotBody, err := runCheckScriptWithSnapshot(nil, writeTestScript(t, script), map[string]interface{}{}, nil)
+				valid := field == `,"success":true` || field == `,"success":false`
+				if !valid {
+					if err == nil || status != http.StatusInternalServerError || success {
+						t.Fatalf("invalid success accepted: success=%v status=%d err=%v", success, status, err)
+					}
+					return
+				}
+				if err != nil || success != (field == `,"success":true`) || status != 200 || detail != "detail" || !reflect.DeepEqual(decodeTestJSONObject(t, []byte(gotBody)), decodeTestJSONObject(t, []byte(body))) {
+					t.Fatalf("valid check changed: success=%v status=%d body=%s detail=%v err=%v", success, status, gotBody, detail, err)
+				}
+			})
+		}
+	}
+}
+
+func TestInvalidCheckResultStopsExecutionAcrossTransports(t *testing.T) {
 	for _, route := range []string{"http", "root", "public", "jsonrpc", "internal", "websocket", "mcp_http", "mcp_stdio"} {
-		for _, stage := range []string{"param", "rejected", "checkOnly", "out"} {
-			t.Run(route+"/"+stage, func(t *testing.T) {
+		for _, test := range []string{"param", "rejected", "checkOnly", "out", "param/missing_success", "checkOnly/missing_success", "out/missing_success", "param/null_success", "checkOnly/null_success", "out/null_success"} {
+			t.Run(route+"/"+test, func(t *testing.T) {
+				stage, invalidField, _ := strings.Cut(test, "/")
 				resetJavascriptInclude(t)
 				setTestSQLiteDB(t)
 				dir := t.TempDir()
@@ -2236,6 +2263,11 @@ func TestInvalidCheckStatusStopsExecutionAcrossTransports(t *testing.T) {
 				invalid := `({success:true,status:0});`
 				if stage == "rejected" {
 					invalid = `({success:false,status:0});`
+				}
+				if invalidField == "missing_success" {
+					invalid = `({status:200});`
+				} else if invalidField == "null_success" {
+					invalid = `({success:null,status:200});`
 				}
 				input, output := invalid, allow
 				if stage == "out" {
@@ -2293,7 +2325,7 @@ func TestInvalidCheckStatusStopsExecutionAcrossTransports(t *testing.T) {
 					vm := goja.New()
 					registerNyanFuncs(vm, snapshot, map[string]interface{}{}, nil)
 					if _, err := vm.RunString(`nyanCallMe(` + string(encodedParams) + `);`); err == nil {
-						t.Fatal("invalid check status did not raise a JavaScript exception")
+						t.Fatal("invalid check result did not raise a JavaScript exception")
 					}
 				case "websocket":
 					req := httptest.NewRequest(http.MethodGet, "/tool", nil)

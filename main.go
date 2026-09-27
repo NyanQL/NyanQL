@@ -7305,12 +7305,15 @@ func runCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiCheckScriptPath 
 		return false, 500, nil, "", err
 	}
 	var result struct {
-		Success bool        `json:"success"`
+		Success *bool       `json:"success"`
 		Status  *int        `json:"status"`
 		Error   interface{} `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
 		return false, 500, nil, jsonStr, fmt.Errorf("failed to unmarshal check result: %v", err)
+	}
+	if result.Success == nil {
+		return false, http.StatusInternalServerError, nil, jsonStr, fmt.Errorf("check result success is required and must be boolean")
 	}
 	// A check result may be sent directly (rejection or checkOnly). Require a
 	// final HTTP status even when success=true; never pass zero to WriteHeader.
@@ -7320,7 +7323,7 @@ func runCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiCheckScriptPath 
 	if *result.Status < 200 || *result.Status > 599 {
 		return false, http.StatusInternalServerError, nil, jsonStr, fmt.Errorf("check result status must be an integer between 200 and 599: %d", *result.Status)
 	}
-	return result.Success, *result.Status, result.Error, jsonStr, nil
+	return *result.Success, *result.Status, result.Error, jsonStr, nil
 }
 
 func checkResultToJSONString(value goja.Value) (string, error) {

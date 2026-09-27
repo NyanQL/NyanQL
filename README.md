@@ -881,6 +881,8 @@ if (!nyanAllParams.id) {
 
 `paramCheck` の戻り値は、JSON文字列またはオブジェクトにしてください。NyanQLは、そのJSONを読んで、`success` が `true` なら次の処理へ進みます。`false` の場合は、SQLやscriptを実行せずにエラーを返します。
 
+`paramCheck`・`outCheck`の `success` は必須の真偽値です。省略・`null`・文字列（`"true"` / `"false"`）・数値などは、通常のチェック拒否ではなく実装不備として、下記の形式不正と同じ実行エラーにします。明示的な `success:false` は有効な拒否結果として、従来どおり `result`・`error` を保持します。API本体の返却JSONに `success` を必須とする変更ではありません。
+
 `paramCheck`・`outCheck`の結果には、200〜599の整数の `status` が必須です。省略・`null`・文字列・小数・範囲外（0や1xxを含む）はチェックの実装不備として扱い、200への補完はしません。`success:true` でも `status` は必要ですが、有効な形式なら入力チェックの通過条件は引き続き `success` だけです（`success:true,status:503` も通過）。通常HTTP・ルートHTTP・public・JSON-RPCでは、不正なチェック結果をHTTP応答に使う前に検出してHTTP 500を返します。`nyanCallMe()`ではJavaScript例外、WebSocketメッセージではstatus 500のエラー応答、MCPでは `isError:true` のToolエラーになります。入力チェックの形式不正では本体・`outCheck`・Pushを開始せず、出力チェックの形式不正では実行済みの本体を取り消さずにPushを停止します。この必須ルールはチェック結果に対するもので、API本体の `status` 省略時の扱いは変更しません。
 
 通常のAPI実行には本体の `script` または `sql` が必要です。入力チェック通過後、両方が未設定なら通常HTTP・ルートHTTPではHTTP 400を返し、`outCheck`・Pushは実行しません。`paramCheck` の成功結果を本体の代わりには使用しません。`nyanCallMe()` ではJavaScript例外になり、MCP・WebSocketでも実行エラーとなります。Push先のAPIに本体がない場合も配信しません。入力チェックの拒否結果と、明示的な `nyan_mode=checkOnly` の結果は、本体がなくても従来どおり返します。
