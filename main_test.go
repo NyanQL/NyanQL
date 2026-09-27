@@ -4878,7 +4878,7 @@ func TestMCPCheckOnlyAcrossTransports(t *testing.T) {
 func TestMCPValidatesResultBeforePush(t *testing.T) {
 	for _, transport := range []string{"streamable_http", "stdio"} {
 		for _, test := range []struct {
-			name, body, wantError string
+			name, body, wantError, requestID string
 		}{
 			{name: "plain_text", body: "not JSON", wantError: "Tool returned invalid JSON"},
 			{name: "empty", wantError: "Tool returned invalid JSON"},
@@ -4891,6 +4891,13 @@ func TestMCPValidatesResultBeforePush(t *testing.T) {
 			{name: "null", body: `null`},
 			{name: "json_string", body: `"ok"`},
 			{name: "oversized", body: `"` + strings.Repeat("x", maxConfiguredHTTPResponseBytes/2) + `"`, wantError: "Tool result is too large"},
+			{name: "escaped_object_within_limit", body: `{"result":"` + strings.Repeat(`\"`, 600000) + `"}`},
+			{name: "escaped_object_oversized_response", body: `{"result":"` + strings.Repeat(`\"`, 800000) + `"}`, wantError: "Tool response is too large"},
+			{name: "html_escape_oversized_response", body: `{"result":"` + strings.Repeat(`<`, 400000) + `"}`, wantError: "Tool response is too large"},
+			// With id:1 this envelope is exactly 4 MiB (6 bytes per quote
+			// across both result fields, plus 124 bytes of JSON framing).
+			{name: "response_at_limit", body: `{"result":"` + strings.Repeat(`\"`, 699030) + `"}`},
+			{name: "request_id_exceeds_limit", body: `{"result":"` + strings.Repeat(`\"`, 699030) + `"}`, requestID: `"long-id"`, wantError: "Tool response is too large"},
 		} {
 			t.Run(transport+"/"+test.name, func(t *testing.T) {
 				resetJavascriptInclude(t)
@@ -4916,7 +4923,11 @@ func TestMCPValidatesResultBeforePush(t *testing.T) {
 					},
 				}, "", [sha256.Size]byte{})
 				server := APIConfig{Type: apiTypeMCP, Transport: transport, ProtocolVersions: []string{mcpProtocolVersion20251125}, Tools: []MCPToolConfig{{API: "tool"}}}
-				const message = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":{}}}`
+				requestID := test.requestID
+				if requestID == "" {
+					requestID = "1"
+				}
+				message := `{"jsonrpc":"2.0","id":` + requestID + `,"method":"tools/call","params":{"name":"tool","arguments":{}}}`
 				var response map[string]interface{}
 				if transport == "stdio" {
 					state := mcpStdioReady
@@ -4937,6 +4948,7 @@ func TestMCPValidatesResultBeforePush(t *testing.T) {
 					t.Fatal(err)
 				}
 				var envelope struct {
+					ID     json.RawMessage `json:"id"`
 					Error  json.RawMessage `json:"error"`
 					Result struct {
 						IsError bool `json:"isError"`
@@ -4948,6 +4960,12 @@ func TestMCPValidatesResultBeforePush(t *testing.T) {
 				}
 				if err := json.Unmarshal(encoded, &envelope); err != nil {
 					t.Fatal(err)
+				}
+				if string(envelope.ID) != requestID {
+					t.Fatalf("response ID=%s, want %s", envelope.ID, requestID)
+				}
+				if test.name == "response_at_limit" && len(encoded) != maxConfiguredHTTPResponseBytes {
+					t.Fatalf("boundary response size=%d, want %d", len(encoded), maxConfiguredHTTPResponseBytes)
 				}
 				if len(envelope.Error) != 0 || envelope.Result.IsError != (test.wantError != "") {
 					t.Fatalf("unexpected MCP error: %s", encoded)
@@ -4972,6 +4990,59 @@ func TestMCPValidatesResultBeforePush(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestMCPStdioContinuesAfterOversizedToolResponse(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	oldHub := hub
+	hub = NewHub()
+	t.Cleanup(func() { hub = oldHub })
+	marker := filepath.Join(t.TempDir(), "pushed")
+	snapshot := newAPIConfigSnapshot(map[string]APIConfig{
+		"tool": {
+			Script: writeTestScript(t, `JSON.stringify({result:nyanAllParams.large ? '"'.repeat(800000) : "ok"});`),
+			Push:   "events",
+		},
+		"events": {Script: writeTestScript(t, fmt.Sprintf(`
+nyanSaveFile(nyanBase64Encode((nyanGetFile(%q)||"") + (nyanAllParams.large ? "large," : "small,")), %q);
+({success:true});`, marker, marker))},
+	}, "", [sha256.Size]byte{})
+	server := APIConfig{Type: apiTypeMCP, Transport: "stdio", ProtocolVersions: []string{mcpProtocolVersion20251125}, Tools: []MCPToolConfig{{API: "tool"}}}
+	input := strings.NewReader(strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":"large","method":"tools/call","params":{"name":"tool","arguments":{"large":true}}}`,
+		`{"jsonrpc":"2.0","id":"small","method":"tools/call","params":{"name":"tool","arguments":{"large":false}}}`,
+	}, "\n") + "\n")
+	var output bytes.Buffer
+	if err := serveMCPStdio(input, &output, snapshot, "test_mcp", server); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("stdio response count=%d, want 3", len(lines))
+	}
+	large := decodeTestJSONObject(t, []byte(lines[1]))
+	if large["id"] != "large" || large["error"] != nil {
+		t.Fatalf("oversized result was not a correlated Tool response: %#v", large)
+	}
+	result := large["result"].(map[string]interface{})
+	if result["isError"] != true || result["content"].([]interface{})[0].(map[string]interface{})["text"] != "Tool response is too large" {
+		t.Fatalf("wrong oversized Tool error: %#v", result)
+	}
+	small := decodeTestJSONObject(t, []byte(lines[2]))
+	if small["id"] != "small" || small["error"] != nil {
+		t.Fatalf("next request was not handled: %#v", small)
+	}
+	result = small["result"].(map[string]interface{})
+	if result["isError"] == true || result["structuredContent"].(map[string]interface{})["result"] != "ok" {
+		t.Fatalf("next Tool failed: %#v", result)
+	}
+	pushed, err := os.ReadFile(marker)
+	if err != nil || string(pushed) != "small," {
+		t.Fatalf("Push executions=%q, want only small; err=%v", pushed, err)
 	}
 }
 
@@ -9695,7 +9766,7 @@ func TestRequestContextMCPTransports(t *testing.T) {
 	if ctx["body"] != message {
 		t.Fatal("MCP body not preserved")
 	}
-	result, err := executeMCPToolForStdio(currentAPISnapshot(), server.Tools[0], map[string]interface{}{"nyan_request": map[string]interface{}{"remoteIP": "forged"}})
+	result, err := executeMCPToolForStdio(currentAPISnapshot(), server.Tools[0], map[string]interface{}{"nyan_request": map[string]interface{}{"remoteIP": "forged"}}, json.RawMessage(`1`))
 	if err != nil {
 		t.Fatal(err)
 	}

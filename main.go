@@ -1455,7 +1455,7 @@ func handleMCPStdioMessage(snapshot *APIConfigSnapshot, serverName string, serve
 		if params.Arguments == nil {
 			params.Arguments = map[string]interface{}{}
 		}
-		result, err := executeMCPToolForStdio(snapshot, tool, params.Arguments)
+		result, err := executeMCPToolForStdio(snapshot, tool, params.Arguments, request.ID)
 		if err != nil {
 			return mcpStdioResult(request.ID, mcpToolErrorResult(err.Error(), nil)), true
 		}
@@ -1481,7 +1481,7 @@ func mcpInitializeResult(serverName string, serverConfig APIConfig, protocolVers
 	return result
 }
 
-func executeMCPToolForStdio(snapshot *APIConfigSnapshot, tool MCPToolConfig, arguments map[string]interface{}) (map[string]interface{}, error) {
+func executeMCPToolForStdio(snapshot *APIConfigSnapshot, tool MCPToolConfig, arguments map[string]interface{}, requestID json.RawMessage) (map[string]interface{}, error) {
 	apiConfig := snapshot.Definitions[tool.API]
 	schema, err := resolveAPISchema(apiConfig)
 	if err != nil {
@@ -1518,7 +1518,10 @@ func executeMCPToolForStdio(snapshot *APIConfigSnapshot, tool MCPToolConfig, arg
 			result["isError"] = true
 		}
 	}
-	// Validate the MCP result before starting this API's Push.
+	if err := validateMCPToolResponse(mcpStdioResult(requestID, result)); err != nil {
+		return nil, err
+	}
+	// Validate the complete MCP response before starting this API's Push.
 	if !execution.CheckRejected && !execution.CheckOnly {
 		performPushForResponse(snapshot, apiConfig, execution.Params, execution.Status, []byte(resultJSON))
 	}
@@ -1931,11 +1934,35 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 			toolResult["isError"] = true
 		}
 	}
-	// Validate the MCP result before starting this API's Push.
+	if err := validateMCPToolResponse(MCPJSONRPCResponse{
+		JSONRPC: "2.0",
+		ID:      normalizedMCPID(request.ID),
+		Result:  toolResult,
+	}); err != nil {
+		writeMCPResult(w, request.ID, mcpToolErrorResult(err.Error(), nil))
+		return
+	}
+	// Validate the complete MCP response before starting this API's Push.
 	if !execution.CheckRejected && !execution.CheckOnly {
 		performPushForResponse(snapshot, apiConfig, execution.Params, execution.Status, []byte(resultJSON))
 	}
 	writeMCPResult(w, request.ID, toolResult)
+}
+
+// The body limit alone cannot bound the response: content.text escapes the JSON
+// again, structuredContent duplicates objects, and the request ID adds bytes.
+// Check the actual transport envelope before Push. Its JSON-compatible values
+// are independent of the parameters passed to Push and remain unchanged until
+// the transport serializes them for delivery.
+func validateMCPToolResponse(response interface{}) error {
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("Tool response could not be encoded")
+	}
+	if len(encoded) > maxConfiguredHTTPResponseBytes {
+		return fmt.Errorf("Tool response is too large")
+	}
+	return nil
 }
 
 func findMCPToolConfig(tools []MCPToolConfig, name string) (MCPToolConfig, bool) {

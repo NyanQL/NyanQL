@@ -1194,7 +1194,7 @@ Pushは、呼び出し元のAPIがチェック拒否・実行エラー・`checkO
 
 この判定は通常HTTP・ルートHTTP・JSON-RPC・WebSocket・`nyanCallMe()`・MCP（HTTP／stdio）に適用します。停止時はPush先の入力チェック・本体・出力チェック・配信をすべて実行しません。呼び出し元の出力チェックや応答内容・HTTPステータスは、このPush判定によって変更しません。
 
-MCP（HTTP／stdio）では、本体・`outCheck`の処理後、返却する本文がJSONとして解析でき、Tool結果の本文サイズ上限（2 MiB）以内であることを確認してから、そのAPI自身のPushを判定します。不正なJSONや本文サイズ超過では `isError:true` のToolエラーを返し、Push先の処理を開始しません。HTTP版のToolエラーはHTTP 200で返します。配列・数値・真偽値・`null`・JSON文字列も有効なJSONとして扱います。
+MCP（HTTP／stdio）では、本体・`outCheck`の処理後、返却する本文がJSONとして解析でき、Tool結果の本文サイズ上限（2 MiB）以内であることを確認します。さらに `content.text`・`structuredContent`・要求IDを含むMCP応答全体をJSON化し、応答上限（4 MiB）以内であることを確認してから、そのAPI自身のPushを判定します。正常時は設定されたPushを実行します。不正なJSON・本文や応答全体のサイズ超過・応答のJSON化失敗では `isError:true` のToolエラーを返し、Push先の処理を開始しません。HTTP版のToolエラーはHTTP 200で返し、stdioも次の要求を引き続き処理します。配列・数値・真偽値・`null`・JSON文字列も有効なJSONとして扱います。
 
 内部呼び出し先と親APIのPushは、それぞれの結果で独立して判定します。内部呼び出し先のPushが完了した後で親が拒否・エラーになっても、完了済みの配信は取り消しません。上記の成功条件は呼び出し元に対するもので、Push先自身が返すエラー通知を一律に配信禁止にするものではありません。
 
