@@ -2216,7 +2216,7 @@ func runMCPOAuthCheck(snapshot *APIConfigSnapshot, path string, params map[strin
 		Success *bool `json:"success"`
 		Status  *int  `json:"status"`
 	}
-	if err := json.Unmarshal([]byte(body), &check); err != nil || check.Success == nil || check.Status == nil || *check.Status < 100 || *check.Status > 599 {
+	if err := json.Unmarshal([]byte(body), &check); err != nil || check.Success == nil || check.Status == nil || *check.Status < 200 || *check.Status > 599 {
 		return false, response, fmt.Errorf("OAuth check returned an invalid result")
 	}
 	response = mcpOAuthHTTPResponse{Status: *check.Status, Headers: http.Header{"Content-Type": {"application/json"}}, Body: []byte(body)}
@@ -4227,9 +4227,6 @@ func runOutCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiConfig APICon
 	success, checkStatusCode, _, jsonStr, err := runCheckScriptWithSnapshot(snapshot, outCheckPath, checkParams, nil)
 	if err != nil {
 		return true, http.StatusInternalServerError, "", err
-	}
-	if checkStatusCode < 100 || checkStatusCode > 599 {
-		return true, http.StatusInternalServerError, "", fmt.Errorf("outCheck response status is out of range: %d", checkStatusCode)
 	}
 	if success {
 		return false, checkStatusCode, "", nil
@@ -7309,13 +7306,21 @@ func runCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiCheckScriptPath 
 	}
 	var result struct {
 		Success bool        `json:"success"`
-		Status  int         `json:"status"`
+		Status  *int        `json:"status"`
 		Error   interface{} `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
 		return false, 500, nil, jsonStr, fmt.Errorf("failed to unmarshal check result: %v", err)
 	}
-	return result.Success, result.Status, result.Error, jsonStr, nil
+	// A check result may be sent directly (rejection or checkOnly). Require a
+	// final HTTP status even when success=true; never pass zero to WriteHeader.
+	if result.Status == nil {
+		return false, http.StatusInternalServerError, nil, jsonStr, fmt.Errorf("check result status is required and must not be null")
+	}
+	if *result.Status < 200 || *result.Status > 599 {
+		return false, http.StatusInternalServerError, nil, jsonStr, fmt.Errorf("check result status must be an integer between 200 and 599: %d", *result.Status)
+	}
+	return result.Success, *result.Status, result.Error, jsonStr, nil
 }
 
 func checkResultToJSONString(value goja.Value) (string, error) {

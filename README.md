@@ -881,6 +881,8 @@ if (!nyanAllParams.id) {
 
 `paramCheck` の戻り値は、JSON文字列またはオブジェクトにしてください。NyanQLは、そのJSONを読んで、`success` が `true` なら次の処理へ進みます。`false` の場合は、SQLやscriptを実行せずにエラーを返します。
 
+`paramCheck`・`outCheck`の結果には、200〜599の整数の `status` が必須です。省略・`null`・文字列・小数・範囲外（0や1xxを含む）はチェックの実装不備として扱い、200への補完はしません。`success:true` でも `status` は必要ですが、有効な形式なら入力チェックの通過条件は引き続き `success` だけです（`success:true,status:503` も通過）。通常HTTP・ルートHTTP・public・JSON-RPCでは、不正なチェック結果をHTTP応答に使う前に検出してHTTP 500を返します。`nyanCallMe()`ではJavaScript例外、WebSocketメッセージではstatus 500のエラー応答、MCPでは `isError:true` のToolエラーになります。入力チェックの形式不正では本体・`outCheck`・Pushを開始せず、出力チェックの形式不正では実行済みの本体を取り消さずにPushを停止します。この必須ルールはチェック結果に対するもので、API本体の `status` 省略時の扱いは変更しません。
+
 通常のAPI実行には本体の `script` または `sql` が必要です。入力チェック通過後、両方が未設定なら通常HTTP・ルートHTTPではHTTP 400を返し、`outCheck`・Pushは実行しません。`paramCheck` の成功結果を本体の代わりには使用しません。`nyanCallMe()` ではJavaScript例外になり、MCP・WebSocketでも実行エラーとなります。Push先のAPIに本体がない場合も配信しません。入力チェックの拒否結果と、明示的な `nyan_mode=checkOnly` の結果は、本体がなくても従来どおり返します。
 
 拒否結果には `result` と `error` の両方を指定できます。`result` は呼び出し元で使うデータや補足情報、`error` はエラーの詳細に使えます。失敗の判定はメッセージの有無ではなく `success` で行います。
@@ -918,7 +920,7 @@ OAuth参照先APIの `paramCheck`（別名 `check`）と `outCheck` も実行し
 | `authorizationServerMetadata` / `protectedResourceMetadata` | 入力チェック → Goによるメタデータ生成 → 出力チェック → HTTP応答。参照先の本体スクリプトは実行しません |
 | `verifyAccess` | 入力チェック → トークン検証スクリプト → 出力チェック → 認証判定 |
 
-チェックはJSON文字列またはオブジェクトを返し、真偽値の `success` と100〜599の整数 `status` を必須とします。入力チェック・出力チェックともに `success:true` で通過します。出力チェックが通過した場合は、本体の本文・ヘッダーを保持し、出力チェックの `status` を最終HTTPステータスに使います。元のステータスを維持したい場合は `nyanAllParams.nyan_output.status` を返してください。HTTPの拒否時にはチェック結果全体をその `status` で返し、本体の `Set-Cookie` / `Location` などは送信しません。チェックの例外・形式不正・ファイル欠落は詳細を含まないHTTP 500になります。チェック結果にも既存の応答本文上限（4 MiB）を適用します。
+チェックはJSON文字列またはオブジェクトを返し、真偽値の `success` と200〜599の整数 `status` を必須とします。入力チェック・出力チェックともに `success:true` で通過します。出力チェックが通過した場合は、本体の本文・ヘッダーを保持し、出力チェックの `status` を最終HTTPステータスに使います。元のステータスを維持したい場合は `nyanAllParams.nyan_output.status` を返してください。HTTPの拒否時にはチェック結果全体をその `status` で返し、本体の `Set-Cookie` / `Location` などは送信しません。チェックの例外・形式不正・ファイル欠落は詳細を含まないHTTP 500になります。チェック結果にも既存の応答本文上限（4 MiB）を適用します。
 
 OAuthのHTTP要求でも `nyan_mode=checkOnly` を指定すると、入力チェックの結果だけを返します。クエリと本文の両方に指定した場合はJSON／フォーム本文を優先し、空文字列は通常実行、`checkOnly` 以外の非空値や文字列以外はHTTP 400とします。入力チェック未設定時は本体を実行せずHTTP 500です。HTTPメソッド・Content-Type・本文上限・管理者認証などの検証は省略しません。OPTIONSではチェックも本体も実行しません。メタデータを含むHTTP経路にOAuthのレート・同時実行数制限を適用します。
 

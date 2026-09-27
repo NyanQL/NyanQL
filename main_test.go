@@ -2198,6 +2198,145 @@ func TestPublicEndpointCheckOnlyWithoutParamCheck(t *testing.T) {
 	}
 }
 
+func TestCheckStatusIsRequiredAndValid(t *testing.T) {
+	resetJavascriptInclude(t)
+	for _, field := range []string{"", `,"status":null`, `,"status":0`, `,"status":-1`, `,"status":99`, `,"status":100`, `,"status":199`, `,"status":600`, `,"status":999`, `,"status":1000`, `,"status":200.5`, `,"status":"200"`, `,"status":true`, `,"status":[]`, `,"status":{}`, `,"status":1e100`, `,"status":200`, `,"status":201`, `,"status":503`, `,"status":599`} {
+		for _, success := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%t/%s", success, field), func(t *testing.T) {
+				body := fmt.Sprintf(`{"success":%t%s,"result":"kept","error":"detail"}`, success, field)
+				path := writeTestScript(t, fmt.Sprintf(`%q;`, body))
+				gotSuccess, status, detail, gotBody, err := runCheckScriptWithSnapshot(nil, path, map[string]interface{}{}, nil)
+				valid := field == `,"status":200` || field == `,"status":201` || field == `,"status":503` || field == `,"status":599`
+				if !valid {
+					if err == nil || status != http.StatusInternalServerError || gotSuccess {
+						t.Fatalf("invalid status accepted: success=%v status=%d err=%v", gotSuccess, status, err)
+					}
+					return
+				}
+				want := decodeTestJSONObject(t, []byte(body))
+				if err != nil || gotSuccess != success || status != int(want["status"].(float64)) || gotBody != body || detail != "detail" {
+					t.Fatalf("valid check changed: success=%v status=%d body=%s detail=%v err=%v", gotSuccess, status, gotBody, detail, err)
+				}
+			})
+		}
+	}
+}
+
+func TestInvalidCheckStatusStopsExecutionAcrossTransports(t *testing.T) {
+	for _, route := range []string{"http", "root", "public", "jsonrpc", "internal", "websocket", "mcp_http", "mcp_stdio"} {
+		for _, stage := range []string{"param", "rejected", "checkOnly", "out"} {
+			t.Run(route+"/"+stage, func(t *testing.T) {
+				resetJavascriptInclude(t)
+				setTestSQLiteDB(t)
+				dir := t.TempDir()
+				mark := func(name string) string {
+					return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"),%q);`, filepath.Join(dir, name))
+				}
+				const allow = `({success:true,status:200});`
+				invalid := `({success:true,status:0});`
+				if stage == "rejected" {
+					invalid = `({success:false,status:0});`
+				}
+				input, output := invalid, allow
+				if stage == "out" {
+					input, output = allow, invalid
+				}
+				definition := APIConfig{ParamCheck: writeTestScript(t, mark("param")+input), Script: writeTestScript(t, mark("body")+allow), OutCheck: writeTestScript(t, mark("out")+output), Push: "events"}
+				if route == "public" {
+					definition.Type, definition.Path = apiTypePublic, dir
+					writeTestFile(t, filepath.Join(dir, "file.txt"), "file must not be sent")
+				}
+				setTestSQLFiles(t, map[string]APIConfig{
+					"tool":   definition,
+					"events": {ParamCheck: writeTestScript(t, mark("push_param")+allow), Script: writeTestScript(t, mark("push_body")+allow), OutCheck: writeTestScript(t, mark("push_out")+allow)},
+				})
+				params := map[string]interface{}{"api": "tool"}
+				if stage == "checkOnly" {
+					params["nyan_mode"] = "checkOnly"
+				}
+				encodedParams, err := json.Marshal(params)
+				if err != nil {
+					t.Fatal(err)
+				}
+				snapshot := currentAPISnapshot()
+				switch route {
+				case "http", "root", "public", "jsonrpc":
+					path := "/tool"
+					if route == "root" {
+						path = "/"
+					} else if route == "public" {
+						path = "/tool/file.txt"
+					}
+					body := string(encodedParams)
+					if route == "jsonrpc" {
+						path, body = "/nyan-rpc", `{"jsonrpc":"2.0","id":1,"method":"tool","params":`+body+`}`
+					}
+					req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+					req.Header.Set("Content-Type", "application/json")
+					if route == "public" {
+						if stage == "checkOnly" {
+							path += "?nyan_mode=checkOnly"
+						}
+						req = httptest.NewRequest(http.MethodGet, path, nil)
+					}
+					req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+					rec := httptest.NewRecorder()
+					if route == "jsonrpc" {
+						handleJSONRPCWithSnapshot(snapshot, rec, req)
+					} else {
+						unifiedHandler(rec, req)
+					}
+					if rec.Code != http.StatusInternalServerError || !json.Valid(rec.Body.Bytes()) {
+						t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+					}
+				case "internal":
+					vm := goja.New()
+					registerNyanFuncs(vm, snapshot, map[string]interface{}{}, nil)
+					if _, err := vm.RunString(`nyanCallMe(` + string(encodedParams) + `);`); err == nil {
+						t.Fatal("invalid check status did not raise a JavaScript exception")
+					}
+				case "websocket":
+					req := httptest.NewRequest(http.MethodGet, "/tool", nil)
+					req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+					response := decodeTestJSONObject(t, executeWebSocketAPIMessage(req, encodedParams))
+					if response["status"] != float64(500) {
+						t.Fatalf("WebSocket response=%#v", response)
+					}
+				case "mcp_http", "mcp_stdio":
+					server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocolVersion20251125}, Tools: []MCPToolConfig{{API: "tool"}}}
+					message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":` + string(encodedParams) + `}}`
+					var response map[string]interface{}
+					if route == "mcp_stdio" {
+						server.Transport = "stdio"
+						state := mcpStdioReady
+						response, _ = handleMCPStdioMessage(snapshot, "test_mcp", server, &state, []byte(message))
+					} else {
+						rec := performTestMCPRequest(t, snapshot, server, message, "")
+						if rec.Code != http.StatusOK {
+							t.Fatalf("MCP HTTP status=%d", rec.Code)
+						}
+						response = decodeTestJSONObject(t, rec.Body.Bytes())
+					}
+					result, ok := response["result"].(map[string]interface{})
+					if !ok || result["isError"] != true {
+						t.Fatalf("MCP response=%#v", response)
+					}
+				}
+				for _, name := range []string{"param", "body", "out", "push_param", "push_body", "push_out"} {
+					_, err := os.Stat(filepath.Join(dir, name))
+					if err != nil && !os.IsNotExist(err) {
+						t.Fatal(err)
+					}
+					want := name == "param" || stage == "out" && (name == "out" || name == "body" && route != "public")
+					if (err == nil) != want {
+						t.Errorf("%s executed=%v, want %v", name, err == nil, want)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestPublicParamCheckUsesSuccess(t *testing.T) {
 	for _, test := range []struct {
 		name, check                 string
@@ -2209,7 +2348,7 @@ func TestPublicParamCheckUsesSuccess(t *testing.T) {
 		{name: "success_200", check: `({success:true,status:200});`, status: 200, wantFile: true},
 		{name: "success_201", check: `({success:true,status:201});`, status: 200, wantFile: true},
 		{name: "success_503", check: `({success:true,status:503});`, status: 200, wantFile: true},
-		{name: "success_without_status", check: `({success:true});`, status: 200, wantFile: true},
+		{name: "success_without_status", check: `({success:true});`, status: 500},
 		{name: "legacy_check", check: `({success:true,status:201});`, status: 200, legacy: true, wantFile: true},
 		{name: "output_sets_status", check: `({success:true,status:503});`, status: 201, outStatus: 201, wantFile: true},
 		{name: "denied", check: `({success:false,status:403,result:"denied"});`, status: 403},
@@ -5462,7 +5601,7 @@ func TestOAuthCheckOnlyHTTPValidation(t *testing.T) {
 }
 
 func TestOAuthCheckResponseBoundaries(t *testing.T) {
-	for _, test := range []string{"inspection_copy", "invalid_header", "invalid_content_type", "invalid_status", "oversized_body", "oversized_input_check", "oversized_output_check", "non_200_output", "forbidden_sql_input", "forbidden_sql_output"} {
+	for _, test := range []string{"inspection_copy", "invalid_header", "invalid_content_type", "invalid_status", "missing_input_status", "zero_input_status", "informational_input_status", "informational_output_status", "oversized_body", "oversized_input_check", "oversized_output_check", "non_200_output", "forbidden_sql_input", "forbidden_sql_output"} {
 		t.Run(test, func(t *testing.T) {
 			definitions, server, mark, stages := newOAuthChecksFixture(t)
 			definition := definitions["authorize"]
@@ -5486,6 +5625,16 @@ output.body="changed";
 				definition.Script = writeTestScript(t, mark("body")+`({status:302,headers:{Location:"https://client.example/","Set-Cookie":"secret=1"},contentType:"text/plain;=",body:"original"});`)
 			case "invalid_status":
 				definition.Script = writeTestScript(t, mark("body")+`({status:302.5,headers:{"Set-Cookie":"secret=1"},body:"original"});`)
+			case "missing_input_status", "zero_input_status", "informational_input_status":
+				result := `({success:true});`
+				if test == "zero_input_status" {
+					result = `({success:true,status:0});`
+				} else if test == "informational_input_status" {
+					result = `({success:true,status:100});`
+				}
+				definition.ParamCheck, wantStages = writeTestScript(t, result), ""
+			case "informational_output_status":
+				definition.OutCheck = writeTestScript(t, `({success:true,status:100});`)
 			case "oversized_body":
 				definition.Script = writeTestScript(t, mark("body")+fmt.Sprintf(`({status:200,headers:{"Set-Cookie":"secret=1"},body:"x".repeat(%d)});`, maxConfiguredHTTPResponseBytes+1))
 			case "oversized_input_check", "oversized_output_check":
