@@ -2313,8 +2313,10 @@ func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverCo
 		if err != nil {
 			return execution, err
 		}
-		if !allowed || checked.Status != http.StatusOK {
+		if !allowed {
 			execution.CheckRejected, execution.Response = true, checked
+		} else {
+			execution.Response.Status = checked.Status
 		}
 	}
 	return execution, nil
@@ -4192,8 +4194,8 @@ func runOutCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiConfig APICon
 	if checkStatusCode < 100 || checkStatusCode > 599 {
 		return true, http.StatusInternalServerError, "", fmt.Errorf("outCheck response status is out of range: %d", checkStatusCode)
 	}
-	if success && checkStatusCode == http.StatusOK {
-		return false, statusCode, "", nil
+	if success {
+		return false, checkStatusCode, "", nil
 	}
 	return true, checkStatusCode, jsonStr, nil
 }
@@ -4358,7 +4360,8 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 		return
 	}
 	contentType := http.DetectContentType(fileContent)
-	if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, contentType, fileContent); handled {
+	handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, contentType, fileContent)
+	if handled {
 		if err != nil {
 			logServiceError(slog.LevelError, "public_out_check_failed", err, "api", apiKey)
 			sendJSONError(w, err.Error(), outStatusCode)
@@ -4367,6 +4370,14 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(outStatusCode)
 		w.Write([]byte(outJSON))
+		return
+	}
+	if outStatusCode != http.StatusOK {
+		w.Header().Set("Content-Type", contentType)
+		w.WriteHeader(outStatusCode)
+		if r.Method != http.MethodHead {
+			w.Write(fileContent)
+		}
 		return
 	}
 	http.ServeContent(w, r, fileInfo.Name(), fileInfo.ModTime(), bytes.NewReader(fileContent))
@@ -5407,7 +5418,8 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 			sendJSONError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, statusCode, "application/json", body); handled {
+		handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, statusCode, "application/json", body)
+		if handled {
 			if err != nil {
 				logServiceError(slog.LevelError, "out_check_failed", err, "api", apiKey)
 				sendJSONError(w, err.Error(), outStatusCode)
@@ -5418,6 +5430,7 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 			w.Write([]byte(outJSON))
 			return
 		}
+		statusCode = outStatusCode
 		performPushForResponse(snapshot, apiConfig, params, statusCode, body)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(statusCode)
@@ -5524,7 +5537,8 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		sendJSONError(w, "Error formatting results", http.StatusInternalServerError)
 		return
 	}
-	if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", body); handled {
+	handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, http.StatusOK, "application/json", body)
+	if handled {
 		if err != nil {
 			logServiceError(slog.LevelError, "out_check_failed", err, "api", apiKey)
 			sendJSONError(w, err.Error(), outStatusCode)
@@ -5535,8 +5549,9 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		w.Write([]byte(outJSON))
 		return
 	}
-	performPushForResponse(snapshot, apiConfig, params, http.StatusOK, body)
+	performPushForResponse(snapshot, apiConfig, params, outStatusCode, body)
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(outStatusCode)
 	w.Write(body)
 }
 
@@ -7547,6 +7562,7 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (string
 
 type apiExecutionResult struct {
 	Body          string
+	Status        int
 	Params        map[string]interface{}
 	CheckRejected bool
 	CheckOnly     bool
@@ -7558,7 +7574,7 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 		return "", err
 	}
 	if !result.CheckRejected && !result.CheckOnly {
-		performPushForResponse(snapshot, snapshot.Definitions[apiName], result.Params, http.StatusOK, []byte(result.Body))
+		performPushForResponse(snapshot, snapshot.Definitions[apiName], result.Params, result.Status, []byte(result.Body))
 	}
 	return result.Body, nil
 }
@@ -7597,6 +7613,7 @@ func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allPara
 		if err != nil {
 			return result, fmt.Errorf("check script error: %v", err)
 		}
+		result.Status = checkStatus
 		if !success {
 			body, err := paramCheckRejectionJSON(checkStatus, jsonStr)
 			if err != nil {
@@ -7630,7 +7647,9 @@ func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allPara
 	if err != nil {
 		return result, err
 	}
-	if handled, _, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, statusCode, "application/json", []byte(result.Body)); handled {
+	handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, statusCode, "application/json", []byte(result.Body))
+	result.Status = outStatusCode
+	if handled {
 		if err != nil {
 			return result, fmt.Errorf("outCheck script error: %v", err)
 		}
@@ -8538,7 +8557,8 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		respondJSONRPCError(w, rpcReq.ID, -32603, "Invalid API response status", err.Error())
 		return
 	}
-	if handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, allParams, statusCode, "application/json", finalBody); handled {
+	handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, allParams, statusCode, "application/json", finalBody)
+	if handled {
 		if err != nil {
 			respondJSONRPCError(w, rpcReq.ID, -32603, "outCheck script error", err.Error())
 			return
@@ -8546,6 +8566,7 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		respondJSONRPCResultJSON(w, rpcReq.ID, outStatusCode, outJSON)
 		return
 	}
+	statusCode = outStatusCode
 
 	// 6) Push処理（必要な場合）
 	performPushForResponse(snapshot, apiConfig, allParams, statusCode, finalBody)

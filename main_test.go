@@ -2222,6 +2222,31 @@ func TestPublicEndpointOutCheckBlocksFile(t *testing.T) {
 	}
 }
 
+func TestPublicEndpointOutCheckSuccessUsesStatus(t *testing.T) {
+	for _, status := range []int{201, 503} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			resetJavascriptInclude(t)
+			dir := t.TempDir()
+			writeTestFile(t, filepath.Join(dir, "test.txt"), "original file")
+			setTestSQLFiles(t, map[string]APIConfig{
+				"assets": {Type: apiTypePublic, Path: dir, OutCheck: writeTestScript(t, fmt.Sprintf(`({success:true,status:%d,result:"must not replace file"});`, status))},
+			})
+			for _, method := range []string{http.MethodGet, http.MethodHead} {
+				r := httptest.NewRequest(method, "/assets/test.txt", nil)
+				w := httptest.NewRecorder()
+				unifiedHandler(w, r)
+				wantBody := "original file"
+				if method == http.MethodHead {
+					wantBody = ""
+				}
+				if w.Code != status || w.Body.String() != wantBody {
+					t.Fatalf("successful outCheck replaced file: %s HTTP %d %s", method, w.Code, w.Body.String())
+				}
+			}
+		})
+	}
+}
+
 func TestRunOutCheckScriptAllowsOutput(t *testing.T) {
 	resetJavascriptInclude(t)
 	scriptPath := writeTestScript(t, `
@@ -2238,6 +2263,9 @@ if (nyanAllParams.nyan_output.body === "main ok" && nyanAllParams.nyan_output_bo
 	}
 	if handled {
 		t.Fatalf("handled = true, want false; status=%d body=%q", statusCode, jsonStr)
+	}
+	if statusCode != http.StatusOK {
+		t.Fatalf("status=%d, want outCheck status 200", statusCode)
 	}
 }
 
@@ -4987,17 +5015,20 @@ if (nyanRuntimeSettings.issuer !== "https://service.example") throw new Error("m
 
 func TestOAuthChecksHTTPRoutes(t *testing.T) {
 	for _, role := range []string{"oauthAuthorize", "oauthToken", "oauthRegister", "oauthAdminUser", "authorizationServerMetadata", "protectedResourceMetadata"} {
-		for _, test := range []string{"allowed", "input_denied", "output_denied", "input_exception", "output_exception", "invalid_input", "invalid_output", "missing_file", "check_only", "check_only_denied", "check_only_missing", "check_alias"} {
+		for _, test := range []string{"allowed", "output_non_200_success", "input_denied", "output_denied", "input_exception", "output_exception", "invalid_input", "invalid_output", "missing_file", "check_only", "check_only_denied", "check_only_missing", "check_alias"} {
 			t.Run(role+"/"+test, func(t *testing.T) {
 				definitions, server, mark, stages := newOAuthChecksFixture(t)
 				apiName := mcpOAuthAPIForRole(server, role)
 				definition := definitions[apiName]
-				wantStatus, wantStages := http.StatusFound, "input,body,output"
+				wantStatus, wantStages := http.StatusOK, "input,body,output"
 				if isMCPOAuthMetadataRole(role) {
 					wantStatus, wantStages = http.StatusOK, "input,output"
 				}
 				const denied = `({success:false,status:403,result:{reason:"denied"}});`
 				switch test {
+				case "output_non_200_success":
+					definition.OutCheck = writeTestScript(t, mark("output")+`({success:true,status:503,result:{checked:true}});`)
+					wantStatus = http.StatusServiceUnavailable
 				case "input_denied", "check_only_denied":
 					definition.ParamCheck = writeTestScript(t, mark("input")+denied)
 					wantStatus, wantStages = http.StatusForbidden, "input"
@@ -5051,7 +5082,7 @@ func TestOAuthChecksHTTPRoutes(t *testing.T) {
 				if rec.Code != wantStatus || stages() != wantStages {
 					t.Fatalf("status=%d want=%d stages=%q want=%q body=%s", rec.Code, wantStatus, stages(), wantStages, rec.Body.String())
 				}
-				if test != "allowed" && test != "check_alias" {
+				if test != "allowed" && test != "check_alias" && test != "output_non_200_success" {
 					if rec.Header().Get("Location") != "" || len(rec.Header().Values("Set-Cookie")) != 0 {
 						t.Fatalf("script headers escaped: %v", rec.Header())
 					}
@@ -5097,7 +5128,10 @@ nyanAllParams.nyan_output.body = '{"authenticated":false}';
 				wantStatus, wantStages := http.StatusUnauthorized, ""
 				token := "Bearer good"
 				switch test {
-				case "allowed":
+				case "allowed", "non_200_output":
+					if test == "non_200_output" {
+						definition.OutCheck = writeTestScript(t, mark("output")+`({success:true,status:201});`)
+					}
 					wantStatus, wantStages = http.StatusOK, "input,verify,output,tool_input"
 					if mode == "normal" {
 						wantStages += ",tool_body"
@@ -5107,11 +5141,8 @@ nyanAllParams.nyan_output.body = '{"authenticated":false}';
 					// must be treated as a check rejection, not as verified access.
 					definition.ParamCheck = writeTestScript(t, mark("input")+`({success:false,status:403,authenticated:true,allow:true,principal:{user_id:"forged"}});`)
 					wantStages = "input"
-				case "output_denied", "non_200_output":
+				case "output_denied":
 					result := `({success:false,status:403,authenticated:true,principal:{user_id:"forged"}});`
-					if test == "non_200_output" {
-						result = `({success:true,status:201});`
-					}
 					definition.OutCheck = writeTestScript(t, mark("output")+result)
 					wantStages = "input,verify,output"
 				case "input_exception":
@@ -5168,8 +5199,8 @@ func TestOAuthCheckOnlyHTTPValidation(t *testing.T) {
 		{name: "query", role: "oauthAuthorize", method: "GET", query: "?nyan_mode=checkOnly", status: 200, stages: "input"},
 		{name: "form", role: "oauthToken", method: "POST", contentType: "application/x-www-form-urlencoded", body: "nyan_mode=checkOnly", status: 200, stages: "input"},
 		{name: "json", role: "oauthRegister", method: "POST", contentType: "application/json", body: `{"nyan_mode":"checkOnly"}`, status: 200, stages: "input"},
-		{name: "form_over_query", role: "oauthToken", method: "POST", contentType: "application/x-www-form-urlencoded", query: "?nyan_mode=checkOnly", body: "nyan_mode=", status: 302, stages: "input,body,output"},
-		{name: "json_over_query", role: "oauthRegister", method: "POST", contentType: "application/json", query: "?nyan_mode=checkOnly", body: `{"nyan_mode":""}`, status: 302, stages: "input,body,output"},
+		{name: "form_over_query", role: "oauthToken", method: "POST", contentType: "application/x-www-form-urlencoded", query: "?nyan_mode=checkOnly", body: "nyan_mode=", status: 200, stages: "input,body,output"},
+		{name: "json_over_query", role: "oauthRegister", method: "POST", contentType: "application/json", query: "?nyan_mode=checkOnly", body: `{"nyan_mode":""}`, status: 200, stages: "input,body,output"},
 		{name: "invalid_mode", role: "oauthAuthorize", method: "GET", query: "?nyan_mode=checkOnyl", status: 400},
 		{name: "repeated_mode", role: "oauthAuthorize", method: "GET", query: "?nyan_mode=checkOnly&nyan_mode=checkOnly", status: 400},
 		{name: "null_mode", role: "oauthRegister", method: "POST", contentType: "application/json", body: `{"nyan_mode":null}`, status: 400},
@@ -5220,7 +5251,7 @@ output.headers.Location="https://changed.example/";
 output.headers["Set-Cookie"][0]="changed=1";
 output.body="changed";
 ({success:true,status:200});`)
-				wantStatus, wantStages = http.StatusFound, "input,body,output"
+				wantStatus, wantStages = http.StatusOK, "input,body,output"
 			case "invalid_header":
 				definition.Script = writeTestScript(t, mark("body")+`({status:302,headers:{Location:"https://client.example/","Set-Cookie":"secret=1",Connection:"close"},body:"original"});`)
 			case "invalid_content_type":
@@ -5237,8 +5268,8 @@ output.body="changed";
 					definition.OutCheck = path
 				}
 			case "non_200_output":
-				definition.OutCheck = writeTestScript(t, mark("output")+`({success:true,status:201,result:{rejected:true}});`)
-				wantStatus, wantStages = 201, "input,body,output"
+				definition.OutCheck = writeTestScript(t, mark("output")+`({success:true,status:201,result:{checked:true}});`)
+				wantStatus, wantStages = http.StatusCreated, "input,body,output"
 			case "forbidden_sql_input", "forbidden_sql_output":
 				forbidden := filepath.Join(t.TempDir(), "forbidden.sql")
 				writeTestFile(t, forbidden, `INSERT INTO oauth_stages VALUES ('forbidden');`)
@@ -5256,7 +5287,7 @@ output.body="changed";
 			if rec.Code != wantStatus || stages() != wantStages {
 				t.Fatalf("status=%d want=%d stages=%q want=%q body=%.200s", rec.Code, wantStatus, stages(), wantStages, rec.Body.String())
 			}
-			if test == "inspection_copy" {
+			if test == "inspection_copy" || test == "non_200_output" {
 				if rec.Body.String() != "original" || rec.Header().Get("Location") != "https://client.example/done" || rec.Header().Values("Set-Cookie")[0] != "one=1; HttpOnly" {
 					t.Fatalf("response mutated: %s %v", rec.Body.String(), rec.Header())
 				}
@@ -7612,10 +7643,11 @@ func TestPushSourceResultAcrossTransports(t *testing.T) {
 				const allow = `({success:true,status:200});`
 				// An error notification from the Push target is intentional: only
 				// the originating API result controls whether to start the Push.
+				const outputAllow = `({success:true,status:201,result:"check result must not replace body"});`
 				const pushed = `{"success":false,"status":503,"result":"notification"}`
 				setTestSQLFiles(t, map[string]APIConfig{
-					"origin": {ParamCheck: writeTestScript(t, mark("input")+allow), Script: writeTestScript(t, mark("body")+fmt.Sprintf(`%q;`, test.body)), OutCheck: writeTestScript(t, mark("output")+fmt.Sprintf(`if(nyanAllParams.nyan_output.body!==%q || nyanAllParams.nyan_output.status!==%d || nyanAllParams.nyan_output_status!==%d) throw new Error("source result changed");`, test.body, test.status, test.status)+allow), Push: "events"},
-					"events": {ParamCheck: writeTestScript(t, mark("push_input")+allow), Script: writeTestScript(t, mark("push_body")+fmt.Sprintf(`%q;`, pushed)), OutCheck: writeTestScript(t, mark("push_output")+`if(nyanAllParams.nyan_output.status!==503 || nyanAllParams.nyan_output_status!==503) throw new Error("wrong Push output status");`+allow)},
+					"origin": {ParamCheck: writeTestScript(t, mark("input")+allow), Script: writeTestScript(t, mark("body")+fmt.Sprintf(`%q;`, test.body)), OutCheck: writeTestScript(t, mark("output")+fmt.Sprintf(`if(nyanAllParams.nyan_output.body!==%q || nyanAllParams.nyan_output.status!==%d || nyanAllParams.nyan_output_status!==%d) throw new Error("source result changed");`, test.body, test.status, test.status)+outputAllow), Push: "events"},
+					"events": {ParamCheck: writeTestScript(t, mark("push_input")+allow), Script: writeTestScript(t, mark("push_body")+fmt.Sprintf(`%q;`, pushed)), OutCheck: writeTestScript(t, mark("push_output")+`if(nyanAllParams.nyan_output.status!==503 || nyanAllParams.nyan_output_status!==503) throw new Error("wrong Push output status");`+outputAllow)},
 				})
 				conn, testHub := newPushCheckSubscriber(t, "events")
 				var body string
@@ -7639,10 +7671,10 @@ func TestPushSourceResultAcrossTransports(t *testing.T) {
 					if route == "jsonrpc" {
 						want := decodeTestJSONObject(t, []byte(test.body))
 						delete(want, "status")
-						if rec.Code != test.status || !reflect.DeepEqual(decodeTestJSONObject(t, []byte(body))["result"], want) {
+						if rec.Code != http.StatusCreated || !reflect.DeepEqual(decodeTestJSONObject(t, []byte(body))["result"], want) {
 							t.Fatalf("RPC response changed: status=%d body=%s", rec.Code, body)
 						}
-					} else if rec.Code != test.status || body != test.body {
+					} else if rec.Code != http.StatusCreated || body != test.body {
 						t.Fatalf("HTTP response changed: status=%d body=%s", rec.Code, body)
 					}
 				case "websocket":
@@ -7683,6 +7715,10 @@ func TestPushSourceResultAcrossTransports(t *testing.T) {
 					if !reflect.DeepEqual(result["structuredContent"], decodeTestJSONObject(t, []byte(test.body))) {
 						t.Fatalf("MCP response changed: %v", result)
 					}
+					wantError := decodeTestJSONObject(t, []byte(test.body))["success"] == false
+					if (result["isError"] == true) != wantError {
+						t.Fatalf("MCP error flag does not match original result: %v", result)
+					}
 				}
 				for _, stage := range []string{"input", "body", "output", "push_input", "push_body", "push_output"} {
 					data, err := os.ReadFile(filepath.Join(dir, stage))
@@ -7703,6 +7739,78 @@ func TestPushSourceResultAcrossTransports(t *testing.T) {
 				}
 				assertPushCheckFrame(t, conn, "complete")
 			})
+		}
+	}
+}
+
+func TestSuccessfulOutCheckSetsFinalStatus(t *testing.T) {
+	for _, kind := range []string{"script", "sql"} {
+		for _, route := range []string{"http", "root", "jsonrpc", "internal"} {
+			for _, status := range []int{201, 503} {
+				t.Run(fmt.Sprintf("%s/%s/%d", kind, route, status), func(t *testing.T) {
+					resetJavascriptInclude(t)
+					setTestSQLiteDB(t)
+					dir := t.TempDir()
+					marker := filepath.Join(dir, "push")
+					target := APIConfig{OutCheck: writeTestScript(t, fmt.Sprintf(`
+if(nyanAllParams.nyan_output.status!==200) throw new Error("wrong body status");
+({success:true,status:%d,result:"must not replace body"});`, status)), Push: "events"}
+					if kind == "script" {
+						target.Script = writeTestScript(t, `({success:true,status:200,result:[{value:7}]});`)
+					} else {
+						path := filepath.Join(dir, "select.sql")
+						writeTestFile(t, path, "SELECT 7 AS value;")
+						target.SQL = []string{path}
+					}
+					setTestSQLFiles(t, map[string]APIConfig{
+						"target": target,
+						"events": {Script: writeTestScript(t, fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"),%q); ({status:200});`, marker))},
+					})
+					var body map[string]interface{}
+					if route == "internal" {
+						result, err := executeAPIWithSnapshot(currentAPISnapshot(), "target", nil)
+						if err != nil || result.CheckRejected || result.Status != status {
+							t.Fatalf("execution=%+v err=%v", result, err)
+						}
+						value, err := callNyanAPIFromVMWithSnapshot(currentAPISnapshot(), "target", nil)
+						if err != nil {
+							t.Fatal(err)
+						}
+						body = decodeTestJSONObject(t, []byte(value))
+					} else {
+						path := "/target"
+						if route == "root" {
+							path = "/?api=target"
+						}
+						r := httptest.NewRequest(http.MethodGet, path, nil)
+						w := httptest.NewRecorder()
+						if route == "jsonrpc" {
+							r = httptest.NewRequest(http.MethodPost, "/nyan-rpc", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"target","params":{}}`))
+							handleJSONRPC(w, r)
+						} else {
+							handleRequest(w, r)
+						}
+						if w.Code != status {
+							t.Fatalf("HTTP %d, want %d: %s", w.Code, status, w.Body.String())
+						}
+						body = decodeTestJSONObject(t, w.Body.Bytes())
+						if route == "jsonrpc" {
+							body = body["result"].(map[string]interface{})
+						}
+					}
+					if body["success"] != true || !reflect.DeepEqual(body["result"], []interface{}{map[string]interface{}{"value": float64(7)}}) || (route != "jsonrpc" && body["status"] != float64(200)) {
+						t.Fatalf("original body changed: %#v", body)
+					}
+					data, err := os.ReadFile(marker)
+					if status == 201 {
+						if err != nil || string(data) != "ran" {
+							t.Fatalf("Push did not run: %q %v", data, err)
+						}
+					} else if !os.IsNotExist(err) {
+						t.Fatalf("Push ran despite final HTTP 503: %q %v", data, err)
+					}
+				})
+			}
 		}
 	}
 }
@@ -7871,7 +7979,8 @@ func TestPushChecksPreserveOriginResponse(t *testing.T) {
 		{name: "out_rejected", paramCheck: allow, outCheck: `({success:false,status:409,error:"denied"});`, wantBody: true, wantOut: true},
 		{name: "out_exception", paramCheck: allow, outCheck: `throw new Error("output check failed");`, wantBody: true, wantOut: true},
 		{name: "out_result_getter_exception", paramCheck: allow, outCheck: `({get success(){throw new Error("output result failed");},status:200});`, wantBody: true, wantOut: true},
-		{name: "out_non_ok_status", paramCheck: allow, outCheck: `({success:true,status:202});`, wantBody: true, wantOut: true},
+		{name: "out_success_202", paramCheck: allow, outCheck: `({success:true,status:202});`, wantBody: true, wantOut: true, wantPush: true},
+		{name: "out_success_503", paramCheck: allow, outCheck: `({success:true,status:503});`, wantBody: true, wantOut: true, wantPush: true},
 		{name: "cyclic_origin_parameters", paramCheck: allow, outCheck: allow, cycleParams: true},
 	} {
 		for _, route := range []string{"http", "nyanCallMe"} {
