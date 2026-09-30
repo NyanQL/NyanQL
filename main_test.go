@@ -29,6 +29,7 @@ import (
 
 	"github.com/dop251/goja"
 	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/argon2"
 )
 
 func captureServiceLogs(t *testing.T, level slog.Level) *bytes.Buffer {
@@ -4458,7 +4459,7 @@ func TestNyanHostExecInvocationErrorsRemainExceptions(t *testing.T) {
 	t.Run("missing_argument", func(t *testing.T) {
 		vm := goja.New()
 		registerNyanFuncs(vm, nil, nil, nil)
-		if _, err := vm.RunString(`nyanHostExec();`); err == nil || !strings.Contains(err.Error(), "No command provided") {
+		if _, err := vm.RunString(`nyanHostExec();`); err == nil || !strings.Contains(err.Error(), "TypeError: nyanHostExec: command required") {
 			t.Fatalf("missing argument error=%v", err)
 		}
 	})
@@ -9188,6 +9189,9 @@ if (nyanRunSQL("./sql/value.sql", {})[0].value !== 7) throw new Error("wrong SQL
 const destination = "./output/" + nyanAllParams.prefix + "-%s.txt";
 nyanSaveFile(nyanBase64Encode("%s"), destination);
 if (nyanGetFile(destination) !== "%s") throw new Error("saved file was not readable");
+if (nyanWriteTextFile(destination + ".text", "猫") !== true) throw new Error("text write failed");
+if (nyanWriteBase64File(destination + ".bin", "AAH/") !== true) throw new Error("binary write failed");
+if (nyanGetFile(destination + ".text") !== "猫") throw new Error("wrong text base");
 %s;
 `, phase, phase, phase, result)
 	}
@@ -9219,6 +9223,12 @@ nyanCallMe({api:"nested/deep/run",prefix:nyanAllParams.prefix});
 				content, err := os.ReadFile(filepath.Join(rootDir, "output", test.prefix+"-"+phase+".txt"))
 				if err != nil || string(content) != phase {
 					t.Fatalf("%s output=%q, err=%v", phase, content, err)
+				}
+				for suffix, want := range map[string]string{".text": "猫", ".bin": "\x00\x01\xff"} {
+					data, err := os.ReadFile(filepath.Join(rootDir, "output", test.prefix+"-"+phase+".txt"+suffix))
+					if err != nil || string(data) != want {
+						t.Fatalf("new writer %s/%s = %q, err=%v", phase, suffix, data, err)
+					}
 				}
 			}
 		})
@@ -10353,6 +10363,877 @@ if (nyanRequest.path !== "/mcp" || nyanRequest.json.method !== "tools/call" || n
 				}
 				if route == "register" && ctx["json"].(map[string]interface{})["value"] != "body" {
 					t.Fatal("OAuth JSON lost")
+				}
+			}
+		})
+	}
+}
+
+// getAPIArgumentTestTransport captures requests without sending them to an external service.
+type getAPIArgumentTestTransport func(*http.Request) (*http.Response, error)
+
+func (transport getAPIArgumentTestTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
+func TestNyanGetAPIArguments(t *testing.T) {
+	originalTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	for _, tc := range []struct {
+		name, arguments, wantUser, wantPass   string
+		wantAuth, noArguments, transportError bool
+		status                                int
+	}{
+		{name: "no_arguments", noArguments: true},
+		{name: "url_only", arguments: `url`},
+		{name: "empty_username", arguments: `url, ""`},
+		{name: "empty_credentials", arguments: `url, "", ""`},
+		{name: "username_only", arguments: `url, "alice"`, wantAuth: true, wantUser: "alice"},
+		{name: "credentials", arguments: `url, "alice", "secret"`, wantAuth: true, wantUser: "alice", wantPass: "secret"},
+		{name: "password_without_username", arguments: `url, "", "secret"`},
+		{name: "explicit_undefined_username", arguments: `url, undefined, "secret"`, wantAuth: true, wantUser: "undefined", wantPass: "secret"},
+		{name: "explicit_null_username", arguments: `url, null, "secret"`, wantAuth: true, wantUser: "null", wantPass: "secret"},
+		{name: "explicit_undefined_password", arguments: `url, "alice", undefined`, wantAuth: true, wantUser: "alice", wantPass: "undefined"},
+		{name: "explicit_null_password", arguments: `url, "alice", null`, wantAuth: true, wantUser: "alice", wantPass: "null"},
+		{name: "extra_argument", arguments: `url, "alice", "secret", "ignored"`, wantAuth: true, wantUser: "alice", wantPass: "secret"},
+		{name: "http_404", arguments: `url`, status: http.StatusNotFound},
+		{name: "http_500", arguments: `url`, status: http.StatusInternalServerError},
+		{name: "transport_error", arguments: `url`, transportError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requests := 0
+			http.DefaultTransport = getAPIArgumentTestTransport(func(request *http.Request) (*http.Response, error) {
+				requests++
+				if request.Method != http.MethodGet || request.URL.Scheme != "https" || request.URL.Host != "getapi.test" || request.URL.Path != "/data" {
+					t.Errorf("unexpected request: %s %s", request.Method, request.URL)
+				}
+				query := request.URL.Query()
+				if query.Get("name") != "猫 &+/?=" || query.Get("limit") != "10" || !reflect.DeepEqual(query["tag"], []string{"a", "b"}) {
+					t.Errorf("query was not preserved: %#v", query)
+				}
+				if request.Body != nil && request.Body != http.NoBody {
+					t.Error("GET unexpectedly contains a request body")
+				}
+				user, pass, ok := request.BasicAuth()
+				if ok != tc.wantAuth || user != tc.wantUser || pass != tc.wantPass {
+					t.Errorf("BasicAuth=(%q, %q, %t), want (%q, %q, %t)", user, pass, ok, tc.wantUser, tc.wantPass, tc.wantAuth)
+				}
+				if !tc.wantAuth && request.Header.Get("Authorization") != "" {
+					t.Error("unexpected Authorization header")
+				}
+				if tc.transportError {
+					return nil, errors.New("getapi-test-offline")
+				}
+				status := tc.status
+				if status == 0 {
+					status = http.StatusOK
+				}
+				return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("get-response")), Request: request}, nil
+			})
+			vm := goja.New()
+			registerNyanFuncs(vm, nil, nil, nil)
+			value, err := vm.RunString(`(function () {
+				var url = "https://getapi.test/data?name=" + encodeURIComponent("猫 &+/?=") + "&limit=10&tag=a&tag=b";
+				try {
+					return JSON.stringify({result: nyanGetAPI(` + tc.arguments + `)});
+				} catch (e) {
+					return JSON.stringify({typeError: e instanceof TypeError, message: String(e)});
+				}
+			})()`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result struct {
+				Result    *string `json:"result"`
+				TypeError bool    `json:"typeError"`
+				Message   string  `json:"message"`
+			}
+			if err := json.Unmarshal([]byte(value.String()), &result); err != nil {
+				t.Fatal(err)
+			}
+			if tc.noArguments {
+				if requests != 0 || result.Result != nil || !result.TypeError || result.Message != "TypeError: nyanGetAPI requires a URL" {
+					t.Fatalf("result=%s requests=%d, want TypeError before sending", value, requests)
+				}
+				return
+			}
+			if requests != 1 {
+				t.Fatalf("requests=%d, want 1", requests)
+			}
+			if tc.transportError && true {
+				if result.Result != nil || result.TypeError || !strings.Contains(result.Message, "getapi-test-offline") {
+					t.Fatalf("transport failure was not preserved: %s", value)
+				}
+				return
+			}
+			want := "get-response"
+			if tc.transportError {
+				want = ""
+			}
+			if result.Result == nil || *result.Result != want || result.Message != "" {
+				t.Fatalf("result=%s, want response %q", value, want)
+			}
+		})
+	}
+}
+
+func TestCheckStatusContract(t *testing.T) {
+	resetJavascriptInclude(t)
+	for _, tc := range []struct {
+		name, field string
+		wantStatus  int
+	}{
+		{name: "missing"},
+		{name: "null", field: `,"status":null`},
+		{name: "string", field: `,"status":"200"`},
+		{name: "boolean", field: `,"status":true`},
+		{name: "array", field: `,"status":[]`},
+		{name: "object", field: `,"status":{}`},
+		{name: "zero", field: `,"status":0`},
+		{name: "negative", field: `,"status":-1`},
+		{name: "below_http", field: `,"status":99`},
+		{name: "informational", field: `,"status":100`},
+		{name: "below_minimum", field: `,"status":199`},
+		{name: "fractional_below_minimum", field: `,"status":199.9`},
+		{name: "fractional_success", field: `,"status":200.5`},
+		{name: "fractional_upper_boundary", field: `,"status":599.9`},
+		{name: "above_maximum", field: `,"status":600`},
+		{name: "overflow", field: `,"status":1e100`},
+		{name: "minimum", field: `,"status":200`, wantStatus: 200},
+		{name: "created", field: `,"status":201`, wantStatus: 201},
+		{name: "forbidden", field: `,"status":403`, wantStatus: 403},
+		{name: "server_error", field: `,"status":500`, wantStatus: 500},
+		{name: "maximum", field: `,"status":599`, wantStatus: 599},
+		{name: "integral_decimal", field: `,"status":200.0`, wantStatus: 200},
+		{name: "integral_exponent", field: `,"status":2e2`, wantStatus: 200},
+		{name: "nan", field: `,"status":NaN`},
+		{name: "infinity", field: `,"status":Infinity`},
+		{name: "negative_infinity", field: `,"status":-Infinity`},
+		{name: "undefined", field: `,"status":undefined`},
+	} {
+		for _, format := range []string{"object", "json_string"} {
+			for _, success := range []bool{true, false} {
+				t.Run(fmt.Sprintf("%s/%s/success_%t", tc.name, format, success), func(t *testing.T) {
+					body := fmt.Sprintf(`{"success":%t%s,"result":{"kept":[1,"value",null]}}`, success, tc.field)
+					script := "(" + body + ");"
+					wantStatus := tc.wantStatus
+					if format == "json_string" {
+						script = fmt.Sprintf("%q;", body)
+						// Match NyanQL's integer JSON decoding, including literal notation.
+						if tc.name == "integral_decimal" || tc.name == "integral_exponent" {
+							wantStatus = 0
+						}
+					}
+					gotSuccess, gotStatus, _, resultJSON, err := runCheckScriptWithSnapshot(nil, writeTestScript(t, script), nil, nil)
+					var envelope struct {
+						Result interface{} `json:"result"`
+					}
+					if err == nil {
+						err = json.Unmarshal([]byte(resultJSON), &envelope)
+					}
+					gotResult := envelope.Result
+					if wantStatus == 0 {
+						if err == nil {
+							t.Fatalf("invalid check status accepted: %s", body)
+						}
+						return
+					}
+					if err != nil || gotStatus != wantStatus || gotSuccess != success {
+						t.Fatalf("success=%t status=%d err=%v, want success=%t status=%d", gotSuccess, gotStatus, err, success, wantStatus)
+					}
+					encoded, err := json.Marshal(gotResult)
+					if err != nil || string(encoded) != `{"kept":[1,"value",null]}` {
+						t.Fatalf("result changed: %s error=%v", encoded, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestMCPBusinessResultAcrossTransports(t *testing.T) {
+	for _, tc := range []struct {
+		name, payload  string
+		wantError      bool
+		responseStatus int
+	}{
+		{name: "business_failure", payload: `{"success":false,"result":{"message":"在庫不足","remaining":0}}`, wantError: true},
+		{name: "success", payload: `{"success":true,"result":"購入完了"}`},
+		{name: "missing_success", payload: `{"result":"取得結果"}`},
+		{name: "string_false", payload: `{"success":"false","result":"kept"}`},
+		{name: "null_success", payload: `{"success":null,"result":"kept"}`},
+		{name: "zero_success", payload: `{"success":0,"result":"kept"}`},
+		{name: "empty_string_success", payload: `{"success":"","result":"kept"}`},
+		{name: "nested_false", payload: `{"result":{"success":false}}`},
+		{name: "array_success", payload: `{"success":[false],"result":"kept"}`},
+		{name: "object_success", payload: `{"success":{"value":false},"result":"kept"}`},
+		{name: "array_result", payload: `[{"success":false}]`},
+		{name: "boolean_result", payload: `false`},
+	} {
+		for _, format := range []string{"object", "json_text"} {
+			for _, transport := range []string{"http", "stdio"} {
+				t.Run(tc.name+"/"+format+"/"+transport, func(t *testing.T) {
+					script := "(" + tc.payload + ");"
+					if format == "json_text" {
+						script = fmt.Sprintf("%q;", tc.payload)
+					}
+					var response []byte
+
+					resetJavascriptInclude(t)
+					setTestSQLiteDB(t)
+					snapshot := newAPIConfigSnapshot(map[string]APIConfig{"tool": {Script: writeTestScript(t, script), OutCheck: writeTestScript(t, `({success:true,status:200});`)}}, "", [sha256.Size]byte{})
+					server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocolVersion20251125}, Tools: []MCPToolConfig{{API: "tool"}}}
+					const request = `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tool","arguments":{}}}`
+					if transport == "http" {
+						rec := performTestMCPRequest(t, snapshot, server, request, "")
+						if rec.Code != http.StatusOK {
+							t.Fatalf("HTTP status=%d body=%s", rec.Code, rec.Body.String())
+						}
+						response = rec.Body.Bytes()
+					} else {
+						server.Transport = "stdio"
+						input := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}` + "\n" + `{"jsonrpc":"2.0","method":"notifications/initialized"}` + "\n" + request + "\n"
+						var output bytes.Buffer
+						if err := serveMCPStdio(strings.NewReader(input), &output, snapshot, "test_mcp", server); err != nil {
+							t.Fatal(err)
+						}
+						lines := bytes.Split(bytes.TrimSpace(output.Bytes()), []byte("\n"))
+						if len(lines) != 2 {
+							t.Fatalf("stdio output=%s", output.String())
+						}
+						response = lines[1]
+					}
+
+					var envelope struct {
+						Result map[string]interface{} `json:"result"`
+						Error  json.RawMessage        `json:"error"`
+					}
+					if err := json.Unmarshal(response, &envelope); err != nil {
+						t.Fatal(err)
+					}
+					if len(envelope.Error) > 0 || envelope.Result == nil {
+						t.Fatalf("expected Tool result, got %s", response)
+					}
+					if (envelope.Result["isError"] == true) != tc.wantError {
+						t.Fatalf("isError=%v want %t: %s", envelope.Result["isError"], tc.wantError, response)
+					}
+					var want interface{}
+					if err := json.Unmarshal([]byte(tc.payload), &want); err != nil {
+						t.Fatal(err)
+					}
+					content, ok := envelope.Result["content"].([]interface{})
+					if !ok || len(content) != 1 {
+						t.Fatalf("content=%v", envelope.Result["content"])
+					}
+					block, ok := content[0].(map[string]interface{})
+					if !ok || block["type"] != "text" {
+						t.Fatalf("content=%v", content)
+					}
+					text, ok := block["text"].(string)
+					if !ok {
+						t.Fatalf("text=%v", block["text"])
+					}
+					var got interface{}
+					if err := json.Unmarshal([]byte(text), &got); err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(got, want) {
+						t.Fatalf("text result changed: %s want %s", text, tc.payload)
+					}
+					structured, exists := envelope.Result["structuredContent"]
+					_, wantObject := want.(map[string]interface{})
+					if (exists && !reflect.DeepEqual(structured, want)) || (!exists && wantObject) {
+						t.Fatalf("structured result changed: %v want %s", structured, tc.payload)
+					}
+				})
+			}
+		}
+	}
+}
+
+// Shared comparison05 contract: success controls passage, outCheck controls final status.
+func TestCheckSuccessContract(t *testing.T) {
+	for _, route := range []string{"http", "root", "jsonrpc"} {
+		for _, tc := range []struct {
+			name                   string
+			param, main, out, want int
+			checkOnly, push        bool
+		}{
+			{"param_created", 201, 201, -1, 201, false, true},
+			{"param_forbidden", 403, 201, -1, 201, false, true},
+			{"param_unavailable", 503, 201, -1, 201, false, true},
+			{"out_overrides_created", 200, 201, 200, 200, false, true},
+			{"out_created", 200, 200, 201, 201, false, true},
+			{"out_forbidden", 200, 200, 403, 403, false, false},
+			{"out_unavailable", 200, 200, 503, 503, false, false},
+			{"out_preserves_status", 200, 201, -1, 201, false, true},
+			{"original_error_still_suppresses_push", 200, 403, 200, 200, false, false},
+			{"no_out_check", 503, 200, 0, 200, false, true},
+			{"check_only_created", 201, 200, 503, 201, true, false},
+			{"check_only_unavailable", 503, 200, 201, 503, true, false},
+		} {
+			t.Run(route+"/"+tc.name, func(t *testing.T) {
+				dir := t.TempDir()
+				marker := filepath.Join(dir, "push")
+				mainMarker := filepath.Join(dir, "main")
+				outMarker := filepath.Join(dir, "out")
+				param := fmt.Sprintf(`({success:true,status:%d,result:"checked"});`, tc.param)
+				out := ""
+				if tc.out != 0 {
+					expression := fmt.Sprint(tc.out)
+					if tc.out == -1 {
+						expression = "nyanAllParams.nyan_output.status"
+					}
+					out = fmt.Sprintf(`MARK_OUT if(nyanAllParams.nyan_output.status!==%d) throw new Error("wrong output metadata"); ({success:true,status:%s,result:"must not replace body"});`, tc.main, expression)
+				}
+
+				resetJavascriptInclude(t)
+				setTestSQLiteDB(t)
+				out = strings.ReplaceAll(out, "MARK_OUT", fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"),%q);`, outMarker))
+				entry := APIConfig{ParamCheck: writeTestScript(t, param), Script: writeTestScript(t, fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"),%q); ({status:%d,value:"日本語"});`, mainMarker, tc.main)), Push: "events"}
+				if out != "" {
+					entry.OutCheck = writeTestScript(t, out)
+				}
+				setTestSQLFiles(t, map[string]APIConfig{"target": entry, "events": {Script: writeTestScript(t, fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("ran"),%q); ({status:200});`, marker))}})
+
+				path := "/target"
+				if route == "root" {
+					path = "/?api=target"
+				}
+				if tc.checkOnly {
+					if route == "root" {
+						path += "&nyan_mode=checkOnly"
+					} else {
+						path += "?nyan_mode=checkOnly"
+					}
+				}
+				req := httptest.NewRequest(http.MethodGet, path, nil)
+				if route == "jsonrpc" {
+					params := `{}`
+					if tc.checkOnly {
+						params = `{"nyan_mode":"checkOnly"}`
+					}
+					req = httptest.NewRequest(http.MethodPost, "/nyan-rpc", strings.NewReader(`{"jsonrpc":"2.0","id":42,"method":"target","params":`+params+`}`))
+					req.Header.Set("Content-Type", "application/json")
+				}
+				rec := httptest.NewRecorder()
+				if route == "jsonrpc" {
+					handleJSONRPC(rec, req)
+				} else {
+					handleRequest(rec, req)
+				}
+				if rec.Code != tc.want {
+					t.Fatalf("HTTP=%d want=%d body=%s", rec.Code, tc.want, rec.Body.String())
+				}
+				var body map[string]interface{}
+				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+					t.Fatal(err)
+				}
+				if route == "jsonrpc" {
+					if body["id"] != float64(42) || body["error"] != nil {
+						t.Fatalf("wrong RPC envelope: %s", rec.Body.String())
+					}
+					body, _ = body["result"].(map[string]interface{})
+				}
+				if tc.checkOnly {
+					if body["success"] != true || body["status"] != float64(tc.param) || body["result"] != "checked" {
+						t.Fatalf("wrong checkOnly result: %v", body)
+					}
+				} else {
+					if body["value"] != "日本語" || (route != "jsonrpc" && body["status"] != float64(tc.main)) {
+						t.Fatalf("original body changed: %v", body)
+					}
+				}
+				for _, m := range []struct {
+					path string
+					want bool
+				}{{mainMarker, !tc.checkOnly}, {outMarker, !tc.checkOnly && tc.out != 0}, {marker, tc.push}} {
+					data, err := os.ReadFile(m.path)
+					if m.want {
+						if err != nil || string(data) != "ran" {
+							t.Fatalf("missing stage %s: %q %v", m.path, data, err)
+						}
+					} else if !os.IsNotExist(err) {
+						t.Fatalf("unexpected stage %s: %q %v", m.path, data, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func newCommonFileWriterTestVM(rootPath string) *goja.Runtime {
+	vm := goja.New()
+	registerNyanFuncs(vm, &APIConfigSnapshot{RootPath: rootPath}, nil, nil)
+	return vm
+}
+
+func TestCommonFileWriters(t *testing.T) {
+	for _, function := range []string{"nyanWriteTextFile", "nyanWriteBase64File"} {
+		t.Run(function, func(t *testing.T) {
+			for _, tc := range []struct{ name, text, want string }{
+				{"unicode", "猫\n🌸\x00", "猫\n🌸\x00"},
+				{"empty", "", ""},
+				{"literal base64", "aGVsbG8=", "aGVsbG8="},
+				{"json text", `{"ok":true}`, `{"ok":true}`},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					dir := t.TempDir()
+					vm := newCommonFileWriterTestVM(filepath.Join(dir, "api.json"))
+					data := tc.text
+					if function == "nyanWriteBase64File" {
+						data = base64.StdEncoding.EncodeToString([]byte(data))
+					}
+					value, err := vm.RunString(fmt.Sprintf(`%s("nested/result.txt", %q)`, function, data))
+					if err != nil || value.Export() != true {
+						t.Fatalf("result=%v err=%v", value, err)
+					}
+					path := filepath.Join(dir, "nested", "result.txt")
+					got, err := os.ReadFile(path)
+					if err != nil || string(got) != tc.want {
+						t.Fatalf("content=%q err=%v", got, err)
+					}
+					info, err := os.Stat(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if info.Mode().Perm() != 0600 {
+						t.Fatalf("mode=%o", info.Mode().Perm())
+					}
+					value, err = vm.RunString(fmt.Sprintf(`%s(%q, "")`, function, path))
+					if err != nil || value.Export() != true {
+						t.Fatalf("overwrite=%v err=%v", value, err)
+					}
+					got, err = os.ReadFile(path)
+					if err != nil || len(got) != 0 {
+						t.Fatalf("overwrite content=%q err=%v", got, err)
+					}
+					files, err := os.ReadDir(filepath.Dir(path))
+					if err != nil || len(files) != 1 {
+						t.Fatalf("temporary files remain: %v %v", files, err)
+					}
+				})
+			}
+			for _, tc := range []struct{ name, args string }{
+				{"no args", ``}, {"missing data", `"file"`}, {"undefined path", `undefined,""`}, {"null path", `null,""`},
+				{"number path", `1,""`}, {"object path", `{},""`}, {"array path", `[],""`}, {"empty path", `"",""`}, {"blank path", `" \t\n",""`},
+				{"undefined data", `"file",undefined`}, {"null data", `"file",null`}, {"number data", `"file",1`}, {"boolean data", `"file",true`},
+				{"object data", `"file",{}`}, {"array data", `"file",[]`}, {"boxed data", `"file",new String("")`},
+				{"path coercion", `{toString(){throw new Error("coerced")}},""`}, {"data coercion", `"file",{toString(){throw new Error("coerced")}}`},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					dir := t.TempDir()
+					vm := newCommonFileWriterTestVM(filepath.Join(dir, "api.json"))
+					got, err := vm.RunString(fmt.Sprintf(`(()=>{try{%s(%s);return "accepted"}catch(e){return e.name}})()`, function, tc.args))
+					if err != nil || got.String() != "TypeError" {
+						t.Fatalf("result=%v err=%v", got, err)
+					}
+					files, err := os.ReadDir(dir)
+					if err != nil || len(files) != 0 {
+						t.Fatalf("invalid call wrote files: %v %v", files, err)
+					}
+				})
+			}
+			t.Run("io failures preserve files", func(t *testing.T) {
+				dir := t.TempDir()
+				vm := newCommonFileWriterTestVM(filepath.Join(dir, "api.json"))
+				existing := filepath.Join(dir, "existing")
+				if err := os.WriteFile(existing, []byte("original"), 0644); err != nil {
+					t.Fatal(err)
+				}
+				for _, path := range []string{"existing/child", "."} {
+					value, err := vm.RunString(fmt.Sprintf(`(()=>{try{%s(%q, "");return false}catch(e){return e instanceof Error}})()`, function, path))
+					if err != nil || !value.ToBoolean() {
+						t.Fatalf("path=%q result=%v err=%v", path, value, err)
+					}
+				}
+				got, err := os.ReadFile(existing)
+				if err != nil || string(got) != "original" {
+					t.Fatalf("original=%q err=%v", got, err)
+				}
+				files, err := os.ReadDir(dir)
+				if err != nil || len(files) != 1 {
+					t.Fatalf("temporary files remain: %v %v", files, err)
+				}
+			})
+			t.Run("missing root rejects relative accepts absolute", func(t *testing.T) {
+				for _, root := range []string{"", "relative/api.json"} {
+					vm := newCommonFileWriterTestVM(root)
+					value, err := vm.RunString(fmt.Sprintf(`(()=>{try{%s("file", "");return false}catch(e){return e instanceof Error}})()`, function))
+					if err != nil || !value.ToBoolean() {
+						t.Fatalf("result=%v err=%v", value, err)
+					}
+					path := filepath.Join(t.TempDir(), "file")
+					value, err = vm.RunString(fmt.Sprintf(`%s(%q, "")`, function, path))
+					if err != nil || value.Export() != true {
+						t.Fatalf("absolute=%v err=%v", value, err)
+					}
+					if _, err := os.Stat(path); err != nil {
+						t.Fatal(err)
+					}
+				}
+			})
+			t.Run("captured root ignores cwd and reload", func(t *testing.T) {
+				dir, other := t.TempDir(), t.TempDir()
+				t.Chdir(other)
+				snapshot := &APIConfigSnapshot{RootPath: filepath.Join(dir, "api.json")}
+				vm := newCommonFileWriterTestVM(snapshot.RootPath)
+				setTestAPISnapshot(t, &APIConfigSnapshot{RootPath: filepath.Join(other, "api.json")})
+				got, err := vm.RunString(fmt.Sprintf(`%s("result", "")`, function))
+				if err != nil || got.Export() != true {
+					t.Fatalf("result=%v err=%v", got, err)
+				}
+				if _, err := os.Stat(filepath.Join(dir, "result")); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Stat(filepath.Join(other, "result")); !os.IsNotExist(err) {
+					t.Fatalf("wrong base: %v", err)
+				}
+			})
+		})
+	}
+	t.Run("binary and line breaks", func(t *testing.T) {
+		dir := t.TempDir()
+		vm := newCommonFileWriterTestVM(filepath.Join(dir, "api.json"))
+		got, err := vm.RunString(`nyanWriteBase64File("binary", "AA\r\nH/")`)
+		if err != nil || got.Export() != true {
+			t.Fatalf("result=%v err=%v", got, err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, "binary"))
+		if err != nil || !bytes.Equal(data, []byte{0, 1, 255}) {
+			t.Fatalf("binary=%v err=%v", data, err)
+		}
+	})
+	for _, tc := range []struct{ name, data string }{
+		{"invalid character", "%%%"}, {"partial valid input", "aGVsbG8=%%%"}, {"missing padding", "YQ"},
+		{"URL safe", "AAH_"}, {"data URL", "data:text/plain;base64,YQ=="}, {"spaces", "Y Q=="},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "existing")
+			if err := os.WriteFile(path, []byte("original"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			vm := newCommonFileWriterTestVM(filepath.Join(dir, "api.json"))
+			for _, dest := range []string{"existing", "new/invalid"} {
+				got, err := vm.RunString(fmt.Sprintf(`(()=>{try{nyanWriteBase64File(%q,%q);return "accepted"}catch(e){return e.name}})()`, dest, tc.data))
+				if err != nil || got.String() != "TypeError" {
+					t.Fatalf("result=%v err=%v", got, err)
+				}
+			}
+			data, err := os.ReadFile(path)
+			if err != nil || string(data) != "original" {
+				t.Fatalf("existing=%q err=%v", data, err)
+			}
+			files, err := os.ReadDir(dir)
+			if err != nil || len(files) != 1 {
+				t.Fatalf("invalid Base64 created files: %v %v", files, err)
+			}
+		})
+	}
+}
+
+func TestCommonFileWritersPreserveLegacy(t *testing.T) {
+	dir := t.TempDir()
+	vm := newCommonFileWriterTestVM(filepath.Join(dir, "api.json"))
+	got, err := vm.RunString(`nyanSaveFile("aGVsbG8=", "legacy") === undefined`)
+	if err != nil || !got.ToBoolean() {
+		t.Fatalf("legacy=%v err=%v", got, err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "legacy"))
+	if err != nil || string(data) != "hello" {
+		t.Fatalf("legacy content=%q err=%v", data, err)
+	}
+}
+func TestCommonFileWritersRestrictedRuntime(t *testing.T) {
+	dir := t.TempDir()
+	vm := newCommonFileWriterTestVM(filepath.Join(dir, "api.json"))
+	restrictNyanRuntimeCapabilities(vm, []string{"sql", "crypto", "password"})
+	for _, function := range []string{"nyanWriteTextFile", "nyanWriteBase64File"} {
+		got, err := vm.RunString(fmt.Sprintf(`typeof %s`, function))
+		if err != nil || got.String() != "undefined" {
+			t.Fatalf("restricted=%v err=%v", got, err)
+		}
+		if _, err := vm.RunString(fmt.Sprintf(`%s("file", "")`, function)); err == nil {
+			t.Fatal("restricted writer accepted")
+		}
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 0 {
+		t.Fatalf("restricted write: %v %v", files, err)
+	}
+}
+
+func TestHostExecCommonContract(t *testing.T) {
+	t.Run("missing argument TypeError", func(t *testing.T) {
+		vm := newCommonFileWriterTestVM("")
+		value, err := vm.RunString(`(()=>{try {nyanHostExec(); return false;} catch(e){return e instanceof TypeError && e.message === "nyanHostExec: command required";}})()`)
+		if err != nil || !value.ToBoolean() {
+			t.Fatalf("missing argument=%v err=%v", value, err)
+		}
+	})
+	for _, exitCode := range []int{0, 7} {
+		t.Run(fmt.Sprintf("object exit %d", exitCode), func(t *testing.T) {
+			command := fmt.Sprintf("echo hello; echo problem >&2; exit %d", exitCode)
+			if runtime.GOOS == "windows" {
+				command = fmt.Sprintf("echo hello& echo problem 1>&2& exit /b %d", exitCode)
+			}
+			vm := newCommonFileWriterTestVM("")
+			value, err := vm.RunString(fmt.Sprintf(`(()=>{const r=nyanHostExec(%q);return typeof r === "object" && r.success === %t && r.exit_code === %d && r.stdout.trim() === "hello" && r.stderr.trim() === "problem" && Object.keys(r).sort().join(",") === "exit_code,stderr,stdout,success";})()`, command, exitCode == 0, exitCode))
+			if err != nil || !value.ToBoolean() {
+				t.Fatalf("object access=%v err=%v", value, err)
+			}
+		})
+	}
+}
+
+func newArgon2ContractRuntime(t *testing.T) *goja.Runtime {
+	return newCommonFileWriterTestVM("")
+}
+
+func TestArgon2idCommonVerificationContract(t *testing.T) {
+	const saved = "$argon2id$v=19$m=65536,t=3,p=2$MDEyMzQ1Njc4OWFiY2RlZg$8AcZ9tO47h2U7BO3dpzQuEogqm6bqJy8+taXF1/F90g"
+	verify := func(t *testing.T, password, encoded string, want bool) {
+		t.Helper()
+		vm := newArgon2ContractRuntime(t)
+		value, err := vm.RunString(fmt.Sprintf(`nyanArgon2idVerify(%q,%q)`, password, encoded))
+		if err != nil || value.Export() != want {
+			t.Fatalf("verify=%v want=%t err=%v", value, want, err)
+		}
+	}
+	t.Run("saved standard", func(t *testing.T) { verify(t, "fixture-password", saved, true) })
+	t.Run("wrong password", func(t *testing.T) { verify(t, "wrong-password", saved, false) })
+	for _, tc := range []struct {
+		name, password        string
+		memory, iterations    uint32
+		parallelism           uint8
+		saltLength, keyLength int
+	}{
+		{"higher time", "fixture-password", 65536, 4, 2, 16, 32},
+		{"parallelism one", "fixture-password", 65536, 3, 1, 16, 32},
+		{"higher memory", "fixture-password", 131072, 3, 2, 16, 32},
+		{"minimum digest", "fixture-password", 65536, 3, 2, 16, 16},
+		{"long salt and digest", "fixture-password", 65536, 3, 2, 64, 64},
+		{"interior sizes", "fixture-password", 65537, 3, 3, 17, 33},
+		{"upper limits", "fixture-password", 262144, 10, 16, 64, 64},
+		{"4096 bytes", strings.Repeat("x", 4096), 65536, 3, 2, 16, 32},
+		{"multibyte password", strings.Repeat("猫", 1365), 65536, 3, 2, 16, 32},
+		{"empty verification remains supported", "", 65536, 3, 2, 16, 32},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Generate an independent deterministic fixture with the Argon2 library;
+			// generation through the product's API deliberately stays at standard settings.
+			salt := bytes.Repeat([]byte("s"), tc.saltLength)
+			digest := argon2.IDKey([]byte(tc.password), salt, tc.iterations, tc.memory, tc.parallelism, uint32(tc.keyLength))
+			encoded := fmt.Sprintf("$argon2id$v=19$m=%d,t=%d,p=%d$%s$%s", tc.memory, tc.iterations, tc.parallelism, base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(digest))
+			verify(t, tc.password, encoded, true)
+		})
+	}
+	parts := strings.Split(saved, "$")
+	changed := func(index int, value string) string {
+		p := append([]string(nil), parts...)
+		p[index] = value
+		return strings.Join(p, "$")
+	}
+	for _, tc := range []struct{ name, encoded string }{
+		{"empty", ""}, {"oversize hash", strings.Repeat("x", 10000)},
+		{"prefix", changed(0, "junk")}, {"missing prefix", strings.TrimPrefix(saved, "$")}, {"extra field", saved + "$extra"},
+		{"algorithm", changed(1, "argon2i")}, {"version", changed(2, "v=16")}, {"version suffix", changed(2, "v=19x")}, {"version space", changed(2, "v=19 ")}, {"version zero", changed(2, "v=019")},
+		{"low memory", changed(3, "m=65535,t=3,p=2")}, {"high memory", changed(3, "m=262145,t=3,p=2")},
+		{"low time", changed(3, "m=65536,t=2,p=2")}, {"high time", changed(3, "m=65536,t=11,p=2")},
+		{"low parallelism", changed(3, "m=65536,t=3,p=0")}, {"high parallelism", changed(3, "m=65536,t=3,p=17")},
+		{"all zero", changed(3, "m=0,t=0,p=0")}, {"overflow", changed(3, "m=4294967296,t=3,p=2")},
+		{"narrowing overflow", changed(3, "m=65536,t=3,p=258")}, {"negative", changed(3, "m=-65536,t=3,p=2")},
+		{"sign", changed(3, "m=+65536,t=3,p=2")}, {"leading zero", changed(3, "m=065536,t=3,p=2")},
+		{"suffix", changed(3, parts[3]+",extra=1")}, {"trailing text", changed(3, parts[3]+"x")}, {"trailing space", changed(3, parts[3]+" ")},
+		{"reordered", changed(3, "t=3,m=65536,p=2")}, {"duplicate", changed(3, "m=65536,t=3,t=2")}, {"missing", changed(3, "m=65536,t=3")},
+		{"short salt", changed(4, base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{0}, 15)))},
+		{"long salt", changed(4, base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{0}, 65)))},
+		{"short digest", changed(5, base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{0}, 15)))},
+		{"long digest", changed(5, base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{0}, 65)))},
+		{"invalid salt", changed(4, strings.Repeat("!", 22))}, {"invalid digest", changed(5, strings.Repeat("!", 43))},
+		{"padded salt", changed(4, parts[4]+"==")}, {"padded digest", changed(5, parts[5]+"=")},
+		{"salt newline", changed(4, parts[4][:5]+"\n"+parts[4][5:])}, {"digest CRLF", changed(5, parts[5][:5]+"\r\n"+parts[5][5:])},
+		{"noncanonical salt bits", changed(4, parts[4][:len(parts[4])-1]+"h")},
+		{"noncanonical digest bits", changed(5, parts[5][:len(parts[5])-1]+"h")},
+		{"URL safe", changed(5, strings.ReplaceAll(parts[5], "+", "-"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseArgon2idHash(tc.encoded); err == nil {
+				t.Fatal("invalid hash parsed")
+			}
+			verify(t, "fixture-password", tc.encoded, false)
+		})
+	}
+	t.Run("overlong password", func(t *testing.T) { verify(t, strings.Repeat("x", 4097), saved, false) })
+	t.Run("overlong multibyte password", func(t *testing.T) { verify(t, strings.Repeat("猫", 1366), saved, false) })
+	t.Run("generation unchanged", func(t *testing.T) {
+		vm := newArgon2ContractRuntime(t)
+		value, err := vm.RunString(`const a=nyanArgon2idHash("fixture-password"), b=nyanArgon2idHash("fixture-password");[a,b];`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		values := value.Export().([]interface{})
+		if values[0] == values[1] {
+			t.Fatal("salt reused")
+		}
+		for _, value := range values {
+			encoded := value.(string)
+			parsed, err := parseArgon2idHash(encoded)
+			if err != nil || parsed.memory != 65536 || parsed.iterations != 3 || parsed.parallelism != 2 || len(parsed.salt) != 16 || len(parsed.digest) != 32 {
+				t.Fatalf("generation changed: %s %v", encoded, err)
+			}
+			verify(t, "fixture-password", encoded, true)
+		}
+		for _, password := range []string{"", strings.Repeat("x", 4097)} {
+			if _, err := vm.RunString(fmt.Sprintf(`nyanArgon2idHash(%q)`, password)); err == nil {
+				t.Fatal("invalid password generated")
+			}
+		}
+	})
+}
+
+func TestArgon2idCalculationSlots(t *testing.T) {
+	const saved = "$argon2id$v=19$m=65536,t=3,p=2$MDEyMzQ1Njc4OWFiY2RlZg$8AcZ9tO47h2U7BO3dpzQuEogqm6bqJy8+taXF1/F90g"
+	if cap(oauthArgon2Slots) != 2 {
+		t.Fatalf("slots=%d", cap(oauthArgon2Slots))
+	}
+	for _, operation := range []string{"generate", "verify", "invalid", "overlong"} {
+		t.Run(operation, func(t *testing.T) {
+			oauthArgon2Slots <- struct{}{}
+			oauthArgon2Slots <- struct{}{}
+			held := 2
+			release := func() {
+				for held > 0 {
+					<-oauthArgon2Slots
+					held--
+				}
+			}
+			defer release()
+			started, done := make(chan struct{}), make(chan error, 1)
+			go func() {
+				vm := newArgon2ContractRuntime(t)
+				close(started)
+				script := fmt.Sprintf(`nyanArgon2idVerify("fixture-password",%q)`, saved)
+				switch operation {
+				case "generate":
+					script = `nyanArgon2idHash("fixture-password")`
+				case "invalid":
+					script = `nyanArgon2idVerify("fixture-password","bad")`
+				case "overlong":
+					script = fmt.Sprintf(`nyanArgon2idVerify(%q,%q)`, strings.Repeat("x", 4097), saved)
+				}
+				value, err := vm.RunString(script)
+				if err == nil && operation != "generate" && value.Export() != (operation == "verify") {
+					err = fmt.Errorf("unexpected result: %v", value)
+				}
+				done <- err
+			}()
+			<-started
+			if operation == "invalid" || operation == "overlong" {
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(time.Second):
+					release()
+					<-done
+					t.Fatal("invalid input waited for calculation slot")
+				}
+				return
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("calculation bypassed full slots: %v", err)
+			case <-time.After(25 * time.Millisecond):
+			}
+			<-oauthArgon2Slots
+			held--
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(10 * time.Second):
+				release()
+				<-done
+				t.Fatal("calculation did not finish after releasing a slot")
+			}
+		})
+	}
+	if len(oauthArgon2Slots) != 0 {
+		t.Fatal("calculation slot leaked")
+	}
+}
+
+func runPushTargetContract(t *testing.T, scripts map[string]string, params map[string]interface{}) {
+	t.Helper()
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	setTestSQLFiles(t, map[string]APIConfig{"group/events": {Script: scripts["main"], ParamCheck: scripts["param"], OutCheck: scripts["out"]}})
+	performPush(currentAPISnapshot(), APIConfig{Push: "group/events"}, params)
+}
+
+func TestPushTargetAPIContract(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		params map[string]interface{}
+		stop   string
+	}{
+		{"source", map[string]interface{}{"api": "source", "nested": map[string]interface{}{"value": "kept"}}, ""},
+		{"slash source", map[string]interface{}{"api": "/source"}, ""},
+		{"forged name", map[string]interface{}{"api": "not-the-target"}, ""},
+		{"number api", map[string]interface{}{"api": 7}, ""},
+		{"array api", map[string]interface{}{"api": []interface{}{"x", "y"}}, ""},
+		{"null api", map[string]interface{}{"api": nil}, ""},
+		{"missing api", map[string]interface{}{"value": "kept"}, ""},
+		{"nil parameters", nil, ""},
+		{"input rejection", map[string]interface{}{"api": "source"}, "param"},
+		{"body exception", map[string]interface{}{"api": "source"}, "main"},
+		{"output rejection", map[string]interface{}{"api": "source"}, "out"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			before, err := json.Marshal(tc.params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			scripts := map[string]string{}
+			for _, stage := range []string{"param", "main", "out"} {
+				path := filepath.Join(dir, stage+".js")
+				script := fmt.Sprintf(`if(nyanAllParams.api!=="group/events")throw new Error("wrong Push target");nyanWriteTextFile(%q,nyanAllParams.api);`, filepath.Join(dir, stage+".txt"))
+				if stage == tc.stop {
+					script += `nyanAllParams.api="changed";nyanAllParams.extra="changed";`
+					if stage == "main" {
+						script += `throw new Error("expected Push failure");`
+					} else {
+						script += `({success:false,status:403});`
+					}
+				} else if stage == "main" {
+					script += `"notification";`
+				} else {
+					script += `({success:true,status:200});`
+				}
+				if err := os.WriteFile(path, []byte(script), 0600); err != nil {
+					t.Fatal(err)
+				}
+				scripts[stage] = path
+			}
+			runPushTargetContract(t, scripts, tc.params)
+			after, err := json.Marshal(tc.params)
+			if err != nil || string(before) != string(after) {
+				t.Fatalf("source mutated: before=%s after=%s err=%v", before, after, err)
+			}
+			for _, stage := range []string{"param", "main", "out"} {
+				want := stage == "param" || (stage == "main" && tc.stop != "param") || (stage == "out" && tc.stop != "param" && tc.stop != "main")
+				data, err := os.ReadFile(filepath.Join(dir, stage+".txt"))
+				if want {
+					if err != nil || string(data) != "group/events" {
+						t.Fatalf("stage=%s data=%s err=%v", stage, data, err)
+					}
+				} else if !os.IsNotExist(err) {
+					t.Fatalf("unexpected stage %s: %s %v", stage, data, err)
 				}
 			}
 		})
