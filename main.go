@@ -7613,6 +7613,8 @@ func restrictNyanRuntimeCapabilities(vm *goja.Runtime, capabilities []string) {
 		"nyanGetFile",
 		"nyanCallMe",
 		"nyanSaveFile",
+		"nyanWriteTextFile",
+		"nyanWriteBase64File",
 	} {
 		vm.Set(functionName, goja.Undefined())
 	}
@@ -8063,7 +8065,7 @@ func execCommand(commandLine string) (*ExecResult, error) {
 // コマンドを実行し、JSON タグに沿ったマップとして結果を返します。
 func nyanHostExecWrapper(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	if len(call.Arguments) < 1 {
-		panic(vm.ToValue("exec: No command provided"))
+		panic(vm.NewTypeError("nyanHostExec: command required"))
 	}
 	// コマンドライン文字列を取得
 	commandLine := call.Argument(0).String()
@@ -8778,6 +8780,11 @@ func saveBase64ToFileWithSnapshot(snapshot *APIConfigSnapshot, destPath, b64 str
 }
 
 func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map[string]interface{}, acceptedParamsKeys []string) {
+	writerRoot := ""
+	if snapshot != nil {
+		writerRoot = snapshot.RootPath
+	}
+	registerNyanFileWriters(vm, writerRoot)
 	if params == nil {
 		params = make(map[string]interface{})
 	}
@@ -8820,10 +8827,11 @@ func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map
 		},
 	})
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
-		var url, username, password string
-		if len(call.Arguments) >= 1 {
-			url = call.Argument(0).String()
+		if len(call.Arguments) == 0 {
+			panic(vm.NewTypeError("nyanGetAPI requires a URL"))
 		}
+		url := call.Argument(0).String()
+		var username, password string
 		if len(call.Arguments) >= 2 {
 			username = call.Argument(1).String()
 		}
@@ -9045,7 +9053,12 @@ func registerNyanCryptographicFunctions(vm *goja.Runtime) {
 		}
 		return vm.ToValue(value)
 	})
-	vm.Set("nyanSHA256Base64URL", func(call goja.FunctionCall) goja.Value { return vm.ToValue(sha256Base64URL(call.Argument(0).String())) })
+	vm.Set("nyanSHA256Base64URL", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			panic(vm.NewTypeError("nyanSHA256Base64URL requires a string"))
+		}
+		return vm.ToValue(sha256Base64URL(call.Argument(0).String()))
+	})
 	vm.Set("nyanArgon2idHash", func(call goja.FunctionCall) goja.Value {
 		value, err := hashPasswordArgon2ID(call.Argument(0).String())
 		if err != nil {
@@ -9089,6 +9102,8 @@ func timingSafeStringEqual(left, right string) bool {
 	return subtle.ConstantTimeCompare(leftDigest[:], rightDigest[:]) == 1 && len(left) == len(right)
 }
 
+var oauthArgon2Slots = make(chan struct{}, 2)
+
 func hashPasswordArgon2ID(password string) (string, error) {
 	if password == "" {
 		return "", fmt.Errorf("password must not be empty")
@@ -9100,6 +9115,8 @@ func hashPasswordArgon2ID(password string) (string, error) {
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
 		return "", fmt.Errorf("generate password salt: %w", err)
 	}
+	oauthArgon2Slots <- struct{}{}
+	defer func() { <-oauthArgon2Slots }()
 	hash := argon2.IDKey([]byte(password), salt, argon2TimeCost, argon2MemoryKiB, argon2Parallelism, argon2KeyLength)
 	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
 		argon2.Version,
@@ -9112,32 +9129,7 @@ func hashPasswordArgon2ID(password string) (string, error) {
 }
 
 func verifyPasswordArgon2ID(password, encoded string) (bool, error) {
-	parts := strings.Split(encoded, "$")
-	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" {
-		return false, fmt.Errorf("invalid Argon2id hash format")
-	}
-	var version int
-	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil || version != argon2.Version {
-		return false, fmt.Errorf("unsupported Argon2id version")
-	}
-	var memory, timeCost uint32
-	var parallelism uint8
-	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &timeCost, &parallelism); err != nil {
-		return false, fmt.Errorf("invalid Argon2id parameters")
-	}
-	if memory < argon2MemoryKiB || memory > 256*1024 || timeCost < argon2TimeCost || timeCost > 10 || parallelism < 1 || parallelism > 16 {
-		return false, fmt.Errorf("unsafe Argon2id parameters")
-	}
-	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
-	if err != nil || len(salt) < argon2SaltLength || len(salt) > 64 {
-		return false, fmt.Errorf("invalid Argon2id salt")
-	}
-	expected, err := base64.RawStdEncoding.DecodeString(parts[5])
-	if err != nil || len(expected) < 16 || len(expected) > 64 {
-		return false, fmt.Errorf("invalid Argon2id hash")
-	}
-	actual := argon2.IDKey([]byte(password), salt, timeCost, memory, parallelism, uint32(len(expected)))
-	return subtle.ConstantTimeCompare(actual, expected) == 1, nil
+	return verifyBoundedArgon2id(password, encoded)
 }
 
 func sha256Hash(input string) string {
@@ -9148,4 +9140,160 @@ func sha256Hash(input string) string {
 func sha1Hash(input string) string {
 	hash := sha1.Sum([]byte(input))
 	return hex.EncodeToString(hash[:])
+}
+
+// New file writers have one contract across the three products. Legacy
+// nyanSaveFile retains its product-specific arguments and return value.
+func registerNyanFileWriters(vm *goja.Runtime, rootAPIPath string) {
+	baseDir := ""
+	if filepath.IsAbs(rootAPIPath) {
+		baseDir = filepath.Dir(rootAPIPath)
+	}
+	for _, name := range []string{"nyanWriteTextFile", "nyanWriteBase64File"} {
+		vm.Set(name, func(call goja.FunctionCall) goja.Value {
+			if len(call.Arguments) < 2 {
+				panic(vm.NewTypeError("%s(path, data) requires 2 string arguments", name))
+			}
+			pathValue, pathOK := call.Argument(0).(goja.String)
+			dataValue, dataOK := call.Argument(1).(goja.String)
+			if !pathOK || strings.TrimSpace(pathValue.String()) == "" {
+				panic(vm.NewTypeError("%s: path must be a non-empty string", name))
+			}
+			if !dataOK {
+				panic(vm.NewTypeError("%s: data must be a string", name))
+			}
+			path, text := pathValue.String(), dataValue.String()
+			data := []byte(text)
+			if name == "nyanWriteBase64File" {
+				var err error
+				data, err = base64.StdEncoding.DecodeString(text)
+				if err != nil {
+					panic(vm.NewTypeError("%s: invalid standard Base64 data", name))
+				}
+			}
+			if !filepath.IsAbs(path) {
+				if baseDir == "" {
+					panic(vm.NewGoError(fmt.Errorf("root API configuration path is unavailable for relative file paths")))
+				}
+				path = filepath.Join(baseDir, path)
+			}
+			if err := writeNyanFileAtomically(path, data); err != nil {
+				panic(vm.NewGoError(fmt.Errorf("%s: %w", name, err)))
+			}
+			return vm.ToValue(true)
+		})
+	}
+}
+
+// Write beside the destination and replace it only after the complete content
+// has been written and synced. The destination is never opened for truncation.
+func writeNyanFileAtomically(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".nyan-write-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = temporary.Close()
+		}
+		_ = os.Remove(temporaryPath)
+	}()
+	if err := temporary.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		return err
+	}
+	err = temporary.Close()
+	closed = true
+	if err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
+}
+
+// Verification limits are independent of the settings used to generate new hashes.
+// Accept NyanQL's existing numeric ranges, with a canonical PHC representation.
+type parsedArgon2idHash struct {
+	memory      uint32
+	iterations  uint32
+	parallelism uint8
+	salt        []byte
+	digest      []byte
+}
+
+func parseArgon2idHash(encoded string) (parsedArgon2idHash, error) {
+	var parsed parsedArgon2idHash
+	// Each 64-byte unpadded Base64 field is at most 86 characters.
+	const maxEncodedLength = len("$argon2id$v=19$m=262144,t=10,p=16$") + 86 + 1 + 86
+	if len(encoded) > maxEncodedLength {
+		return parsed, fmt.Errorf("Argon2id hash is too long")
+	}
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" || parts[2] != "v=19" {
+		return parsed, fmt.Errorf("invalid Argon2id hash format or version")
+	}
+	parameters := strings.Split(parts[3], ",")
+	if len(parameters) != 3 {
+		return parsed, fmt.Errorf("invalid Argon2id parameters")
+	}
+	var values [3]uint64
+	for i, name := range []string{"m=", "t=", "p="} {
+		if !strings.HasPrefix(parameters[i], name) {
+			return parsed, fmt.Errorf("invalid Argon2id parameters")
+		}
+		number := strings.TrimPrefix(parameters[i], name)
+		value, err := strconv.ParseUint(number, 10, 32)
+		if err != nil || strconv.FormatUint(value, 10) != number {
+			return parsed, fmt.Errorf("invalid Argon2id parameters")
+		}
+		values[i] = value
+	}
+	if values[0] < 65536 || values[0] > 262144 || values[1] < 3 || values[1] > 10 || values[2] < 1 || values[2] > 16 {
+		return parsed, fmt.Errorf("unsafe Argon2id parameters")
+	}
+	parsed.memory, parsed.iterations, parsed.parallelism = uint32(values[0]), uint32(values[1]), uint8(values[2])
+	decode := func(text string, minimum int) ([]byte, error) {
+		if len(text) < base64.RawStdEncoding.EncodedLen(minimum) || len(text) > base64.RawStdEncoding.EncodedLen(64) {
+			return nil, fmt.Errorf("invalid Argon2id field length")
+		}
+		data, err := base64.RawStdEncoding.Strict().DecodeString(text)
+		if err != nil || len(data) < minimum || len(data) > 64 || base64.RawStdEncoding.EncodeToString(data) != text {
+			return nil, fmt.Errorf("invalid Argon2id Base64 field")
+		}
+		return data, nil
+	}
+	var err error
+	parsed.salt, err = decode(parts[4], 16)
+	if err != nil {
+		return parsed, err
+	}
+	parsed.digest, err = decode(parts[5], 16)
+	if err != nil {
+		return parsed, err
+	}
+	return parsed, nil
+}
+
+func verifyBoundedArgon2id(password, encoded string) (bool, error) {
+	if len(password) > 4096 {
+		return false, fmt.Errorf("password is too long")
+	}
+	parsed, err := parseArgon2idHash(encoded)
+	if err != nil {
+		return false, err
+	}
+	// Validate before waiting for a slot or allocating Argon2's work memory.
+	oauthArgon2Slots <- struct{}{}
+	defer func() { <-oauthArgon2Slots }()
+	actual := argon2.IDKey([]byte(password), parsed.salt, parsed.iterations, parsed.memory, parsed.parallelism, uint32(len(parsed.digest)))
+	return subtle.ConstantTimeCompare(actual, parsed.digest) == 1, nil
 }
