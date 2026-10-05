@@ -1793,28 +1793,156 @@ func buildMCPToolDefinition(snapshot *APIConfigSnapshot, toolConfig MCPToolConfi
 }
 
 func normalizedMCPInputSchema(schema map[string]interface{}) map[string]interface{} {
-	var normalized map[string]interface{}
-	if len(schema) == 0 {
-		normalized = map[string]interface{}{
-			"type":                 "object",
-			"properties":           map[string]interface{}{},
-			"additionalProperties": true,
-		}
-	} else {
-		normalized = cloneJSONCompatibleValue(schema).(map[string]interface{})
+	normalized := mcpInputSchemaWithExecutionMode(schema)
+	if _, hasRef := schema["$ref"]; !hasRef {
+		return normalized
 	}
-	// Publish and validate the same optional execution control for both MCP
-	// transports, including APIs whose schema disallows additional properties.
-	// Keep malformed properties intact so schema compilation still rejects them.
+	compiled, err := compileJSONSchema(normalized)
+	if err != nil {
+		return normalized // Leave invalid schemas for the caller's compiler to reject.
+	}
+	// Specialize only references that validate the arguments object itself.
+	// Keep the original definitions intact: a nested property can share them.
+	definitions, _ := schema["$defs"].(map[string]interface{})
+	definitions = cloneParams(definitions)
+	references := make(map[string]string)
+	var extendReference func(map[string]interface{}, *jsonschema.Schema)
+	extendReference = func(current map[string]interface{}, compiled *jsonschema.Schema) {
+		if compiled.Ref == nil {
+			return
+		}
+		// Use the compiler's canonical location, including for local anchors.
+		ref := compiled.Ref.Location
+		if replacement, exists := references[ref]; exists {
+			current["$ref"] = replacement
+			return
+		}
+		location, err := url.Parse(ref)
+		if err != nil || !strings.HasPrefix(location.Fragment, "/") {
+			return
+		}
+		var target interface{} = schema
+		for _, part := range strings.Split(location.Fragment[1:], "/") {
+			part = strings.ReplaceAll(strings.ReplaceAll(part, "~1", "/"), "~0", "~")
+			switch value := target.(type) {
+			case map[string]interface{}:
+				target = value[part]
+			case []interface{}:
+				index, err := strconv.Atoi(part)
+				if err != nil || index < 0 || index >= len(value) {
+					return
+				}
+				target = value[index]
+			default:
+				return
+			}
+			// Moving an embedded resource would change the base of its references.
+			// Keep such resources untouched, as well as nested property schemas.
+			if object, ok := target.(map[string]interface{}); ok {
+				if _, hasID := object["$id"].(string); hasID {
+					return
+				}
+			}
+		}
+		source, ok := target.(map[string]interface{})
+		if !ok {
+			return // Boolean schemas and invalid references remain unchanged.
+		}
+		name := "nyan_input"
+		for index := 1; ; index++ {
+			if _, exists := definitions[name]; !exists {
+				break
+			}
+			name = fmt.Sprintf("nyan_input_%d", index)
+		}
+		replacement := "#/$defs/" + name
+		references[ref] = replacement
+		extended := mcpInputSchemaWithExecutionMode(source)
+		// Keep anchor identities on the original definition, including the
+		// dynamic anchor used by recursive children retained below.
+		delete(extended, "$anchor")
+		delete(extended, "$dynamicAnchor")
+		definitions[name] = extended
+		extendReference(extended, compiled.Ref)
+		if reflect.DeepEqual(source, extended) {
+			// tools/list and tools/call normalize stored schemas again.
+			// Reuse an already extended reference rather than growing $defs.
+			delete(definitions, name)
+			references[ref], _ = current["$ref"].(string)
+			return
+		}
+		// Reuse subschemas at their original locations so copying this object
+		// does not duplicate anchors or embedded resources, or rebase their refs.
+		retainMCPInputSubschemaReferences(extended, location)
+		current["$ref"] = replacement
+	}
+	extendReference(normalized, compiled)
+	if len(definitions) != 0 {
+		normalized["$defs"] = definitions
+	}
+	return normalized
+}
+
+func retainMCPInputSubschemaReferences(schema map[string]interface{}, location *url.URL) {
+	reference := func(parts ...string) interface{} {
+		target := *location
+		for _, part := range parts {
+			target.Fragment += "/" + strings.ReplaceAll(strings.ReplaceAll(part, "~", "~0"), "/", "~1")
+		}
+		// Published schemas must also resolve in clients with a different base URI.
+		return map[string]interface{}{"$ref": (&url.URL{Fragment: target.Fragment}).String()}
+	}
+	delete(schema, "$defs")
+	delete(schema, "definitions")
+	for _, keyword := range []string{"properties", "patternProperties", "dependentSchemas", "dependencies"} {
+		if original, ok := schema[keyword].(map[string]interface{}); ok {
+			children := cloneParams(original)
+			for name, child := range children {
+				if keyword == "properties" && name == "nyan_mode" {
+					continue
+				}
+				if _, isSchema := child.(map[string]interface{}); isSchema {
+					children[name] = reference(keyword, name)
+				}
+			}
+			schema[keyword] = children
+		}
+	}
+	for _, keyword := range []string{"allOf", "anyOf", "oneOf", "prefixItems", "items", "additionalItems", "contains", "unevaluatedItems", "additionalProperties", "unevaluatedProperties", "propertyNames", "not", "if", "then", "else", "contentSchema"} {
+		switch value := schema[keyword].(type) {
+		case map[string]interface{}:
+			schema[keyword] = reference(keyword)
+		case []interface{}:
+			children := append([]interface{}(nil), value...)
+			for index, child := range children {
+				if _, isSchema := child.(map[string]interface{}); isSchema {
+					children[index] = reference(keyword, strconv.Itoa(index))
+				}
+			}
+			schema[keyword] = children
+		}
+	}
+}
+
+func mcpInputSchemaWithExecutionMode(schema map[string]interface{}) map[string]interface{} {
+	normalized := make(map[string]interface{}, len(schema)+1)
+	for key, value := range schema {
+		normalized[key] = value
+	}
+	if len(schema) == 0 {
+		normalized["type"] = "object"
+		normalized["additionalProperties"] = true
+	}
 	if _, exists := normalized["properties"]; !exists {
 		normalized["properties"] = map[string]interface{}{}
 	}
-	if properties, ok := normalized["properties"].(map[string]interface{}); ok {
-		properties["nyan_mode"] = map[string]interface{}{
-			"type":        "string",
-			"enum":        []interface{}{"", "checkOnly"},
-			"description": "Run only paramCheck with checkOnly; do not execute the API body, outCheck, or Push. Omit or use an empty string for normal execution.",
+	if source, ok := normalized["properties"].(map[string]interface{}); ok {
+		properties := make(map[string]interface{}, len(source)+1)
+		for key, value := range source {
+			properties[key] = value
 		}
+		properties["nyan_mode"] = map[string]interface{}{"type": "string", "enum": []interface{}{"", "checkOnly"}, "description": "Run only paramCheck with checkOnly; do not execute the API body, outCheck, or Push. Omit or use an empty string for normal execution."}
+		normalized["properties"] = properties
 	}
 	return normalized
 }
@@ -2342,8 +2470,6 @@ func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverCo
 		}
 		if !allowed {
 			execution.CheckRejected, execution.Response = true, checked
-		} else {
-			execution.Response.Status = checked.Status
 		}
 	}
 	return execution, nil
@@ -4218,7 +4344,7 @@ func runOutCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiConfig APICon
 		return true, http.StatusInternalServerError, "", err
 	}
 	if success {
-		return false, checkStatusCode, "", nil
+		return false, statusCode, "", nil
 	}
 	return true, checkStatusCode, jsonStr, nil
 }
@@ -4342,9 +4468,7 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 
 	checkScriptPath := getParamCheckScriptPath(apiConfig)
 	if checkScriptPath == "" && mode == "checkOnly" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"success":true,"status":200,"result":null}`))
+		sendJSONError(w, "No check script for this API", http.StatusNotFound)
 		return
 	}
 	if checkScriptPath != "" {
@@ -8412,6 +8536,16 @@ func respondJSONRPCError(w http.ResponseWriter, id interface{}, code int, messag
 	json.NewEncoder(w).Encode(resp)
 }
 
+// JSON-RPC requires a response body. Keep the check result's own status intact.
+func jsonRPCResponseStatus(status int) int {
+	switch status {
+	case http.StatusNoContent, http.StatusResetContent, http.StatusNotModified:
+		return http.StatusOK
+	default:
+		return status
+	}
+}
+
 func respondJSONRPCResultJSON(w http.ResponseWriter, id interface{}, statusCode int, jsonStr string) {
 	var result interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
@@ -8424,7 +8558,7 @@ func respondJSONRPCResultJSON(w http.ResponseWriter, id interface{}, statusCode 
 		ID:      id,
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
+	w.WriteHeader(jsonRPCResponseStatus(statusCode))
 	if err := json.NewEncoder(w).Encode(rpcResp); err != nil {
 		logServiceError(slog.LevelError, "jsonrpc_response_encode_failed", err)
 	}
@@ -8529,7 +8663,7 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 				ID:      rpcReq.ID,
 			}
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(statusCode)
+			w.WriteHeader(jsonRPCResponseStatus(statusCode))
 			json.NewEncoder(w).Encode(rpcResp)
 			return
 		}
@@ -8657,7 +8791,7 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		ID:      rpcReq.ID,
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
+	w.WriteHeader(jsonRPCResponseStatus(statusCode))
 	if err := json.NewEncoder(w).Encode(rpcResp); err != nil {
 		logServiceError(slog.LevelError, "jsonrpc_response_encode_failed", err)
 	}
