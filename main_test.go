@@ -5913,7 +5913,7 @@ func TestOAuthCheckOnlyHTTPValidation(t *testing.T) {
 		{name: "invalid_json", role: "oauthRegister", method: "POST", contentType: "application/json", query: "?nyan_mode=checkOnly", body: `{`, status: 400},
 		{name: "duplicate_json_key", role: "oauthRegister", method: "POST", contentType: "application/json", body: `{"nyan_mode":"checkOnly","nyan_mode":""}`, status: 400},
 		{name: "invalid_form", role: "oauthToken", method: "POST", contentType: "application/x-www-form-urlencoded", query: "?nyan_mode=checkOnly", body: "value=%", status: 400},
-		{name: "oversized_request", role: "oauthRegister", method: "POST", contentType: "application/json", query: "?nyan_mode=checkOnly", body: strings.Repeat("x", maxConfiguredHTTPBodyBytes+1), status: 413},
+		{name: "oversized_request", role: "oauthRegister", method: "POST", contentType: "application/json", query: "?nyan_mode=checkOnly", body: strings.Repeat("x", int(defaultReceiveBytes)+1), status: 413},
 		{name: "admin_auth", role: "oauthAdminUser", method: "POST", contentType: "application/json", body: `{"nyan_mode":"checkOnly"}`, status: 401, noAdminAuth: true},
 		{name: "options", role: "oauthAuthorize", method: "OPTIONS", query: "?nyan_mode=checkOnly", status: 204},
 		{name: "metadata_options", role: "protectedResourceMetadata", method: "OPTIONS", query: "?nyan_mode=checkOnly", status: 204},
@@ -6290,7 +6290,7 @@ JSON.stringify({
 	snapshot := newOAuthIntegrationTestSnapshot(t, targetScript)
 	setTestAPISnapshot(t, snapshot)
 
-	oversized := strings.Repeat("x", maxConfiguredHTTPBodyBytes+1)
+	oversized := strings.Repeat("x", int(defaultReceiveBytes)+1)
 	tooLargeRegister := performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/register", "application/json", oversized, nil)
 	if tooLargeRegister.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized registration status = %d, want %d; body=%s", tooLargeRegister.Code, http.StatusRequestEntityTooLarge, tooLargeRegister.Body.String())
@@ -11473,5 +11473,582 @@ func TestExecutionModeDynamicAnchor(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestReceiveLimitsConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		input    string
+		http, ws int64
+		bad      bool
+	}{
+		{`{}`, 20 << 20, 20 << 20, false},
+		{`{"receiveLimits":{}}`, 20 << 20, 20 << 20, false},
+		{`{"receiveLimits":{"httpBodyBytes":0,"webSocketMessageBytes":0}}`, 20 << 20, 20 << 20, false},
+		{`{"receiveLimits":{"httpBodyBytes":32,"webSocketMessageBytes":64}}`, 32, 64, false},
+		{`{"receiveLimits":{"httpBodyBytes":-1}}`, 0, 0, true},
+		{`{"receiveLimits":{"webSocketMessageBytes":-1}}`, 0, 0, true},
+		{`{"receiveLimits":{"httpBodyBytes":1.5}}`, 0, 0, true},
+
+		{`{"receiveLimits":{"httpBodyBytes":"20MB","webSocketMessageBytes":"1GB"}}`, 20 << 20, 1 << 30, false},
+		{`{"receiveLimits":{"httpBodyBytes":"2MB","webSocketMessageBytes":64}}`, 2 << 20, 64, false},
+		{`{"receiveLimits":{"httpBodyBytes":" 2 mb ","webSocketMessageBytes":"1GiB"}}`, 2 << 20, 1 << 30, false},
+		{`{"receiveLimits":{"httpBodyBytes":"2KB","webSocketMessageBytes":"3KiB"}}`, 2 << 10, 3 << 10, false},
+		{`{"receiveLimits":{"httpBodyBytes":"4B","webSocketMessageBytes":"5"}}`, 4, 5, false},
+		{`{"receiveLimits":{"httpBodyBytes":"0MB","webSocketMessageBytes":"0"}}`, 20 << 20, 20 << 20, false},
+		{`{"receiveLimits":{"httpBodyBytes":"9223372036854775807B"}}`, 9223372036854775807, 20 << 20, false},
+		{`{"receiveLimits":{"httpBodyBytes":"8589934591GB"}}`, 8589934591 << 30, 20 << 20, false},
+		{`{"receiveLimits":{"httpBodyBytes":"8589934592GB"}}`, 0, 0, true},
+		{`{"receiveLimits":{"httpBodyBytes":"9223372036854775808B"}}`, 0, 0, true},
+		{`{"receiveLimits":{"httpBodyBytes":"-1MB"}}`, 0, 0, true},
+		{`{"receiveLimits":{"webSocketMessageBytes":"1.5MB"}}`, 0, 0, true},
+		{`{"receiveLimits":{"httpBodyBytes":""}}`, 0, 0, true},
+		{`{"receiveLimits":{"httpBodyBytes":"MB"}}`, 0, 0, true},
+		{`{"receiveLimits":{"httpBodyBytes":"2XB"}}`, 0, 0, true},
+		{`{"receiveLimits":{"httpBodyBytes":"2MBjunk"}}`, 0, 0, true},
+		{`{"receiveLimits":{"httpBodyBytes":true}}`, 0, 0, true},
+		{`{"receiveLimits":{"httpBodyBytes":9223372036854775808}}`, 0, 0, true},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			var cfg Config
+			err := json.Unmarshal([]byte(tc.input), &cfg)
+			if tc.bad {
+				if err == nil {
+					t.Fatal("invalid limit accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.ReceiveLimits.httpBodyBytes() != tc.http || cfg.ReceiveLimits.webSocketMessageBytes() != tc.ws {
+				t.Fatalf("wrong effective limits: %+v", cfg.ReceiveLimits)
+			}
+		})
+	}
+}
+
+func TestReceiveLimitsHTTP(t *testing.T) {
+	old := config.ReceiveLimits
+	t.Cleanup(func() { config.ReceiveLimits = old })
+	for _, tc := range []struct {
+		name    string
+		limit   int64
+		size    int
+		unknown bool
+		status  int
+	}{
+		{"below", 64, 63, false, 200}, {"exact", 64, 64, false, 200}, {"over", 64, 65, false, 413},
+		{"stream exact", 64, 64, true, 200}, {"stream over", 64, 65, true, 413},
+		{"raised", 128, 100, true, 200},
+		{"default exact", 0, 20 << 20, true, 200}, {"default over", 0, (20 << 20) + 1, true, 413},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config.ReceiveLimits.HTTPBodyBytes = tc.limit
+			called := false
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				data, err := io.ReadAll(r.Body)
+				if err != nil || len(data) != tc.size {
+					t.Errorf("body changed: len=%d err=%v", len(data), err)
+				}
+				w.WriteHeader(200)
+			})
+			handler := receiveTestHTTPHandler(next)
+			req := httptest.NewRequest("POST", "/nyan-rpc", strings.NewReader(strings.Repeat("x", tc.size)))
+			if tc.unknown {
+				req.ContentLength = -1
+				req.TransferEncoding = []string{"chunked"}
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.status || called != (tc.status == 200) {
+				t.Fatalf("status=%d called=%v", rec.Code, called)
+			}
+		})
+	}
+	// Form parsing must respect a configured limit greater than net/http's 10 MiB default.
+	config.ReceiveLimits.HTTPBodyBytes = 12 << 20
+	req := httptest.NewRequest("POST", "/", strings.NewReader("value="+strings.Repeat("a", 11<<20)))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	receiveTestHTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Error(err)
+		}
+		if len(r.PostForm.Get("value")) != 11<<20 {
+			t.Error("form truncated")
+		}
+		w.WriteHeader(http.StatusOK)
+	})).ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatal(rec.Code)
+	}
+}
+
+func TestReceiveLimitsWebSocket(t *testing.T) {
+	old := config.ReceiveLimits
+	t.Cleanup(func() { config.ReceiveLimits = old })
+	setTestSQLFiles(t, map[string]APIConfig{"channel": {}})
+	oldHub := hub
+	hub = NewHub()
+	t.Cleanup(func() { hub = oldHub })
+	server := httptest.NewServer(receiveLimitHandler(http.HandlerFunc(unifiedHandler)))
+	defer server.Close()
+	config.ReceiveLimits.WebSocketMessageBytes = 64
+	for _, size := range []int{63, 64, 65} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			dialer := websocket.Dialer{WriteBufferSize: 16, HandshakeTimeout: 3 * time.Second}
+			conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/channel", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			message := `{"api":"x","pad":"` + strings.Repeat("x", size-20) + `"}`
+			if len(message) != size {
+				t.Fatal("bad test message length")
+			}
+			writer, err := conn.NextWriter(websocket.TextMessage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = writer.Write([]byte(message)); err != nil {
+				t.Fatal(err)
+			}
+			if err = writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = conn.ReadMessage()
+			if size > 64 {
+				if !websocket.IsCloseError(err, websocket.CloseMessageTooBig) {
+					t.Fatalf("expected close 1009, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func receiveTestHTTPHandler(next http.Handler) http.Handler { return receiveLimitHandler(next) }
+
+func TestReceiveLimitsLargeFormCollection(t *testing.T) {
+	old := config.ReceiveLimits
+	t.Cleanup(func() { config.ReceiveLimits = old })
+	config.ReceiveLimits.HTTPBodyBytes = 12 << 20
+	req := httptest.NewRequest("POST", "/", strings.NewReader("value="+strings.Repeat("a", 11<<20)))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	if !enforceReceiveBodyLimit(rec, req) {
+		t.Fatalf("status %d", rec.Code)
+	}
+	params, err := collectRequestParams(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(params["value"].(string)) != 11<<20 {
+		t.Fatal("form truncated")
+	}
+}
+
+func TestReceiveLimitsWSClient(t *testing.T) {
+	old := config.ReceiveLimits
+	t.Cleanup(func() { config.ReceiveLimits = old })
+	config.ReceiveLimits.WebSocketMessageBytes = 32
+	closed := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			closed <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if err = conn.WriteMessage(websocket.TextMessage, []byte(strings.Repeat("x", 33))); err != nil {
+			closed <- err
+			return
+		}
+		_, _, err = conn.ReadMessage()
+		closed <- err
+	}))
+	defer server.Close()
+	cfg := wsClientConfig{name: "limit-test", connectURL: "ws" + strings.TrimPrefix(server.URL, "http")}
+	runtime := newWSClientRuntime(cfg)
+	err := runtime.connectAndListen(cfg)
+	if !errors.Is(err, websocket.ErrReadLimit) {
+		t.Fatalf("expected receive limit error, got %v", err)
+	}
+	select {
+	case err := <-closed:
+		if !websocket.IsCloseError(err, 1009) {
+			t.Fatal(err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("missing close")
+	}
+}
+
+func TestHTTPTimeoutConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		want  [4]time.Duration
+		bad   bool
+	}{
+		{`{}`, [4]time.Duration{30 * time.Second, 20 * time.Minute, 30 * time.Minute, 5 * time.Minute}, false},
+		{`{"httpTimeouts":{}}`, [4]time.Duration{30 * time.Second, 20 * time.Minute, 30 * time.Minute, 5 * time.Minute}, false},
+		{`{"httpTimeouts":{"readTimeout":"0s","writeTimeout":null}}`, [4]time.Duration{30 * time.Second, 20 * time.Minute, 30 * time.Minute, 5 * time.Minute}, false},
+		{`{"httpTimeouts":{"readHeaderTimeout":"1s","readTimeout":"2m","writeTimeout":"1h","idleTimeout":"500ms"}}`, [4]time.Duration{time.Second, 2 * time.Minute, time.Hour, 500 * time.Millisecond}, false},
+		{`{"httpTimeouts":{"readTimeout":"-1s"}}`, [4]time.Duration{}, true},
+		{`{"httpTimeouts":{"readTimeout":""}}`, [4]time.Duration{}, true},
+		{`{"httpTimeouts":{"readTimeout":20}}`, [4]time.Duration{}, true},
+		{`{"httpTimeouts":{"writeTimeout":"30"}}`, [4]time.Duration{}, true},
+		{`{"httpTimeouts":{"idleTimeout":"999999999999999999h"}}`, [4]time.Duration{}, true},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			var cfg Config
+			err := json.Unmarshal([]byte(tc.input), &cfg)
+			if tc.bad {
+				if err == nil {
+					t.Fatal("invalid timeout accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := newConfiguredHTTPServer("", nil, cfg.HTTPTimeouts)
+			got := [4]time.Duration{server.ReadHeaderTimeout, server.ReadTimeout, server.WriteTimeout, server.IdleTimeout}
+			if got != tc.want {
+				t.Fatalf("timeouts=%v want=%v", got, tc.want)
+			}
+			encoded, err := json.Marshal(cfg.HTTPTimeouts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var roundtrip HTTPTimeoutsConfig
+			if err = json.Unmarshal(encoded, &roundtrip); err != nil {
+				t.Fatal(err)
+			}
+			if roundtrip != cfg.HTTPTimeouts {
+				t.Fatal("roundtrip changed timeouts")
+			}
+		})
+	}
+}
+
+func TestHTTPTimeoutSlowRequests(t *testing.T) {
+	for _, stage := range []string{"header", "body", "idle"} {
+		t.Run(stage, func(t *testing.T) {
+			var deadlines HTTPTimeoutsConfig
+			if err := json.Unmarshal([]byte(`{"readHeaderTimeout":"150ms","readTimeout":"150ms","writeTimeout":"2s","idleTimeout":"150ms"}`), &deadlines); err != nil {
+				t.Fatal(err)
+			}
+			handled := make(chan struct{}, 1)
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !enforceReceiveBodyLimit(w, r) {
+					return
+				}
+				handled <- struct{}{}
+				w.Header().Set("Content-Length", "2")
+				_, _ = w.Write([]byte("ok"))
+			})
+			server := httptest.NewUnstartedServer(handler)
+			server.Config = newConfiguredHTTPServer("", handler, deadlines)
+			server.Start()
+			defer server.Close()
+			conn, err := net.DialTimeout("tcp", server.Listener.Addr().String(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+			switch stage {
+			case "header":
+				_, err = io.WriteString(conn, "POST / HTTP/1.1\r\nHost: test\r\nX-Pending: ")
+			case "body":
+				_, err = io.WriteString(conn, "POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 10\r\n\r\nx")
+			case "idle":
+				_, err = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader := bufio.NewReader(conn)
+			if stage == "idle" {
+				response, err := http.ReadResponse(reader, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, err := io.ReadAll(response.Body)
+				response.Body.Close()
+				if err != nil || string(body) != "ok" {
+					t.Fatalf("healthy request failed: %s %v", body, err)
+				}
+			}
+			// The server must finish/close the slow connection before the client deadline.
+			_, err = io.ReadAll(reader)
+			if e, ok := err.(net.Error); ok && e.Timeout() {
+				t.Fatal("server failed to enforce deadline")
+			}
+			if stage != "idle" {
+				select {
+				case <-handled:
+					t.Fatal("incomplete request reached handler body")
+				default:
+				}
+			}
+		})
+	}
+}
+
+func TestHTTPTimeoutWrite(t *testing.T) {
+	var deadlines HTTPTimeoutsConfig
+	if err := json.Unmarshal([]byte(`{"writeTimeout":"100ms"}`), &deadlines); err != nil {
+		t.Fatal(err)
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(250 * time.Millisecond)
+		_, _ = w.Write([]byte("too late"))
+	})
+	server := httptest.NewUnstartedServer(handler)
+	server.Config = newConfiguredHTTPServer("", handler, deadlines)
+	server.Start()
+	defer server.Close()
+	client := &http.Client{Timeout: 3 * time.Second}
+	response, err := client.Get(server.URL)
+	if response != nil {
+		defer response.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("expired write deadline allowed a response")
+	}
+}
+
+func TestHTTPTimeoutWebSocketStaysOpen(t *testing.T) {
+	setTestSQLFiles(t, map[string]APIConfig{"channel": {}})
+	oldHub := hub
+	hub = NewHub()
+	t.Cleanup(func() { hub = oldHub })
+	handler := receiveLimitHandler(http.HandlerFunc(unifiedHandler))
+	var deadlines HTTPTimeoutsConfig
+	if err := json.Unmarshal([]byte(`{"readTimeout":"100ms","writeTimeout":"100ms","idleTimeout":"100ms"}`), &deadlines); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Config = newConfiguredHTTPServer("", handler, deadlines)
+	server.Start()
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/channel", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	time.Sleep(250 * time.Millisecond)
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err = conn.WriteMessage(websocket.TextMessage, []byte(`{"api":"missing"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = conn.ReadMessage(); err != nil {
+		t.Fatalf("HTTP deadline leaked into WebSocket: %v", err)
+	}
+}
+
+type admissionBodyProbe struct {
+	reader        io.Reader
+	reads, closed int
+}
+
+func (body *admissionBodyProbe) Read(p []byte) (int, error) {
+	n, err := body.reader.Read(p)
+	body.reads += n
+	return n, err
+}
+func (body *admissionBodyProbe) Close() error { body.closed++; return nil }
+
+func TestReceiveAdmissionBusyAndRateDoNotRead(t *testing.T) {
+	for _, mode := range []string{"busy", "rate", "origin"} {
+		t.Run(mode, func(t *testing.T) {
+			handler, name := newReceiveAdmissionHandler(t, mode == "rate")
+			if mode == "busy" {
+				release, ok := acquireMCPExecutionSlot(name, 1)
+				if !ok {
+					t.Fatal("slot unavailable")
+				}
+				defer release()
+			}
+			makeRequest := func() *http.Request {
+				req := httptest.NewRequest("POST", "https://service.example/"+name, nil)
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Accept", "application/json, text/event-stream")
+				req.Header.Set("Origin", "https://client.example")
+				req.ContentLength = 1 << 20
+				req.Body = &admissionBodyProbe{reader: strings.NewReader(strings.Repeat("x", 1<<20))}
+				return req
+			}
+			if mode == "rate" {
+				handler.ServeHTTP(httptest.NewRecorder(), makeRequest())
+			}
+			req := makeRequest()
+			want := 503
+			if mode == "rate" {
+				want = 429
+			}
+			if mode == "origin" {
+				want = 403
+				req.Header.Set("Origin", "https://untrusted.example")
+			}
+			probe := req.Body.(*admissionBodyProbe)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != want || probe.reads != 0 || probe.closed != 0 {
+				t.Fatalf("status=%d read=%d close=%d", rec.Code, probe.reads, probe.closed)
+			}
+		})
+	}
+}
+
+func TestReceiveAdmissionCORS(t *testing.T) {
+	handler, name := newReceiveAdmissionHandler(t, false)
+	for _, path := range []string{"/ordinary", "/nyan-rpc", "/" + name} {
+		for _, unknown := range []bool{false, true} {
+			req := httptest.NewRequest("POST", "https://service.example"+path, strings.NewReader(strings.Repeat("x", 65)))
+			req.SetBasicAuth("audit", "audit")
+			req.Header.Set("Origin", "https://client.example")
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json, text/event-stream")
+			if unknown {
+				req.ContentLength = -1
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			origin := rec.Header().Get("Access-Control-Allow-Origin")
+			if rec.Code != 413 || (origin != "*" && origin != "https://client.example") {
+				t.Fatalf("%s unknown=%v status=%d CORS=%q", path, unknown, rec.Code, origin)
+			}
+		}
+	}
+}
+
+func TestReceiveAdmissionOverflowDoesNotCloseBody(t *testing.T) {
+	handler, name := newReceiveAdmissionHandler(t, false)
+	for _, path := range []string{"/ordinary", "/" + name} {
+		probe := &admissionBodyProbe{reader: strings.NewReader(strings.Repeat("x", 65))}
+		req := httptest.NewRequest("POST", "https://service.example"+path, nil)
+		req.Body = probe
+		req.ContentLength = -1
+		req.SetBasicAuth("audit", "audit")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != 413 || probe.closed != 0 {
+			t.Fatalf("%s status=%d close=%d", path, rec.Code, probe.closed)
+		}
+	}
+}
+
+func TestReceiveAdmissionChunkedStopsAtLimit(t *testing.T) {
+	handler, name := newReceiveAdmissionHandler(t, false)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	for _, path := range []string{"/ordinary", "/" + name} {
+		func() {
+			conn, err := net.DialTimeout("tcp", server.Listener.Addr().String(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			// No terminal chunk: the sender stops immediately after exceeding 64 bytes.
+			_, err = fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: service.example\r\nAuthorization: Basic YXVkaXQ6YXVkaXQ=\r\nOrigin: https://client.example\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n41\r\n%s\r\n", path, strings.Repeat("x", 65))
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			if err != nil {
+				t.Fatalf("%s waited for unread body: %v", path, err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != 413 || response.Header.Get("Access-Control-Allow-Origin") == "" {
+				t.Fatalf("%s response=%v", path, response)
+			}
+		}()
+	}
+}
+
+func newReceiveAdmissionHandler(t *testing.T, rate bool) (http.Handler, string) {
+	t.Helper()
+	old := config
+	t.Cleanup(func() { config = old })
+	config.BasicAuth = BasicAuthConfig{Username: "audit", Password: "audit"}
+	config.ReceiveLimits.HTTPBodyBytes = 64
+	name := strings.ReplaceAll(t.Name(), "/", "-")
+	mcp := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", AllowedOrigins: []string{"https://client.example"}, MaxConcurrent: 1}
+	if rate {
+		mcp.RateLimit = &HTTPRateLimitConfig{Requests: 1, Window: "1m"}
+	}
+	setTestSQLFiles(t, map[string]APIConfig{name: mcp})
+	return newServiceHTTPHandler(), name
+}
+func TestReceiveAdmissionBasicAuthBeforeBody(t *testing.T) {
+	handler, _ := newReceiveAdmissionHandler(t, false)
+	for _, path := range []string{"/ordinary", "/nyan-rpc", "/nyan/detail"} {
+		req := httptest.NewRequest("POST", path, nil)
+		probe := &admissionBodyProbe{reader: strings.NewReader(strings.Repeat("x", 1<<20))}
+		req.Body = probe
+		req.ContentLength = 1 << 20
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != 401 || probe.reads != 0 || probe.closed != 0 {
+			t.Fatalf("%s status=%d reads=%d closed=%d", path, rec.Code, probe.reads, probe.closed)
+		}
+	}
+}
+
+func TestReceiveAdmissionOAuthBusyDoesNotRead(t *testing.T) {
+	_, name := newReceiveAdmissionHandler(t, false)
+	release, ok := acquireMCPExecutionSlot(name+":oauth:oauthToken", 1)
+	if !ok {
+		t.Fatal("slot unavailable")
+	}
+	defer release()
+	req := httptest.NewRequest("POST", "https://service.example/token", nil)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	probe := &admissionBodyProbe{reader: strings.NewReader(strings.Repeat("x", 1024))}
+	req.Body = probe
+	req.ContentLength = -1
+	rec := httptest.NewRecorder()
+	server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", MaxConcurrent: 1, OAuth: MCPOAuthConfig{Token: "token"}}
+	handleMCPOAuthHTTPRequest(nil, rec, req, name, server, "token", "oauthToken")
+	if rec.Code != 503 || probe.reads != 0 || probe.closed != 0 {
+		t.Fatalf("status=%d reads=%d closed=%d", rec.Code, probe.reads, probe.closed)
+	}
+}
+
+// Inspect the request at the upgrade boundary: keeping the buffered Body here
+// retains the allocation for the lifetime of the WebSocket handler.
+func TestReceiveLimitsWebSocketReleasesHandshakeBody(t *testing.T) {
+	setTestSQLFiles(t, map[string]APIConfig{"channel": {}})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handleWebSocketWithSnapshot(currentAPISnapshot(), w, r) })
+	oldCheck := upgrader.CheckOrigin
+	t.Cleanup(func() { upgrader.CheckOrigin = oldCheck })
+	reachedUpgrade := false
+	upgrader.CheckOrigin = func(r *http.Request) bool {
+		reachedUpgrade = true
+		if r.Body != http.NoBody {
+			t.Error("buffered HTTP body remains referenced at WebSocket upgrade")
+		}
+		return false // Stop before hijacking; no socket or GC timing is needed.
+	}
+	req := httptest.NewRequest("GET", "http://service.example/", strings.NewReader(strings.Repeat("x", 16<<20)))
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if !reachedUpgrade {
+		t.Fatalf("upgrade not reached: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }

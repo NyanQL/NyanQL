@@ -51,26 +51,203 @@ import (
 	"golang.org/x/crypto/argon2"
 )
 
+// ReceiveLimitsConfig bounds incoming bodies and WebSocket messages, in bytes.
+// Zero keeps a safe default; negative limits are configuration errors.
+type ReceiveLimitsConfig struct {
+	HTTPBodyBytes         int64 `json:"httpBodyBytes"`
+	WebSocketMessageBytes int64 `json:"webSocketMessageBytes"`
+}
+
+const defaultReceiveBytes int64 = 20 << 20
+
+// receiveByteCount accepts legacy byte counts and human-readable binary units.
+type receiveByteCount int64
+
+func (count *receiveByteCount) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	var value int64
+	if len(data) > 0 && data[0] == '"' {
+		var text string
+		if err := json.Unmarshal(data, &text); err != nil {
+			return err
+		}
+		text = strings.ToUpper(strings.TrimSpace(text))
+		end := 0
+		for end < len(text) && text[end] >= '0' && text[end] <= '9' {
+			end++
+		}
+		if end == 0 {
+			return fmt.Errorf("receiveLimits requires a non-negative integer with an optional B, KB, MB or GB unit")
+		}
+		parsed, err := strconv.ParseInt(text[:end], 10, 64)
+		if err != nil {
+			return fmt.Errorf("receiveLimits byte count is out of range")
+		}
+		var multiplier int64
+		switch strings.TrimSpace(text[end:]) {
+		case "", "B":
+			multiplier = 1
+		case "KB", "KIB":
+			multiplier = 1 << 10
+		case "MB", "MIB":
+			multiplier = 1 << 20
+		case "GB", "GIB":
+			multiplier = 1 << 30
+		default:
+			return fmt.Errorf("receiveLimits has an invalid size unit (use B, KB, MB or GB)")
+		}
+		if parsed > math.MaxInt64/multiplier {
+			return fmt.Errorf("receiveLimits byte count is out of range")
+		}
+		value = parsed * multiplier
+	} else if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("receiveLimits requires an integer byte count or a size string: %w", err)
+	}
+	if value < 0 {
+		return fmt.Errorf("receiveLimits values must be non-negative byte counts")
+	}
+	*count = receiveByteCount(value)
+	return nil
+}
+
+func (limits *ReceiveLimitsConfig) UnmarshalJSON(data []byte) error {
+	var decoded struct {
+		HTTPBodyBytes         receiveByteCount `json:"httpBodyBytes"`
+		WebSocketMessageBytes receiveByteCount `json:"webSocketMessageBytes"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*limits = ReceiveLimitsConfig{HTTPBodyBytes: int64(decoded.HTTPBodyBytes), WebSocketMessageBytes: int64(decoded.WebSocketMessageBytes)}
+	return nil
+}
+
+func (limits ReceiveLimitsConfig) httpBodyBytes() int64 {
+	if limits.HTTPBodyBytes > 0 {
+		return limits.HTTPBodyBytes
+	}
+	return defaultReceiveBytes
+}
+
+func (limits ReceiveLimitsConfig) webSocketMessageBytes() int64 {
+	if limits.WebSocketMessageBytes > 0 {
+		return limits.WebSocketMessageBytes
+	}
+	return defaultReceiveBytes
+}
+
+// Read only after the route's header-based authentication and admission checks.
+// Never close a partially read server body here: Close can drain unread bytes
+// and delay an error response while the peer has stopped sending.
+func readBoundedRequestBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, error) {
+	var body []byte
+	var err error
+	if r.ContentLength > limit {
+		err = &http.MaxBytesError{Limit: limit}
+	} else if r.Body != nil {
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	}
+	if err != nil {
+		// Gin's writer does not expose net/http's private requestTooLarge hook.
+		// Explicitly disable HTTP/1 reuse so the server does not drain the body
+		// before flushing a rejection. HTTP/2 closes only the affected stream.
+		r.Close = true
+		if w != nil && r.ProtoMajor < 2 {
+			w.Header().Set("Connection", "close")
+		}
+	}
+	return body, err
+}
+
+func enforceReceiveBodyLimit(w http.ResponseWriter, r *http.Request) bool {
+	limit := config.ReceiveLimits.httpBodyBytes()
+	body, err := readBoundedRequestBody(w, r, limit)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body is too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+		}
+		return false
+	}
+	// Keep MaxBytesReader visible to ParseForm, which otherwise adds a 10 MiB cap.
+	r.Body = http.MaxBytesReader(w, io.NopCloser(bytes.NewReader(body)), limit)
+	return true
+}
+
+// HTTPTimeoutsConfig controls HTTP transport deadlines; zero uses defaults.
+type HTTPTimeoutsConfig struct {
+	ReadHeaderTimeout httpTimeoutDuration `json:"readHeaderTimeout"`
+	ReadTimeout       httpTimeoutDuration `json:"readTimeout"`
+	WriteTimeout      httpTimeoutDuration `json:"writeTimeout"`
+	IdleTimeout       httpTimeoutDuration `json:"idleTimeout"`
+}
+
+type httpTimeoutDuration time.Duration
+
+func (duration *httpTimeoutDuration) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		*duration = 0
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(data, &text); err != nil {
+		return fmt.Errorf("httpTimeouts requires a duration string such as 30s or 20m: %w", err)
+	}
+	value, err := time.ParseDuration(strings.TrimSpace(text))
+	if err != nil || value < 0 {
+		return fmt.Errorf("httpTimeouts requires a non-negative duration such as 30s or 20m")
+	}
+	*duration = httpTimeoutDuration(value)
+	return nil
+}
+
+func (duration httpTimeoutDuration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(duration).String())
+}
+
+func (duration httpTimeoutDuration) orDefault(fallback time.Duration) time.Duration {
+	if duration > 0 {
+		return time.Duration(duration)
+	}
+	return fallback
+}
+
+func newConfiguredHTTPServer(address string, handler http.Handler, timeouts HTTPTimeoutsConfig) *http.Server {
+	return &http.Server{
+		Addr:              address,
+		Handler:           handler,
+		ReadHeaderTimeout: timeouts.ReadHeaderTimeout.orDefault(30 * time.Second),
+		ReadTimeout:       timeouts.ReadTimeout.orDefault(20 * time.Minute),
+		WriteTimeout:      timeouts.WriteTimeout.orDefault(30 * time.Minute),
+		IdleTimeout:       timeouts.IdleTimeout.orDefault(5 * time.Minute),
+		MaxHeaderBytes:    1 << 20,
+	}
+}
+
 type Config struct {
-	Name                   string             `json:"name"`
-	Profile                string             `json:"profile"`
-	Version                string             `json:"version"`
-	Port                   int                `json:"Port"`
-	CertPath               string             `json:"CertPath"`
-	KeyPath                string             `json:"KeyPath"`
-	DatabaseType           string             `json:"DBType"`
-	DBUsername             string             `json:"DBUser"`
-	DBPassword             string             `json:"DBPassword"`
-	DBName                 string             `json:"DBName"`
-	DBHost                 string             `json:"DBHost"`
-	DBPort                 string             `json:"DBPort"`
-	MaxOpenConnections     int                `json:"MaxOpenConnections"`
-	MaxIdleConnections     int                `json:"MaxIdleConnections"`
-	ConnMaxLifetimeSeconds int                `json:"ConnMaxLifetimeSeconds"`
-	BasicAuth              BasicAuthConfig    `json:"BasicAuth"`
-	Log                    LogConfig          `json:"log"`
-	JavascriptInclude      []string           `json:"javascript_include,omitempty"`
-	APIHotReload           APIHotReloadConfig `json:"APIHotReload"`
+	HTTPTimeouts           HTTPTimeoutsConfig  `json:"httpTimeouts"`
+	ReceiveLimits          ReceiveLimitsConfig `json:"receiveLimits"`
+	Name                   string              `json:"name"`
+	Profile                string              `json:"profile"`
+	Version                string              `json:"version"`
+	Port                   int                 `json:"Port"`
+	CertPath               string              `json:"CertPath"`
+	KeyPath                string              `json:"KeyPath"`
+	DatabaseType           string              `json:"DBType"`
+	DBUsername             string              `json:"DBUser"`
+	DBPassword             string              `json:"DBPassword"`
+	DBName                 string              `json:"DBName"`
+	DBHost                 string              `json:"DBHost"`
+	DBPort                 string              `json:"DBPort"`
+	MaxOpenConnections     int                 `json:"MaxOpenConnections"`
+	MaxIdleConnections     int                 `json:"MaxIdleConnections"`
+	ConnMaxLifetimeSeconds int                 `json:"ConnMaxLifetimeSeconds"`
+	BasicAuth              BasicAuthConfig     `json:"BasicAuth"`
+	Log                    LogConfig           `json:"log"`
+	JavascriptInclude      []string            `json:"javascript_include,omitempty"`
+	APIHotReload           APIHotReloadConfig  `json:"APIHotReload"`
 }
 
 type APIHotReloadConfig struct {
@@ -403,12 +580,11 @@ const (
 	mcpProtocolVersion20250326       = "2025-03-26"
 	mcpProtocolVersion20250618       = "2025-06-18"
 	mcpProtocolVersion20251125       = "2025-11-25"
-	maxConfiguredHTTPBodyBytes       = 1 << 20
+	maxMCPStdioMessageBytes          = 1 << 20
 	maxConfiguredHTTPResponseBytes   = 4 << 20
 	maxSQLJSONRows                   = 10000
 	maxSQLJSONBytes                  = maxConfiguredHTTPResponseBytes
 	maxRestrictedScriptRuntime       = 15 * time.Second
-	maxWebSocketMessageBytes         = 1 << 20
 	maxWebSocketConnections          = 128
 	webSocketWriteTimeout            = 5 * time.Second
 )
@@ -574,31 +750,9 @@ func main() {
 		serviceLog(slog.LevelInfo, "api_hot_reload_disabled")
 	}
 
-	corsHandler := cors.New(cors.Options{
-		AllowedOrigins: []string{"*"},
-		AllowedMethods: []string{"GET", "POST", "OPTIONS", "PUT", "DELETE"},
-		AllowedHeaders: []string{"Content-Type", "Authorization", "MCP-Protocol-Version", "MCP-Session-Id", "Last-Event-ID"},
-		ExposedHeaders: []string{"WWW-Authenticate", "MCP-Protocol-Version", "Retry-After"},
-	})
-
 	hub = NewHub()
 
-	http.Handle("/nyan-rpc", corsHandler.Handler(http.HandlerFunc(basicAuth(handleJSONRPC, config))))
-
-	http.Handle("/nyan/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		basicAuth(handleNyanOrDetail, config)(w, r)
-	})))
-
-	http.Handle("/", corsHandler.Handler(http.HandlerFunc(unifiedHandler)))
-
-	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", config.Port),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      2 * time.Minute,
-		IdleTimeout:       2 * time.Minute,
-		MaxHeaderBytes:    1 << 20,
-	}
+	server := newConfiguredHTTPServer(fmt.Sprintf(":%d", config.Port), newServiceHTTPHandler(), config.HTTPTimeouts)
 	if config.CertPath != "" && config.KeyPath != "" {
 		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "https", "port", config.Port)
 		fatalServiceError("http_server_stopped", server.ListenAndServeTLS(config.CertPath, config.KeyPath))
@@ -1020,8 +1174,7 @@ func handleMCPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxConfiguredHTTPBodyBytes)
-	body, err := io.ReadAll(r.Body)
+	body, err := readBoundedRequestBody(w, r, config.ReceiveLimits.httpBodyBytes())
 	if err != nil {
 		var maxBytesError *http.MaxBytesError
 		if errors.As(err, &maxBytesError) {
@@ -1184,6 +1337,16 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return
 	}
+	release, acquired := acquireMCPExecutionSlot(serverName+":oauth:"+role, mcpOAuthMaxConcurrent(serverConfig, role))
+	if !acquired {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "OAuth endpoint is busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
+	if r.Method != http.MethodPost && !enforceReceiveBodyLimit(w, r) {
+		return
+	}
 	params, err := mcpOAuthRequestParams(w, r)
 	if err != nil {
 		status := http.StatusBadRequest
@@ -1199,13 +1362,6 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		return
 	}
 	params["nyan_mode"] = mode
-	release, acquired := acquireMCPExecutionSlot(serverName+":oauth:"+role, mcpOAuthMaxConcurrent(serverConfig, role))
-	if !acquired {
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "OAuth endpoint is busy", http.StatusServiceUnavailable)
-		return
-	}
-	defer release()
 	result, err := invokeMCPOAuthHook(snapshot, serverName, serverConfig, runtimeURLs, role, params)
 	if err != nil {
 		logServiceError(slog.LevelError, "oauth_hook_failed", err, "api", apiName, "role", role)
@@ -1305,8 +1461,7 @@ func mcpOAuthRequestParams(w http.ResponseWriter, r *http.Request) (map[string]i
 	if r.Method != http.MethodPost {
 		return params, nil
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxConfiguredHTTPBodyBytes)
-	body, err := io.ReadAll(r.Body)
+	body, err := readBoundedRequestBody(w, r, config.ReceiveLimits.httpBodyBytes())
 	if err != nil {
 		return nil, fmt.Errorf("request body is too large")
 	}
@@ -1360,7 +1515,7 @@ func serveMCPStdio(input io.Reader, output io.Writer, snapshot *APIConfigSnapsho
 		return fmt.Errorf("MCP API %q does not use stdio", serverName)
 	}
 	scanner := bufio.NewScanner(input)
-	scanner.Buffer(make([]byte, 64<<10), maxConfiguredHTTPBodyBytes+1)
+	scanner.Buffer(make([]byte, 64<<10), maxMCPStdioMessageBytes+1)
 	state := mcpStdioCreated
 	for scanner.Scan() {
 		line := append([]byte(nil), scanner.Bytes()...)
@@ -2717,6 +2872,9 @@ func handleWebSocketWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWri
 		http.Error(w, "too many WebSocket connections", http.StatusServiceUnavailable)
 		return
 	}
+	if !enforceReceiveBodyLimit(w, r) {
+		return
+	}
 	if !checkWebSocketConnection(snapshot, w, r) {
 		return
 	}
@@ -2725,6 +2883,9 @@ func handleWebSocketWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWri
 		channel = "default"
 	}
 
+	// Handshake checks are complete. Do not retain the buffered HTTP body
+	// throughout the lifetime of the WebSocket connection.
+	r.Body = http.NoBody
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logServiceError(slog.LevelWarn, "websocket_upgrade_failed", err, "channel", channel)
@@ -2734,7 +2895,7 @@ func handleWebSocketWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWri
 	connectionHub := hub
 	connectionHub.AddClient(channel, conn)
 	defer connectionHub.RemoveClient(channel, conn)
-	conn.SetReadLimit(maxWebSocketMessageBytes)
+	conn.SetReadLimit(config.ReceiveLimits.webSocketMessageBytes())
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
@@ -4393,6 +4554,7 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 			io.Reader
 			io.Closer
 		}{io.TeeReader(r.Body, &formBody), r.Body}
+		r.Body = http.MaxBytesReader(nil, r.Body, config.ReceiveLimits.httpBodyBytes())
 	}
 	if err := r.ParseForm(); err != nil {
 		return nil, fmt.Errorf("error parsing form data: %v", err)
@@ -4452,6 +4614,9 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 		return
 	}
 
+	if !enforceReceiveBodyLimit(w, r) {
+		return
+	}
 	params, err := collectRequestParams(r)
 	if err != nil {
 		sendJSONError(w, "Invalid JSON data", http.StatusBadRequest)
@@ -5260,6 +5425,7 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 	if err != nil {
 		return fmt.Errorf("dial failed: %w", err)
 	}
+	conn.SetReadLimit(config.ReceiveLimits.webSocketMessageBytes())
 	if !runtime.acceptConnection(conn, cfg.connectURL) {
 		_ = conn.Close()
 		return nil
@@ -6049,7 +6215,7 @@ func basicAuth(next http.HandlerFunc, config Config) http.HandlerFunc {
 			sendJSONError(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next(w, r)
+		receiveLimitHandler(next).ServeHTTP(w, r)
 	}
 }
 
@@ -9430,4 +9596,32 @@ func verifyBoundedArgon2id(password, encoded string) (bool, error) {
 	defer func() { <-oauthArgon2Slots }()
 	actual := argon2.IDKey([]byte(password), parsed.salt, parsed.iterations, parsed.memory, parsed.parallelism, uint32(len(parsed.digest)))
 	return subtle.ConstantTimeCompare(actual, parsed.digest) == 1, nil
+}
+
+func receiveLimitHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if enforceReceiveBodyLimit(w, r) {
+			next.ServeHTTP(w, r)
+		}
+	})
+}
+
+func newServiceHTTPHandler() http.Handler {
+	mux := http.NewServeMux()
+	corsHandler := cors.New(cors.Options{
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"GET", "POST", "OPTIONS", "PUT", "DELETE"},
+		AllowedHeaders: []string{"Content-Type", "Authorization", "MCP-Protocol-Version", "MCP-Session-Id", "Last-Event-ID"},
+		ExposedHeaders: []string{"WWW-Authenticate", "MCP-Protocol-Version", "Retry-After"},
+	})
+
+	mux.Handle("/nyan-rpc", corsHandler.Handler(http.HandlerFunc(basicAuth(handleJSONRPC, config))))
+
+	mux.Handle("/nyan/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		basicAuth(handleNyanOrDetail, config)(w, r)
+	})))
+
+	mux.Handle("/", corsHandler.Handler(http.HandlerFunc(unifiedHandler)))
+
+	return mux
 }

@@ -1,4 +1,14 @@
 {
+  "httpTimeouts": {
+    "readHeaderTimeout": "30s",
+    "readTimeout": "20m",
+    "writeTimeout": "30m",
+    "idleTimeout": "5m"
+  },
+  "receiveLimits": {
+    "httpBodyBytes": "20MB",
+    "webSocketMessageBytes": "20MB"
+  },
   "name": "にゃんくる",
   "profile": "サンプル用のにゃんくるです。スタンプカードのためのAPIです。",
   "version": "0.0.1",
