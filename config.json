@@ -1,4 +1,22 @@
 {
+  "name": "にゃんくる",
+  "profile": "サンプル用のにゃんくるです。スタンプカードのためのAPIです。",
+  "version": "0.0.1",
+  "Port": 8443,
+  "certPath": "",
+  "keyPath": "",
+  "javascript_include": [
+    "./javascript/lib/nyanRequestCheck.js",
+    "./javascript/base.js"
+  ],
+  "log": {
+    "Filename": "./logs/nyanql.log",
+    "MaxSize": 5,
+    "MaxBackups": 3,
+    "MaxAge": 7,
+    "Compress": true,
+    "EnableLogging": false
+  },
   "httpTimeouts": {
     "readHeaderTimeout": "30s",
     "readTimeout": "20m",
@@ -9,16 +27,10 @@
     "httpBodyBytes": "20MB",
     "webSocketMessageBytes": "20MB"
   },
-  "name": "にゃんくる",
-  "profile": "サンプル用のにゃんくるです。スタンプカードのためのAPIです。",
-  "version": "0.0.1",
-  "Port": 8443,
   "BasicAuth": {
     "Username": "neko",
     "Password": "nyan"
   },
-  "certPath": "",
-  "keyPath": "",
   "DBType": "sqlite",
   "DBUser": "",
   "DBPassword": "",
@@ -28,18 +40,6 @@
   "MaxOpenConnections": 10,
   "MaxIdleConnections": 5,
   "ConnMaxLifetimeSeconds": 3600,
-  "log": {
-    "Filename": "./logs/nyanql.log",
-    "MaxSize": 5,
-    "MaxBackups": 3,
-    "MaxAge": 7,
-    "Compress": true,
-    "EnableLogging": false
-  },
-  "javascript_include": [
-    "./javascript/lib/nyanRequestCheck.js",
-    "./javascript/base.js"
-  ],
   "APIHotReload": {
     "Enabled": true,
     "Interval": "1s"
