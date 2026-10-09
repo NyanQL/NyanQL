@@ -11965,11 +11965,18 @@ func TestReceiveAdmissionChunkedStopsAtLimit(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			reader := bufio.NewReader(conn)
+			response, err := http.ReadResponse(reader, nil)
 			if err != nil {
 				t.Fatalf("%s waited for unread body: %v", path, err)
 			}
 			defer response.Body.Close()
+			if _, err := io.ReadAll(response.Body); err != nil {
+				t.Fatalf("413 response body stalled: %v", err)
+			}
+			if _, err := reader.ReadByte(); err != io.EOF {
+				t.Fatalf("connection remains after 413; want EOF, got %v", err)
+			}
 			if response.StatusCode != 413 || response.Header.Get("Access-Control-Allow-Origin") == "" {
 				t.Fatalf("%s response=%v", path, response)
 			}
@@ -12051,4 +12058,131 @@ func TestReceiveLimitsWebSocketReleasesHandshakeBody(t *testing.T) {
 	if !reachedUpgrade {
 		t.Fatalf("upgrade not reached: status=%d body=%s", rec.Code, rec.Body.String())
 	}
+}
+
+func TestReceiveAdmissionBusyRespondsWithoutBody(t *testing.T) {
+	handler, name := newReceiveAdmissionHandler(t, false)
+	release, ok := acquireMCPExecutionSlot(name, 1)
+	if !ok {
+		t.Fatal("slot unavailable")
+	}
+	defer release()
+	assertEarlyBusyResponse(t, handler, "/"+name, "application/json")
+}
+
+func assertEarlyBusyResponse(t *testing.T, handler http.Handler, path, contentType string) {
+	t.Helper()
+	assertEarlyRejectionEOF(t, handler, path, contentType, http.StatusServiceUnavailable)
+}
+
+func assertEarlyRejectionEOF(t *testing.T, handler http.Handler, path, contentType string, status int) {
+	t.Helper()
+	for _, framing := range []string{"Content-Length: 32", "Transfer-Encoding: chunked"} {
+		t.Run(framing, func(t *testing.T) {
+			server := httptest.NewServer(handler)
+			defer server.Close()
+			conn, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			_, err = fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: service.example\r\nContent-Type: %s\r\nAccept: application/json, text/event-stream\r\n%s\r\n\r\n", path, contentType, framing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader := bufio.NewReader(conn)
+			response, err := http.ReadResponse(reader, nil)
+			if err != nil {
+				t.Fatalf("early rejection waited for body: %v", err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != status || !response.Close {
+				t.Fatalf("status=%d close=%v", response.StatusCode, response.Close)
+			}
+			if _, err := io.ReadAll(response.Body); err != nil {
+				t.Fatalf("response body stalled: %v", err)
+			}
+			if _, err := reader.ReadByte(); err != io.EOF {
+				t.Fatalf("connection remains after rejection; want EOF, got %v", err)
+			}
+		})
+	}
+}
+
+func TestReceiveAdmissionOAuthBusyRespondsWithoutBody(t *testing.T) {
+	_, name := newReceiveAdmissionHandler(t, false)
+	release, ok := acquireMCPExecutionSlot(name+":oauth:oauthToken", 1)
+	if !ok {
+		t.Fatal("slot unavailable")
+	}
+	defer release()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", MaxConcurrent: 1, OAuth: MCPOAuthConfig{Token: "token"}}
+		handleMCPOAuthHTTPRequest(nil, w, r, name, server, "token", "oauthToken")
+	})
+	assertEarlyBusyResponse(t, handler, "/token", "application/x-www-form-urlencoded")
+}
+
+func TestExecutionModeDraftIdentifierReferences(t *testing.T) {
+	for _, tc := range []struct {
+		name, draft, identifier string
+		preserve                bool
+	}{
+		{"draft4_anchor", "http://json-schema.org/draft-04/schema#", `"id":"#Input",`, true},
+		{"draft4_resource", "http://json-schema.org/draft-04/schema#", `"id":"urn:test:input",`, true},
+		{"draft7_anchor", "http://json-schema.org/draft-07/schema#", `"$id":"#Input",`, true},
+		{"modern_id_annotation", "https://json-schema.org/draft/2020-12/schema", `"id":"#Input",`, false},
+		{"draft4_data_id", "http://json-schema.org/draft-04/schema#", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var original map[string]interface{}
+			raw := fmt.Sprintf(`{"$schema":%q,"$ref":"#/definitions/Input","definitions":{"Input":{%s"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}}}`, tc.draft, tc.identifier)
+			if err := json.Unmarshal([]byte(raw), &original); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := compileJSONSchema(original); err != nil {
+				t.Fatalf("original: %v", err)
+			}
+			before, _ := json.Marshal(original)
+			normalized := normalizedMCPInputSchema(original)
+			compiled, err := compileJSONSchema(normalized)
+			if err != nil {
+				t.Fatalf("normalized: %v", err)
+			}
+			after, _ := json.Marshal(original)
+			if !bytes.Equal(before, after) {
+				t.Fatal("original mutated")
+			}
+			if !reflect.DeepEqual(normalized, normalizedMCPInputSchema(normalized)) {
+				t.Fatal("normalization is not idempotent")
+			}
+			if tc.preserve && normalized["$ref"] != original["$ref"] {
+				t.Fatal("identified resource was copied")
+			}
+			if err := compiled.Validate(map[string]interface{}{"id": 123}); err != nil {
+				t.Fatalf("valid input rejected: %v", err)
+			}
+			if err := compiled.Validate(map[string]interface{}{"id": "wrong"}); err == nil {
+				t.Fatal("invalid id accepted")
+			}
+			if err := compiled.Validate(map[string]interface{}{}); err == nil {
+				t.Fatal("required id ignored")
+			}
+			err = compiled.Validate(map[string]interface{}{"id": 123, "nyan_mode": "checkOnly"})
+			if (err != nil) != tc.preserve {
+				t.Fatalf("mode extension changed: %v", err)
+			}
+		})
+	}
+}
+
+func TestReceiveAdmissionRateRejectionClosesConnection(t *testing.T) {
+	handler, name := newReceiveAdmissionHandler(t, true)
+	seed := httptest.NewRequest("POST", "http://service.example/"+name, nil)
+	seed.RemoteAddr = "127.0.0.1:1"
+	seed.Header.Set("Content-Type", "application/json")
+	seed.Header.Set("Accept", "application/json, text/event-stream")
+	handler.ServeHTTP(httptest.NewRecorder(), seed)
+	assertEarlyRejectionEOF(t, handler, "/"+name, "application/json", http.StatusTooManyRequests)
 }

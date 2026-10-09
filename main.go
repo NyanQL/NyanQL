@@ -136,6 +136,19 @@ func (limits ReceiveLimitsConfig) webSocketMessageBytes() int64 {
 	return defaultReceiveBytes
 }
 
+// Avoid net/http draining a body that the rejected client may never send.
+func closeUnreadRequestBody(w http.ResponseWriter, r *http.Request) {
+	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
+		r.Close = true
+		if r.ProtoMajor < 2 {
+			w.Header().Set("Connection", "close")
+			// Stop net/http's post-response body drain without expiring writes.
+			// ResponseController also unwraps Gin's response writer.
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+		}
+	}
+}
+
 // Read only after the route's header-based authentication and admission checks.
 // Never close a partially read server body here: Close can drain unread bytes
 // and delay an error response while the peer has stopped sending.
@@ -154,6 +167,9 @@ func readBoundedRequestBody(w http.ResponseWriter, r *http.Request, limit int64)
 		r.Close = true
 		if w != nil && r.ProtoMajor < 2 {
 			w.Header().Set("Connection", "close")
+			// Stop net/http's post-response body drain without expiring writes.
+			// ResponseController also unwraps Gin's response writer.
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now())
 		}
 	}
 	return body, err
@@ -1154,12 +1170,14 @@ func handleMCPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 	}
 	if allowed, retryAfter := configuredRateLimitAllows("mcp:"+serverName, serverConfig.RateLimit, r.RemoteAddr, time.Now()); !allowed {
 		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(retryAfter.Seconds()))))
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return
 	}
 	release, acquired := acquireMCPExecutionSlot(serverName, configuredMCPMaxConcurrent(serverConfig))
 	if !acquired {
 		w.Header().Set("Retry-After", "1")
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "server is busy", http.StatusServiceUnavailable)
 		return
 	}
@@ -1334,12 +1352,14 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	}
 	if allowed, retryAfter := configuredRateLimitAllows("mcp:"+serverName+":oauth:"+role, mcpOAuthRateLimit(serverConfig, role), r.RemoteAddr, time.Now()); !allowed {
 		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(retryAfter.Seconds())))))
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return
 	}
 	release, acquired := acquireMCPExecutionSlot(serverName+":oauth:"+role, mcpOAuthMaxConcurrent(serverConfig, role))
 	if !acquired {
 		w.Header().Set("Retry-After", "1")
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "OAuth endpoint is busy", http.StatusServiceUnavailable)
 		return
 	}
@@ -1996,6 +2016,13 @@ func normalizedMCPInputSchema(schema map[string]interface{}) map[string]interfac
 			if object, ok := target.(map[string]interface{}); ok {
 				if _, hasID := object["$id"].(string); hasID {
 					return
+				}
+				// Draft-04 uses id for resource and anchor identity. Use the
+				// compiler's resolved dialect, not a keyword-name heuristic.
+				if compiled.Ref.DraftVersion == 4 {
+					if _, hasID := object["id"].(string); hasID {
+						return
+					}
 				}
 			}
 		}
@@ -2869,6 +2896,7 @@ func handleWebSocketWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWri
 	case websocketConnectionSlots <- struct{}{}:
 		defer func() { <-websocketConnectionSlots }()
 	default:
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "too many WebSocket connections", http.StatusServiceUnavailable)
 		return
 	}
