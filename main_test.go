@@ -9522,6 +9522,7 @@ func TestWebSocketAPIChecks(t *testing.T) {
 	for _, test := range []struct {
 		name, paramResult, outResult         string
 		sql, bodyError, paramOnly, checkOnly bool
+		missingCheck, legacyCheck            bool
 		wantBody, wantOut                    bool
 		wantStatus                           int
 	}{
@@ -9537,6 +9538,8 @@ func TestWebSocketAPIChecks(t *testing.T) {
 		{name: "missing_body", paramResult: allow, outResult: `({success:false,status:409,error:"denied"});`, paramOnly: true, wantStatus: 500},
 		{name: "check_only_without_body", paramResult: allow, outResult: allow, paramOnly: true, checkOnly: true, wantStatus: 200},
 		{name: "check_only", paramResult: allow, outResult: allow, checkOnly: true, wantStatus: 200},
+		{name: "check_only_without_param_check", outResult: allow, checkOnly: true, missingCheck: true, wantStatus: 404},
+		{name: "check_only_with_legacy_check", paramResult: allow, outResult: allow, checkOnly: true, legacyCheck: true, wantStatus: 200},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			resetJavascriptInclude(t)
@@ -9562,7 +9565,12 @@ if (!nyanAllParams.checked || (result.value !== 7 && (!result.result || result.r
 `
 			}
 			output += test.outResult
-			target := APIConfig{ParamCheck: writeTestScript(t, input), OutCheck: writeTestScript(t, output)}
+			target := APIConfig{OutCheck: writeTestScript(t, output)}
+			if test.legacyCheck {
+				target.Check = writeTestScript(t, input)
+			} else if !test.missingCheck {
+				target.ParamCheck = writeTestScript(t, input)
+			}
 			if test.sql {
 				sqlFile := filepath.Join(dir, "run.sql")
 				writeTestFile(t, sqlFile, `INSERT INTO executed (value) VALUES (/*value*/0) RETURNING value;`)
@@ -9608,7 +9616,7 @@ if (!nyanAllParams.checked) throw new Error("paramCheck did not run before the b
 			} else if response["value"] != float64(7) {
 				t.Fatalf("script result = %#v", response)
 			}
-			for stage, want := range map[string]bool{"param": true, "body": test.wantBody && !test.sql, "out": test.wantOut, "push": false} {
+			for stage, want := range map[string]bool{"param": !test.missingCheck, "body": test.wantBody && !test.sql, "out": test.wantOut, "push": false} {
 				_, err := os.Stat(filepath.Join(dir, stage))
 				if err != nil && !os.IsNotExist(err) {
 					t.Fatal(err)

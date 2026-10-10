@@ -3025,7 +3025,8 @@ func executeWebSocketAPIMessage(r *http.Request, message []byte) (response []byt
 			return webSocketAPIError(http.StatusBadRequest, "Reserved request parameter: "+key)
 		}
 	}
-	if _, err := parseExecutionMode(params); err != nil {
+	mode, err := parseExecutionMode(params)
+	if err != nil {
 		return webSocketAPIError(http.StatusBadRequest, err.Error())
 	}
 	snapshot := currentAPISnapshot()
@@ -3035,6 +3036,9 @@ func executeWebSocketAPIMessage(r *http.Request, message []byte) (response []byt
 	apiConfig, exists := snapshot.Definitions[apiName]
 	if !exists || getAPIType(apiConfig) != apiTypeAPI {
 		return webSocketAPIError(http.StatusNotFound, "API not found")
+	}
+	if mode == "checkOnly" && getParamCheckScriptPath(apiConfig) == "" {
+		return webSocketAPIError(http.StatusNotFound, "No check script for this API")
 	}
 	params["nyan_request"] = scriptHTTPRequestContext(r)
 	result, err := callNyanAPIFromVMWithSnapshot(snapshot, apiName, params)
