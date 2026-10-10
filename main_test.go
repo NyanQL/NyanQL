@@ -12186,3 +12186,156 @@ func TestReceiveAdmissionRateRejectionClosesConnection(t *testing.T) {
 	handler.ServeHTTP(httptest.NewRecorder(), seed)
 	assertEarlyRejectionEOF(t, handler, "/"+name, "application/json", http.StatusTooManyRequests)
 }
+
+func TestReceiveAdmissionEarlyRejectionEOF(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, headers string
+		status                      int
+	}{
+		{"origin", "POST", "mcp", "Origin: https://untrusted.example\r\n", 403},
+		{"method", "PUT", "mcp", "", 405},
+		{"content_type", "POST", "mcp", "Content-Type: text/plain\r\n", 415},
+		{"accept", "POST", "mcp", "Accept: text/plain\r\n", 406},
+		{"options", "OPTIONS", "mcp", "", 204},
+		{"cors_preflight", "OPTIONS", "/ordinary", "Origin: https://client.example\r\nAccess-Control-Request-Method: POST\r\n", 204},
+		{"basic_auth", "POST", "/ordinary", "", 401},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, name := newReceiveAdmissionHandler(t, false)
+			path := tc.path
+			if path == "mcp" {
+				path = "/" + name
+			}
+			assertUnreadBodyRejectionEOF(t, handler, tc.method, path, tc.headers, tc.status)
+		})
+	}
+}
+
+func assertUnreadBodyRejectionEOF(t *testing.T, handler http.Handler, method, path, headers string, status int) {
+	t.Helper()
+	for _, framing := range []string{"Content-Length: 32", "Transfer-Encoding: chunked"} {
+		t.Run(framing, func(t *testing.T) {
+			server := httptest.NewServer(handler)
+			defer server.Close()
+			conn, err := net.Dial("tcp", server.Listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			requestHeaders := headers
+			if !strings.Contains(headers, "Content-Type:") {
+				requestHeaders += "Content-Type: application/json\r\n"
+			}
+			if !strings.Contains(headers, "Accept:") {
+				requestHeaders += "Accept: application/json, text/event-stream\r\n"
+			}
+			_, err = fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: service.example\r\n%s%s\r\n\r\n", method, path, requestHeaders, framing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader := bufio.NewReader(conn)
+			response, err := http.ReadResponse(reader, nil)
+			if err != nil {
+				t.Fatalf("expected immediate %d; blocked on missing body: %v", status, err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != status {
+				t.Fatalf("status=%d want=%d", response.StatusCode, status)
+			}
+			if !response.Close {
+				t.Fatal("rejected body connection remains reusable")
+			}
+			if _, err := io.ReadAll(response.Body); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := reader.ReadByte(); err != io.EOF {
+				t.Fatalf("expected EOF after rejection: %v", err)
+			}
+		})
+	}
+}
+
+func TestReceiveAdmissionOAuthEarlyRejectionEOF(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, role, headers string
+		status                      int
+	}{
+		{"origin", "POST", "oauthToken", "Origin: https://untrusted.example\r\n", 403},
+		{"method", "POST", "authorizationServerMetadata", "", 405},
+		{"options", "OPTIONS", "oauthToken", "", 204},
+		{"content_type", "POST", "oauthToken", "Content-Type: text/plain\r\n", 415},
+		{"admin_auth", "POST", "oauthAdminUser", "", 401},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, name := newReceiveAdmissionHandler(t, false)
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", AllowedOrigins: []string{"https://client.example"}}
+				handleMCPOAuthHTTPRequest(nil, w, r, name, server, "oauth", tc.role)
+			})
+			assertUnreadBodyRejectionEOF(t, handler, tc.method, "/oauth", tc.headers, tc.status)
+		})
+	}
+}
+
+func TestReceiveAdmissionMuxEarlyResponsesEOF(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, headers string
+		status                      int
+	}{
+		{"preflight_without_origin", "OPTIONS", "/ordinary", "Access-Control-Request-Method: POST\r\n", 204},
+		{"slash_redirect", "GET", "/nyan", "", 301},
+		{"clean_path_redirect", "GET", "/ordinary//x", "", 301},
+		{"dot_path_redirect", "GET", "/ordinary/../x", "", 301},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, _ := newReceiveAdmissionHandler(t, false)
+			if tc.status == 301 {
+				tc.status = unmodifiedMuxRedirectStatus(t, tc.path)
+			}
+			assertUnreadBodyRejectionEOF(t, handler, tc.method, tc.path, tc.headers, tc.status)
+		})
+	}
+}
+
+func TestReceiveAdmissionMuxResponsesWithoutBody(t *testing.T) {
+	handler, _ := newReceiveAdmissionHandler(t, false)
+	for _, tc := range []struct {
+		method, path, location string
+		status                 int
+	}{
+		{"GET", "/nyan", "/nyan/", 301},
+		{"GET", "/ordinary//x?q=1", "/ordinary/x?q=1", 301},
+		{"OPTIONS", "/ordinary", "", 204},
+	} {
+		if tc.status == 301 {
+			tc.status = unmodifiedMuxRedirectStatus(t, tc.path)
+		}
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		if tc.method == "OPTIONS" {
+			req.Header.Set("Access-Control-Request-Method", "POST")
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != tc.status || rec.Header().Get("Location") != tc.location {
+			t.Fatalf("%s status=%d location=%s", tc.path, rec.Code, rec.Header().Get("Location"))
+		}
+		if req.Close || rec.Header().Get("Connection") == "close" {
+			t.Fatalf("body-free request unnecessarily closed: %s", tc.path)
+		}
+	}
+}
+
+// Compare with the standard mux: redirect status differs between Go versions.
+func unmodifiedMuxRedirectStatus(t *testing.T, path string) int {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/nyan/", func(http.ResponseWriter, *http.Request) {})
+	mux.HandleFunc("/", func(http.ResponseWriter, *http.Request) {})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+	if rec.Code < 300 || rec.Code >= 400 {
+		t.Fatalf("expected standard mux redirect: %d", rec.Code)
+	}
+	return rec.Code
+}

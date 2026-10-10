@@ -847,10 +847,12 @@ func unifiedHandler(w http.ResponseWriter, r *http.Request) {
 	// WebSocket購読は接続先の入力チェックを適用する。API実行のBasic認証はメッセージ受信時に行う。
 	if isWebSocketRequest(r) {
 		if !webSocketEndpointConfigured(snapshot, r.URL.Path) {
+			closeUnreadRequestBody(w, r)
 			http.NotFound(w, r)
 			return
 		}
 		if !validateWebSocketOrigin(r) {
+			closeUnreadRequestBody(w, r)
 			http.Error(w, "forbidden origin", http.StatusForbidden)
 			return
 		}
@@ -1151,20 +1153,24 @@ func (rejectingJSONSchemaLoader) Load(location string) (interface{}, error) {
 func handleMCPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, serverName string, serverConfig APIConfig) {
 	runtimeURLs, err := deriveMCPRuntimeURLs(r, serverName, serverConfig)
 	if err != nil {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "invalid Host", http.StatusMisdirectedRequest)
 		return
 	}
 	if !requestOriginAllowed(r.Header.Get("Origin"), runtimeURLs.Origin, serverConfig.AllowedOrigins) {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "forbidden origin", http.StatusForbidden)
 		return
 	}
 	writeMCPCORSHeaders(w, r)
 	if r.Method == http.MethodOptions {
+		closeUnreadRequestBody(w, r)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST, OPTIONS")
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -1183,11 +1189,13 @@ func handleMCPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWr
 	}
 	defer release()
 	if !mcpAcceptsJSONAndEventStream(r.Header.Get("Accept")) {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "Accept must allow application/json and text/event-stream", http.StatusNotAcceptable)
 		return
 	}
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
 		return
 	}
@@ -1306,10 +1314,12 @@ func writeMCPCORSHeaders(w http.ResponseWriter, r *http.Request) {
 func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, serverName string, serverConfig APIConfig, apiName, role string) {
 	runtimeURLs, err := deriveMCPRuntimeURLs(r, serverName, serverConfig)
 	if err != nil {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "invalid Host", http.StatusMisdirectedRequest)
 		return
 	}
 	if !requestOriginAllowed(r.Header.Get("Origin"), runtimeURLs.Origin, serverConfig.AllowedOrigins) {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "forbidden origin", http.StatusForbidden)
 		return
 	}
@@ -1321,6 +1331,7 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	if r.Method == http.MethodOptions {
+		closeUnreadRequestBody(w, r)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -1331,22 +1342,26 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		}
 		remoteIP := net.ParseIP(strings.TrimSpace(remoteHost))
 		if remoteIP == nil || !remoteIP.IsLoopback() {
+			closeUnreadRequestBody(w, r)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 		username, password, ok := r.BasicAuth()
 		if !ok || !timingSafeStringEqual(username, config.BasicAuth.Username) || !timingSafeStringEqual(password, config.BasicAuth.Password) {
 			w.Header().Set("WWW-Authenticate", `Basic realm="NyanQL OAuth administration", charset="UTF-8"`)
+			closeUnreadRequestBody(w, r)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 	}
 	if !mcpOAuthMethodAllowed(role, r.Method) {
 		w.Header().Set("Allow", mcpOAuthAllowedMethods(role))
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if err := validateMCPOAuthContentType(role, r); err != nil {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "unsupported Content-Type", http.StatusUnsupportedMediaType)
 		return
 	}
@@ -4633,11 +4648,13 @@ func handlePublicRequest(w http.ResponseWriter, r *http.Request, apiKey string, 
 func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, apiKey string, requestedPath string, apiConfig APIConfig) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	publicPath := strings.TrimSpace(apiConfig.Path)
 	if publicPath == "" {
+		closeUnreadRequestBody(w, r)
 		sendJSONError(w, "public path is missing", http.StatusInternalServerError)
 		return
 	}
@@ -6240,6 +6257,7 @@ func basicAuth(next http.HandlerFunc, config Config) http.HandlerFunc {
 		user, pass, ok := r.BasicAuth()
 		if !ok || !checkPassword(user, pass, config) {
 			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+			closeUnreadRequestBody(w, r)
 			sendJSONError(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -9636,6 +9654,12 @@ func receiveLimitHandler(next http.Handler) http.Handler {
 
 func newServiceHTTPHandler() http.Handler {
 	mux := http.NewServeMux()
+	// Mark registered routes so mux-generated redirects can be identified
+	// without duplicating ServeMux's escaped-path and trailing-slash rules.
+	type serviceRoute struct{ http.Handler }
+	register := func(pattern string, handler http.Handler) {
+		mux.Handle(pattern, &serviceRoute{Handler: handler})
+	}
 	corsHandler := cors.New(cors.Options{
 		AllowedOrigins: []string{"*"},
 		AllowedMethods: []string{"GET", "POST", "OPTIONS", "PUT", "DELETE"},
@@ -9643,13 +9667,24 @@ func newServiceHTTPHandler() http.Handler {
 		ExposedHeaders: []string{"WWW-Authenticate", "MCP-Protocol-Version", "Retry-After"},
 	})
 
-	mux.Handle("/nyan-rpc", corsHandler.Handler(http.HandlerFunc(basicAuth(handleJSONRPC, config))))
+	register("/nyan-rpc", corsHandler.Handler(http.HandlerFunc(basicAuth(handleJSONRPC, config))))
 
-	mux.Handle("/nyan/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	register("/nyan/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		basicAuth(handleNyanOrDetail, config)(w, r)
 	})))
 
-	mux.Handle("/", corsHandler.Handler(http.HandlerFunc(unifiedHandler)))
+	register("/", corsHandler.Handler(http.HandlerFunc(unifiedHandler)))
 
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// CORS preflight returns before route admission and never consumes a body.
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			closeUnreadRequestBody(w, r)
+		}
+		handler, _ := mux.Handler(r)
+		if _, registered := handler.(*serviceRoute); !registered {
+			// Redirects and other mux-generated replies do not consume bodies.
+			closeUnreadRequestBody(w, r)
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
