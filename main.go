@@ -51,26 +51,219 @@ import (
 	"golang.org/x/crypto/argon2"
 )
 
+// ReceiveLimitsConfig bounds incoming bodies and WebSocket messages, in bytes.
+// Zero keeps a safe default; negative limits are configuration errors.
+type ReceiveLimitsConfig struct {
+	HTTPBodyBytes         int64 `json:"httpBodyBytes"`
+	WebSocketMessageBytes int64 `json:"webSocketMessageBytes"`
+}
+
+const defaultReceiveBytes int64 = 20 << 20
+
+// receiveByteCount accepts legacy byte counts and human-readable binary units.
+type receiveByteCount int64
+
+func (count *receiveByteCount) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	var value int64
+	if len(data) > 0 && data[0] == '"' {
+		var text string
+		if err := json.Unmarshal(data, &text); err != nil {
+			return err
+		}
+		text = strings.ToUpper(strings.TrimSpace(text))
+		end := 0
+		for end < len(text) && text[end] >= '0' && text[end] <= '9' {
+			end++
+		}
+		if end == 0 {
+			return fmt.Errorf("receiveLimits requires a non-negative integer with an optional B, KB, MB or GB unit")
+		}
+		parsed, err := strconv.ParseInt(text[:end], 10, 64)
+		if err != nil {
+			return fmt.Errorf("receiveLimits byte count is out of range")
+		}
+		var multiplier int64
+		switch strings.TrimSpace(text[end:]) {
+		case "", "B":
+			multiplier = 1
+		case "KB", "KIB":
+			multiplier = 1 << 10
+		case "MB", "MIB":
+			multiplier = 1 << 20
+		case "GB", "GIB":
+			multiplier = 1 << 30
+		default:
+			return fmt.Errorf("receiveLimits has an invalid size unit (use B, KB, MB or GB)")
+		}
+		if parsed > math.MaxInt64/multiplier {
+			return fmt.Errorf("receiveLimits byte count is out of range")
+		}
+		value = parsed * multiplier
+	} else if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("receiveLimits requires an integer byte count or a size string: %w", err)
+	}
+	if value < 0 {
+		return fmt.Errorf("receiveLimits values must be non-negative byte counts")
+	}
+	*count = receiveByteCount(value)
+	return nil
+}
+
+func (limits *ReceiveLimitsConfig) UnmarshalJSON(data []byte) error {
+	var decoded struct {
+		HTTPBodyBytes         receiveByteCount `json:"httpBodyBytes"`
+		WebSocketMessageBytes receiveByteCount `json:"webSocketMessageBytes"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*limits = ReceiveLimitsConfig{HTTPBodyBytes: int64(decoded.HTTPBodyBytes), WebSocketMessageBytes: int64(decoded.WebSocketMessageBytes)}
+	return nil
+}
+
+func (limits ReceiveLimitsConfig) httpBodyBytes() int64 {
+	if limits.HTTPBodyBytes > 0 {
+		return limits.HTTPBodyBytes
+	}
+	return defaultReceiveBytes
+}
+
+func (limits ReceiveLimitsConfig) webSocketMessageBytes() int64 {
+	if limits.WebSocketMessageBytes > 0 {
+		return limits.WebSocketMessageBytes
+	}
+	return defaultReceiveBytes
+}
+
+// Avoid net/http draining a body that the rejected client may never send.
+func closeUnreadRequestBody(w http.ResponseWriter, r *http.Request) {
+	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
+		r.Close = true
+		if r.ProtoMajor < 2 {
+			w.Header().Set("Connection", "close")
+			// Stop net/http's post-response body drain without expiring writes.
+			// ResponseController also unwraps Gin's response writer.
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+		}
+	}
+}
+
+// Read only after the route's header-based authentication and admission checks.
+// Never close a partially read server body here: Close can drain unread bytes
+// and delay an error response while the peer has stopped sending.
+func readBoundedRequestBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, error) {
+	var body []byte
+	var err error
+	if r.ContentLength > limit {
+		err = &http.MaxBytesError{Limit: limit}
+	} else if r.Body != nil {
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	}
+	if err != nil {
+		// Gin's writer does not expose net/http's private requestTooLarge hook.
+		// Explicitly disable HTTP/1 reuse so the server does not drain the body
+		// before flushing a rejection. HTTP/2 closes only the affected stream.
+		r.Close = true
+		if w != nil && r.ProtoMajor < 2 {
+			w.Header().Set("Connection", "close")
+			// Stop net/http's post-response body drain without expiring writes.
+			// ResponseController also unwraps Gin's response writer.
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+		}
+	}
+	return body, err
+}
+
+func enforceReceiveBodyLimit(w http.ResponseWriter, r *http.Request) bool {
+	limit := config.ReceiveLimits.httpBodyBytes()
+	body, err := readBoundedRequestBody(w, r, limit)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body is too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+		}
+		return false
+	}
+	// Keep MaxBytesReader visible to ParseForm, which otherwise adds a 10 MiB cap.
+	r.Body = http.MaxBytesReader(w, io.NopCloser(bytes.NewReader(body)), limit)
+	return true
+}
+
+// HTTPTimeoutsConfig controls HTTP transport deadlines; zero uses defaults.
+type HTTPTimeoutsConfig struct {
+	ReadHeaderTimeout httpTimeoutDuration `json:"readHeaderTimeout"`
+	ReadTimeout       httpTimeoutDuration `json:"readTimeout"`
+	WriteTimeout      httpTimeoutDuration `json:"writeTimeout"`
+	IdleTimeout       httpTimeoutDuration `json:"idleTimeout"`
+}
+
+type httpTimeoutDuration time.Duration
+
+func (duration *httpTimeoutDuration) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		*duration = 0
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(data, &text); err != nil {
+		return fmt.Errorf("httpTimeouts requires a duration string such as 30s or 20m: %w", err)
+	}
+	value, err := time.ParseDuration(strings.TrimSpace(text))
+	if err != nil || value < 0 {
+		return fmt.Errorf("httpTimeouts requires a non-negative duration such as 30s or 20m")
+	}
+	*duration = httpTimeoutDuration(value)
+	return nil
+}
+
+func (duration httpTimeoutDuration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(duration).String())
+}
+
+func (duration httpTimeoutDuration) orDefault(fallback time.Duration) time.Duration {
+	if duration > 0 {
+		return time.Duration(duration)
+	}
+	return fallback
+}
+
+func newConfiguredHTTPServer(address string, handler http.Handler, timeouts HTTPTimeoutsConfig) *http.Server {
+	return &http.Server{
+		Addr:              address,
+		Handler:           handler,
+		ReadHeaderTimeout: timeouts.ReadHeaderTimeout.orDefault(30 * time.Second),
+		ReadTimeout:       timeouts.ReadTimeout.orDefault(20 * time.Minute),
+		WriteTimeout:      timeouts.WriteTimeout.orDefault(30 * time.Minute),
+		IdleTimeout:       timeouts.IdleTimeout.orDefault(5 * time.Minute),
+		MaxHeaderBytes:    1 << 20,
+	}
+}
+
 type Config struct {
-	Name                   string             `json:"name"`
-	Profile                string             `json:"profile"`
-	Version                string             `json:"version"`
-	Port                   int                `json:"Port"`
-	CertPath               string             `json:"CertPath"`
-	KeyPath                string             `json:"KeyPath"`
-	DatabaseType           string             `json:"DBType"`
-	DBUsername             string             `json:"DBUser"`
-	DBPassword             string             `json:"DBPassword"`
-	DBName                 string             `json:"DBName"`
-	DBHost                 string             `json:"DBHost"`
-	DBPort                 string             `json:"DBPort"`
-	MaxOpenConnections     int                `json:"MaxOpenConnections"`
-	MaxIdleConnections     int                `json:"MaxIdleConnections"`
-	ConnMaxLifetimeSeconds int                `json:"ConnMaxLifetimeSeconds"`
-	BasicAuth              BasicAuthConfig    `json:"BasicAuth"`
-	Log                    LogConfig          `json:"log"`
-	JavascriptInclude      []string           `json:"javascript_include,omitempty"`
-	APIHotReload           APIHotReloadConfig `json:"APIHotReload"`
+	HTTPTimeouts           HTTPTimeoutsConfig  `json:"httpTimeouts"`
+	ReceiveLimits          ReceiveLimitsConfig `json:"receiveLimits"`
+	Name                   string              `json:"name"`
+	Profile                string              `json:"profile"`
+	Version                string              `json:"version"`
+	Port                   int                 `json:"Port"`
+	CertPath               string              `json:"CertPath"`
+	KeyPath                string              `json:"KeyPath"`
+	DatabaseType           string              `json:"DBType"`
+	DBUsername             string              `json:"DBUser"`
+	DBPassword             string              `json:"DBPassword"`
+	DBName                 string              `json:"DBName"`
+	DBHost                 string              `json:"DBHost"`
+	DBPort                 string              `json:"DBPort"`
+	MaxOpenConnections     int                 `json:"MaxOpenConnections"`
+	MaxIdleConnections     int                 `json:"MaxIdleConnections"`
+	ConnMaxLifetimeSeconds int                 `json:"ConnMaxLifetimeSeconds"`
+	BasicAuth              BasicAuthConfig     `json:"BasicAuth"`
+	Log                    LogConfig           `json:"log"`
+	JavascriptInclude      []string            `json:"javascript_include,omitempty"`
+	APIHotReload           APIHotReloadConfig  `json:"APIHotReload"`
 }
 
 type APIHotReloadConfig struct {
@@ -403,12 +596,11 @@ const (
 	mcpProtocolVersion20250326       = "2025-03-26"
 	mcpProtocolVersion20250618       = "2025-06-18"
 	mcpProtocolVersion20251125       = "2025-11-25"
-	maxConfiguredHTTPBodyBytes       = 1 << 20
+	maxMCPStdioMessageBytes          = 1 << 20
 	maxConfiguredHTTPResponseBytes   = 4 << 20
 	maxSQLJSONRows                   = 10000
 	maxSQLJSONBytes                  = maxConfiguredHTTPResponseBytes
 	maxRestrictedScriptRuntime       = 15 * time.Second
-	maxWebSocketMessageBytes         = 1 << 20
 	maxWebSocketConnections          = 128
 	webSocketWriteTimeout            = 5 * time.Second
 )
@@ -574,31 +766,9 @@ func main() {
 		serviceLog(slog.LevelInfo, "api_hot_reload_disabled")
 	}
 
-	corsHandler := cors.New(cors.Options{
-		AllowedOrigins: []string{"*"},
-		AllowedMethods: []string{"GET", "POST", "OPTIONS", "PUT", "DELETE"},
-		AllowedHeaders: []string{"Content-Type", "Authorization", "MCP-Protocol-Version", "MCP-Session-Id", "Last-Event-ID"},
-		ExposedHeaders: []string{"WWW-Authenticate", "MCP-Protocol-Version", "Retry-After"},
-	})
-
 	hub = NewHub()
 
-	http.Handle("/nyan-rpc", corsHandler.Handler(http.HandlerFunc(basicAuth(handleJSONRPC, config))))
-
-	http.Handle("/nyan/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		basicAuth(handleNyanOrDetail, config)(w, r)
-	})))
-
-	http.Handle("/", corsHandler.Handler(http.HandlerFunc(unifiedHandler)))
-
-	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", config.Port),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      2 * time.Minute,
-		IdleTimeout:       2 * time.Minute,
-		MaxHeaderBytes:    1 << 20,
-	}
+	server := newConfiguredHTTPServer(fmt.Sprintf(":%d", config.Port), newServiceHTTPHandler(), config.HTTPTimeouts)
 	if config.CertPath != "" && config.KeyPath != "" {
 		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "https", "port", config.Port)
 		fatalServiceError("http_server_stopped", server.ListenAndServeTLS(config.CertPath, config.KeyPath))
@@ -677,10 +847,12 @@ func unifiedHandler(w http.ResponseWriter, r *http.Request) {
 	// WebSocket購読は接続先の入力チェックを適用する。API実行のBasic認証はメッセージ受信時に行う。
 	if isWebSocketRequest(r) {
 		if !webSocketEndpointConfigured(snapshot, r.URL.Path) {
+			closeUnreadRequestBody(w, r)
 			http.NotFound(w, r)
 			return
 		}
 		if !validateWebSocketOrigin(r) {
+			closeUnreadRequestBody(w, r)
 			http.Error(w, "forbidden origin", http.StatusForbidden)
 			return
 		}
@@ -981,47 +1153,54 @@ func (rejectingJSONSchemaLoader) Load(location string) (interface{}, error) {
 func handleMCPRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, serverName string, serverConfig APIConfig) {
 	runtimeURLs, err := deriveMCPRuntimeURLs(r, serverName, serverConfig)
 	if err != nil {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "invalid Host", http.StatusMisdirectedRequest)
 		return
 	}
 	if !requestOriginAllowed(r.Header.Get("Origin"), runtimeURLs.Origin, serverConfig.AllowedOrigins) {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "forbidden origin", http.StatusForbidden)
 		return
 	}
 	writeMCPCORSHeaders(w, r)
 	if r.Method == http.MethodOptions {
+		closeUnreadRequestBody(w, r)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST, OPTIONS")
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if allowed, retryAfter := configuredRateLimitAllows("mcp:"+serverName, serverConfig.RateLimit, r.RemoteAddr, time.Now()); !allowed {
 		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(retryAfter.Seconds()))))
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return
 	}
 	release, acquired := acquireMCPExecutionSlot(serverName, configuredMCPMaxConcurrent(serverConfig))
 	if !acquired {
 		w.Header().Set("Retry-After", "1")
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "server is busy", http.StatusServiceUnavailable)
 		return
 	}
 	defer release()
 	if !mcpAcceptsJSONAndEventStream(r.Header.Get("Accept")) {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "Accept must allow application/json and text/event-stream", http.StatusNotAcceptable)
 		return
 	}
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxConfiguredHTTPBodyBytes)
-	body, err := io.ReadAll(r.Body)
+	body, err := readBoundedRequestBody(w, r, config.ReceiveLimits.httpBodyBytes())
 	if err != nil {
 		var maxBytesError *http.MaxBytesError
 		if errors.As(err, &maxBytesError) {
@@ -1135,10 +1314,12 @@ func writeMCPCORSHeaders(w http.ResponseWriter, r *http.Request) {
 func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, serverName string, serverConfig APIConfig, apiName, role string) {
 	runtimeURLs, err := deriveMCPRuntimeURLs(r, serverName, serverConfig)
 	if err != nil {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "invalid Host", http.StatusMisdirectedRequest)
 		return
 	}
 	if !requestOriginAllowed(r.Header.Get("Origin"), runtimeURLs.Origin, serverConfig.AllowedOrigins) {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "forbidden origin", http.StatusForbidden)
 		return
 	}
@@ -1150,6 +1331,7 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	if r.Method == http.MethodOptions {
+		closeUnreadRequestBody(w, r)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -1160,28 +1342,44 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		}
 		remoteIP := net.ParseIP(strings.TrimSpace(remoteHost))
 		if remoteIP == nil || !remoteIP.IsLoopback() {
+			closeUnreadRequestBody(w, r)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 		username, password, ok := r.BasicAuth()
 		if !ok || !timingSafeStringEqual(username, config.BasicAuth.Username) || !timingSafeStringEqual(password, config.BasicAuth.Password) {
 			w.Header().Set("WWW-Authenticate", `Basic realm="NyanQL OAuth administration", charset="UTF-8"`)
+			closeUnreadRequestBody(w, r)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 	}
 	if !mcpOAuthMethodAllowed(role, r.Method) {
 		w.Header().Set("Allow", mcpOAuthAllowedMethods(role))
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if err := validateMCPOAuthContentType(role, r); err != nil {
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "unsupported Content-Type", http.StatusUnsupportedMediaType)
 		return
 	}
 	if allowed, retryAfter := configuredRateLimitAllows("mcp:"+serverName+":oauth:"+role, mcpOAuthRateLimit(serverConfig, role), r.RemoteAddr, time.Now()); !allowed {
 		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(retryAfter.Seconds())))))
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
+	release, acquired := acquireMCPExecutionSlot(serverName+":oauth:"+role, mcpOAuthMaxConcurrent(serverConfig, role))
+	if !acquired {
+		w.Header().Set("Retry-After", "1")
+		closeUnreadRequestBody(w, r)
+		http.Error(w, "OAuth endpoint is busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
+	if r.Method != http.MethodPost && !enforceReceiveBodyLimit(w, r) {
 		return
 	}
 	params, err := mcpOAuthRequestParams(w, r)
@@ -1199,13 +1397,6 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		return
 	}
 	params["nyan_mode"] = mode
-	release, acquired := acquireMCPExecutionSlot(serverName+":oauth:"+role, mcpOAuthMaxConcurrent(serverConfig, role))
-	if !acquired {
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "OAuth endpoint is busy", http.StatusServiceUnavailable)
-		return
-	}
-	defer release()
 	result, err := invokeMCPOAuthHook(snapshot, serverName, serverConfig, runtimeURLs, role, params)
 	if err != nil {
 		logServiceError(slog.LevelError, "oauth_hook_failed", err, "api", apiName, "role", role)
@@ -1305,8 +1496,7 @@ func mcpOAuthRequestParams(w http.ResponseWriter, r *http.Request) (map[string]i
 	if r.Method != http.MethodPost {
 		return params, nil
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxConfiguredHTTPBodyBytes)
-	body, err := io.ReadAll(r.Body)
+	body, err := readBoundedRequestBody(w, r, config.ReceiveLimits.httpBodyBytes())
 	if err != nil {
 		return nil, fmt.Errorf("request body is too large")
 	}
@@ -1360,7 +1550,7 @@ func serveMCPStdio(input io.Reader, output io.Writer, snapshot *APIConfigSnapsho
 		return fmt.Errorf("MCP API %q does not use stdio", serverName)
 	}
 	scanner := bufio.NewScanner(input)
-	scanner.Buffer(make([]byte, 64<<10), maxConfiguredHTTPBodyBytes+1)
+	scanner.Buffer(make([]byte, 64<<10), maxMCPStdioMessageBytes+1)
 	state := mcpStdioCreated
 	for scanner.Scan() {
 		line := append([]byte(nil), scanner.Bytes()...)
@@ -1793,28 +1983,163 @@ func buildMCPToolDefinition(snapshot *APIConfigSnapshot, toolConfig MCPToolConfi
 }
 
 func normalizedMCPInputSchema(schema map[string]interface{}) map[string]interface{} {
-	var normalized map[string]interface{}
-	if len(schema) == 0 {
-		normalized = map[string]interface{}{
-			"type":                 "object",
-			"properties":           map[string]interface{}{},
-			"additionalProperties": true,
-		}
-	} else {
-		normalized = cloneJSONCompatibleValue(schema).(map[string]interface{})
+	normalized := mcpInputSchemaWithExecutionMode(schema)
+	if _, hasRef := schema["$ref"]; !hasRef {
+		return normalized
 	}
-	// Publish and validate the same optional execution control for both MCP
-	// transports, including APIs whose schema disallows additional properties.
-	// Keep malformed properties intact so schema compilation still rejects them.
+	compiled, err := compileJSONSchema(normalized)
+	if err != nil {
+		return normalized // Leave invalid schemas for the caller's compiler to reject.
+	}
+	// Specialize only references that validate the arguments object itself.
+	// Keep the original definitions intact: a nested property can share them.
+	definitions, _ := schema["$defs"].(map[string]interface{})
+	definitions = cloneParams(definitions)
+	references := make(map[string]string)
+	var extendReference func(map[string]interface{}, *jsonschema.Schema)
+	extendReference = func(current map[string]interface{}, compiled *jsonschema.Schema) {
+		if compiled.Ref == nil {
+			return
+		}
+		// Use the compiler's canonical location, including for local anchors.
+		ref := compiled.Ref.Location
+		if replacement, exists := references[ref]; exists {
+			current["$ref"] = replacement
+			return
+		}
+		location, err := url.Parse(ref)
+		if err != nil || !strings.HasPrefix(location.Fragment, "/") {
+			return
+		}
+		var target interface{} = schema
+		for _, part := range strings.Split(location.Fragment[1:], "/") {
+			part = strings.ReplaceAll(strings.ReplaceAll(part, "~1", "/"), "~0", "~")
+			switch value := target.(type) {
+			case map[string]interface{}:
+				target = value[part]
+			case []interface{}:
+				index, err := strconv.Atoi(part)
+				if err != nil || index < 0 || index >= len(value) {
+					return
+				}
+				target = value[index]
+			default:
+				return
+			}
+			// Moving an embedded resource would change the base of its references.
+			// Keep such resources untouched, as well as nested property schemas.
+			if object, ok := target.(map[string]interface{}); ok {
+				if _, hasID := object["$id"].(string); hasID {
+					return
+				}
+				// Draft-04 uses id for resource and anchor identity. Use the
+				// compiler's resolved dialect, not a keyword-name heuristic.
+				if compiled.Ref.DraftVersion == 4 {
+					if _, hasID := object["id"].(string); hasID {
+						return
+					}
+				}
+			}
+		}
+		source, ok := target.(map[string]interface{})
+		if !ok {
+			return // Boolean schemas and invalid references remain unchanged.
+		}
+		name := "nyan_input"
+		for index := 1; ; index++ {
+			if _, exists := definitions[name]; !exists {
+				break
+			}
+			name = fmt.Sprintf("nyan_input_%d", index)
+		}
+		replacement := "#/$defs/" + name
+		references[ref] = replacement
+		extended := mcpInputSchemaWithExecutionMode(source)
+		// Keep anchor identities on the original definition, including the
+		// dynamic anchor used by recursive children retained below.
+		delete(extended, "$anchor")
+		delete(extended, "$dynamicAnchor")
+		definitions[name] = extended
+		extendReference(extended, compiled.Ref)
+		if reflect.DeepEqual(source, extended) {
+			// tools/list and tools/call normalize stored schemas again.
+			// Reuse an already extended reference rather than growing $defs.
+			delete(definitions, name)
+			references[ref], _ = current["$ref"].(string)
+			return
+		}
+		// Reuse subschemas at their original locations so copying this object
+		// does not duplicate anchors or embedded resources, or rebase their refs.
+		retainMCPInputSubschemaReferences(extended, location)
+		current["$ref"] = replacement
+	}
+	extendReference(normalized, compiled)
+	if len(definitions) != 0 {
+		normalized["$defs"] = definitions
+	}
+	return normalized
+}
+
+func retainMCPInputSubschemaReferences(schema map[string]interface{}, location *url.URL) {
+	reference := func(parts ...string) interface{} {
+		target := *location
+		for _, part := range parts {
+			target.Fragment += "/" + strings.ReplaceAll(strings.ReplaceAll(part, "~", "~0"), "/", "~1")
+		}
+		// Published schemas must also resolve in clients with a different base URI.
+		return map[string]interface{}{"$ref": (&url.URL{Fragment: target.Fragment}).String()}
+	}
+	delete(schema, "$defs")
+	delete(schema, "definitions")
+	for _, keyword := range []string{"properties", "patternProperties", "dependentSchemas", "dependencies"} {
+		if original, ok := schema[keyword].(map[string]interface{}); ok {
+			children := cloneParams(original)
+			for name, child := range children {
+				if keyword == "properties" && name == "nyan_mode" {
+					continue
+				}
+				if _, isSchema := child.(map[string]interface{}); isSchema {
+					children[name] = reference(keyword, name)
+				}
+			}
+			schema[keyword] = children
+		}
+	}
+	for _, keyword := range []string{"allOf", "anyOf", "oneOf", "prefixItems", "items", "additionalItems", "contains", "unevaluatedItems", "additionalProperties", "unevaluatedProperties", "propertyNames", "not", "if", "then", "else", "contentSchema"} {
+		switch value := schema[keyword].(type) {
+		case map[string]interface{}:
+			schema[keyword] = reference(keyword)
+		case []interface{}:
+			children := append([]interface{}(nil), value...)
+			for index, child := range children {
+				if _, isSchema := child.(map[string]interface{}); isSchema {
+					children[index] = reference(keyword, strconv.Itoa(index))
+				}
+			}
+			schema[keyword] = children
+		}
+	}
+}
+
+func mcpInputSchemaWithExecutionMode(schema map[string]interface{}) map[string]interface{} {
+	normalized := make(map[string]interface{}, len(schema)+1)
+	for key, value := range schema {
+		normalized[key] = value
+	}
+	if len(schema) == 0 {
+		normalized["type"] = "object"
+		normalized["additionalProperties"] = true
+	}
 	if _, exists := normalized["properties"]; !exists {
 		normalized["properties"] = map[string]interface{}{}
 	}
-	if properties, ok := normalized["properties"].(map[string]interface{}); ok {
-		properties["nyan_mode"] = map[string]interface{}{
-			"type":        "string",
-			"enum":        []interface{}{"", "checkOnly"},
-			"description": "Run only paramCheck with checkOnly; do not execute the API body, outCheck, or Push. Omit or use an empty string for normal execution.",
+	if source, ok := normalized["properties"].(map[string]interface{}); ok {
+		properties := make(map[string]interface{}, len(source)+1)
+		for key, value := range source {
+			properties[key] = value
 		}
+		properties["nyan_mode"] = map[string]interface{}{"type": "string", "enum": []interface{}{"", "checkOnly"}, "description": "Run only paramCheck with checkOnly; do not execute the API body, outCheck, or Push. Omit or use an empty string for normal execution."}
+		normalized["properties"] = properties
 	}
 	return normalized
 }
@@ -2342,8 +2667,6 @@ func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverCo
 		}
 		if !allowed {
 			execution.CheckRejected, execution.Response = true, checked
-		} else {
-			execution.Response.Status = checked.Status
 		}
 	}
 	return execution, nil
@@ -2588,7 +2911,11 @@ func handleWebSocketWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWri
 	case websocketConnectionSlots <- struct{}{}:
 		defer func() { <-websocketConnectionSlots }()
 	default:
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "too many WebSocket connections", http.StatusServiceUnavailable)
+		return
+	}
+	if !enforceReceiveBodyLimit(w, r) {
 		return
 	}
 	if !checkWebSocketConnection(snapshot, w, r) {
@@ -2599,6 +2926,9 @@ func handleWebSocketWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWri
 		channel = "default"
 	}
 
+	// Handshake checks are complete. Do not retain the buffered HTTP body
+	// throughout the lifetime of the WebSocket connection.
+	r.Body = http.NoBody
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logServiceError(slog.LevelWarn, "websocket_upgrade_failed", err, "channel", channel)
@@ -2608,7 +2938,7 @@ func handleWebSocketWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWri
 	connectionHub := hub
 	connectionHub.AddClient(channel, conn)
 	defer connectionHub.RemoveClient(channel, conn)
-	conn.SetReadLimit(maxWebSocketMessageBytes)
+	conn.SetReadLimit(config.ReceiveLimits.webSocketMessageBytes())
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
@@ -2695,7 +3025,8 @@ func executeWebSocketAPIMessage(r *http.Request, message []byte) (response []byt
 			return webSocketAPIError(http.StatusBadRequest, "Reserved request parameter: "+key)
 		}
 	}
-	if _, err := parseExecutionMode(params); err != nil {
+	mode, err := parseExecutionMode(params)
+	if err != nil {
 		return webSocketAPIError(http.StatusBadRequest, err.Error())
 	}
 	snapshot := currentAPISnapshot()
@@ -2705,6 +3036,9 @@ func executeWebSocketAPIMessage(r *http.Request, message []byte) (response []byt
 	apiConfig, exists := snapshot.Definitions[apiName]
 	if !exists || getAPIType(apiConfig) != apiTypeAPI {
 		return webSocketAPIError(http.StatusNotFound, "API not found")
+	}
+	if mode == "checkOnly" && getParamCheckScriptPath(apiConfig) == "" {
+		return webSocketAPIError(http.StatusNotFound, "No check script for this API")
 	}
 	params["nyan_request"] = scriptHTTPRequestContext(r)
 	result, err := callNyanAPIFromVMWithSnapshot(snapshot, apiName, params)
@@ -4218,7 +4552,7 @@ func runOutCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiConfig APICon
 		return true, http.StatusInternalServerError, "", err
 	}
 	if success {
-		return false, checkStatusCode, "", nil
+		return false, statusCode, "", nil
 	}
 	return true, checkStatusCode, jsonStr, nil
 }
@@ -4267,6 +4601,7 @@ func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 			io.Reader
 			io.Closer
 		}{io.TeeReader(r.Body, &formBody), r.Body}
+		r.Body = http.MaxBytesReader(nil, r.Body, config.ReceiveLimits.httpBodyBytes())
 	}
 	if err := r.ParseForm(); err != nil {
 		return nil, fmt.Errorf("error parsing form data: %v", err)
@@ -4317,15 +4652,20 @@ func handlePublicRequest(w http.ResponseWriter, r *http.Request, apiKey string, 
 func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request, apiKey string, requestedPath string, apiConfig APIConfig) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
+		closeUnreadRequestBody(w, r)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	publicPath := strings.TrimSpace(apiConfig.Path)
 	if publicPath == "" {
+		closeUnreadRequestBody(w, r)
 		sendJSONError(w, "public path is missing", http.StatusInternalServerError)
 		return
 	}
 
+	if !enforceReceiveBodyLimit(w, r) {
+		return
+	}
 	params, err := collectRequestParams(r)
 	if err != nil {
 		sendJSONError(w, "Invalid JSON data", http.StatusBadRequest)
@@ -4342,9 +4682,7 @@ func handlePublicRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.Respons
 
 	checkScriptPath := getParamCheckScriptPath(apiConfig)
 	if checkScriptPath == "" && mode == "checkOnly" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"success":true,"status":200,"result":null}`))
+		sendJSONError(w, "No check script for this API", http.StatusNotFound)
 		return
 	}
 	if checkScriptPath != "" {
@@ -5136,6 +5474,7 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 	if err != nil {
 		return fmt.Errorf("dial failed: %w", err)
 	}
+	conn.SetReadLimit(config.ReceiveLimits.webSocketMessageBytes())
 	if !runtime.acceptConnection(conn, cfg.connectURL) {
 		_ = conn.Close()
 		return nil
@@ -5922,10 +6261,11 @@ func basicAuth(next http.HandlerFunc, config Config) http.HandlerFunc {
 		user, pass, ok := r.BasicAuth()
 		if !ok || !checkPassword(user, pass, config) {
 			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+			closeUnreadRequestBody(w, r)
 			sendJSONError(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next(w, r)
+		receiveLimitHandler(next).ServeHTTP(w, r)
 	}
 }
 
@@ -7613,6 +7953,8 @@ func restrictNyanRuntimeCapabilities(vm *goja.Runtime, capabilities []string) {
 		"nyanGetFile",
 		"nyanCallMe",
 		"nyanSaveFile",
+		"nyanWriteTextFile",
+		"nyanWriteBase64File",
 	} {
 		vm.Set(functionName, goja.Undefined())
 	}
@@ -8063,7 +8405,7 @@ func execCommand(commandLine string) (*ExecResult, error) {
 // コマンドを実行し、JSON タグに沿ったマップとして結果を返します。
 func nyanHostExecWrapper(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	if len(call.Arguments) < 1 {
-		panic(vm.ToValue("exec: No command provided"))
+		panic(vm.NewTypeError("nyanHostExec: command required"))
 	}
 	// コマンドライン文字列を取得
 	commandLine := call.Argument(0).String()
@@ -8410,6 +8752,16 @@ func respondJSONRPCError(w http.ResponseWriter, id interface{}, code int, messag
 	json.NewEncoder(w).Encode(resp)
 }
 
+// JSON-RPC requires a response body. Keep the check result's own status intact.
+func jsonRPCResponseStatus(status int) int {
+	switch status {
+	case http.StatusNoContent, http.StatusResetContent, http.StatusNotModified:
+		return http.StatusOK
+	default:
+		return status
+	}
+}
+
 func respondJSONRPCResultJSON(w http.ResponseWriter, id interface{}, statusCode int, jsonStr string) {
 	var result interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
@@ -8422,7 +8774,7 @@ func respondJSONRPCResultJSON(w http.ResponseWriter, id interface{}, statusCode 
 		ID:      id,
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
+	w.WriteHeader(jsonRPCResponseStatus(statusCode))
 	if err := json.NewEncoder(w).Encode(rpcResp); err != nil {
 		logServiceError(slog.LevelError, "jsonrpc_response_encode_failed", err)
 	}
@@ -8527,7 +8879,7 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 				ID:      rpcReq.ID,
 			}
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(statusCode)
+			w.WriteHeader(jsonRPCResponseStatus(statusCode))
 			json.NewEncoder(w).Encode(rpcResp)
 			return
 		}
@@ -8655,7 +9007,7 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		ID:      rpcReq.ID,
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
+	w.WriteHeader(jsonRPCResponseStatus(statusCode))
 	if err := json.NewEncoder(w).Encode(rpcResp); err != nil {
 		logServiceError(slog.LevelError, "jsonrpc_response_encode_failed", err)
 	}
@@ -8778,6 +9130,11 @@ func saveBase64ToFileWithSnapshot(snapshot *APIConfigSnapshot, destPath, b64 str
 }
 
 func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map[string]interface{}, acceptedParamsKeys []string) {
+	writerRoot := ""
+	if snapshot != nil {
+		writerRoot = snapshot.RootPath
+	}
+	registerNyanFileWriters(vm, writerRoot)
 	if params == nil {
 		params = make(map[string]interface{})
 	}
@@ -8820,10 +9177,11 @@ func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map
 		},
 	})
 	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
-		var url, username, password string
-		if len(call.Arguments) >= 1 {
-			url = call.Argument(0).String()
+		if len(call.Arguments) == 0 {
+			panic(vm.NewTypeError("nyanGetAPI requires a URL"))
 		}
+		url := call.Argument(0).String()
+		var username, password string
 		if len(call.Arguments) >= 2 {
 			username = call.Argument(1).String()
 		}
@@ -9045,7 +9403,12 @@ func registerNyanCryptographicFunctions(vm *goja.Runtime) {
 		}
 		return vm.ToValue(value)
 	})
-	vm.Set("nyanSHA256Base64URL", func(call goja.FunctionCall) goja.Value { return vm.ToValue(sha256Base64URL(call.Argument(0).String())) })
+	vm.Set("nyanSHA256Base64URL", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) == 0 {
+			panic(vm.NewTypeError("nyanSHA256Base64URL requires a string"))
+		}
+		return vm.ToValue(sha256Base64URL(call.Argument(0).String()))
+	})
 	vm.Set("nyanArgon2idHash", func(call goja.FunctionCall) goja.Value {
 		value, err := hashPasswordArgon2ID(call.Argument(0).String())
 		if err != nil {
@@ -9089,6 +9452,8 @@ func timingSafeStringEqual(left, right string) bool {
 	return subtle.ConstantTimeCompare(leftDigest[:], rightDigest[:]) == 1 && len(left) == len(right)
 }
 
+var oauthArgon2Slots = make(chan struct{}, 2)
+
 func hashPasswordArgon2ID(password string) (string, error) {
 	if password == "" {
 		return "", fmt.Errorf("password must not be empty")
@@ -9100,6 +9465,8 @@ func hashPasswordArgon2ID(password string) (string, error) {
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
 		return "", fmt.Errorf("generate password salt: %w", err)
 	}
+	oauthArgon2Slots <- struct{}{}
+	defer func() { <-oauthArgon2Slots }()
 	hash := argon2.IDKey([]byte(password), salt, argon2TimeCost, argon2MemoryKiB, argon2Parallelism, argon2KeyLength)
 	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
 		argon2.Version,
@@ -9112,32 +9479,7 @@ func hashPasswordArgon2ID(password string) (string, error) {
 }
 
 func verifyPasswordArgon2ID(password, encoded string) (bool, error) {
-	parts := strings.Split(encoded, "$")
-	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" {
-		return false, fmt.Errorf("invalid Argon2id hash format")
-	}
-	var version int
-	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil || version != argon2.Version {
-		return false, fmt.Errorf("unsupported Argon2id version")
-	}
-	var memory, timeCost uint32
-	var parallelism uint8
-	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &timeCost, &parallelism); err != nil {
-		return false, fmt.Errorf("invalid Argon2id parameters")
-	}
-	if memory < argon2MemoryKiB || memory > 256*1024 || timeCost < argon2TimeCost || timeCost > 10 || parallelism < 1 || parallelism > 16 {
-		return false, fmt.Errorf("unsafe Argon2id parameters")
-	}
-	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
-	if err != nil || len(salt) < argon2SaltLength || len(salt) > 64 {
-		return false, fmt.Errorf("invalid Argon2id salt")
-	}
-	expected, err := base64.RawStdEncoding.DecodeString(parts[5])
-	if err != nil || len(expected) < 16 || len(expected) > 64 {
-		return false, fmt.Errorf("invalid Argon2id hash")
-	}
-	actual := argon2.IDKey([]byte(password), salt, timeCost, memory, parallelism, uint32(len(expected)))
-	return subtle.ConstantTimeCompare(actual, expected) == 1, nil
+	return verifyBoundedArgon2id(password, encoded)
 }
 
 func sha256Hash(input string) string {
@@ -9148,4 +9490,205 @@ func sha256Hash(input string) string {
 func sha1Hash(input string) string {
 	hash := sha1.Sum([]byte(input))
 	return hex.EncodeToString(hash[:])
+}
+
+// New file writers have one contract across the three products. Legacy
+// nyanSaveFile retains its product-specific arguments and return value.
+func registerNyanFileWriters(vm *goja.Runtime, rootAPIPath string) {
+	baseDir := ""
+	if filepath.IsAbs(rootAPIPath) {
+		baseDir = filepath.Dir(rootAPIPath)
+	}
+	for _, name := range []string{"nyanWriteTextFile", "nyanWriteBase64File"} {
+		vm.Set(name, func(call goja.FunctionCall) goja.Value {
+			if len(call.Arguments) < 2 {
+				panic(vm.NewTypeError("%s(path, data) requires 2 string arguments", name))
+			}
+			pathValue, pathOK := call.Argument(0).(goja.String)
+			dataValue, dataOK := call.Argument(1).(goja.String)
+			if !pathOK || strings.TrimSpace(pathValue.String()) == "" {
+				panic(vm.NewTypeError("%s: path must be a non-empty string", name))
+			}
+			if !dataOK {
+				panic(vm.NewTypeError("%s: data must be a string", name))
+			}
+			path, text := pathValue.String(), dataValue.String()
+			data := []byte(text)
+			if name == "nyanWriteBase64File" {
+				var err error
+				data, err = base64.StdEncoding.DecodeString(text)
+				if err != nil {
+					panic(vm.NewTypeError("%s: invalid standard Base64 data", name))
+				}
+			}
+			if !filepath.IsAbs(path) {
+				if baseDir == "" {
+					panic(vm.NewGoError(fmt.Errorf("root API configuration path is unavailable for relative file paths")))
+				}
+				path = filepath.Join(baseDir, path)
+			}
+			if err := writeNyanFileAtomically(path, data); err != nil {
+				panic(vm.NewGoError(fmt.Errorf("%s: %w", name, err)))
+			}
+			return vm.ToValue(true)
+		})
+	}
+}
+
+// Write beside the destination and replace it only after the complete content
+// has been written and synced. The destination is never opened for truncation.
+func writeNyanFileAtomically(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".nyan-write-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = temporary.Close()
+		}
+		_ = os.Remove(temporaryPath)
+	}()
+	if err := temporary.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		return err
+	}
+	err = temporary.Close()
+	closed = true
+	if err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
+}
+
+// Verification limits are independent of the settings used to generate new hashes.
+// Accept NyanQL's existing numeric ranges, with a canonical PHC representation.
+type parsedArgon2idHash struct {
+	memory      uint32
+	iterations  uint32
+	parallelism uint8
+	salt        []byte
+	digest      []byte
+}
+
+func parseArgon2idHash(encoded string) (parsedArgon2idHash, error) {
+	var parsed parsedArgon2idHash
+	// Each 64-byte unpadded Base64 field is at most 86 characters.
+	const maxEncodedLength = len("$argon2id$v=19$m=262144,t=10,p=16$") + 86 + 1 + 86
+	if len(encoded) > maxEncodedLength {
+		return parsed, fmt.Errorf("Argon2id hash is too long")
+	}
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" || parts[2] != "v=19" {
+		return parsed, fmt.Errorf("invalid Argon2id hash format or version")
+	}
+	parameters := strings.Split(parts[3], ",")
+	if len(parameters) != 3 {
+		return parsed, fmt.Errorf("invalid Argon2id parameters")
+	}
+	var values [3]uint64
+	for i, name := range []string{"m=", "t=", "p="} {
+		if !strings.HasPrefix(parameters[i], name) {
+			return parsed, fmt.Errorf("invalid Argon2id parameters")
+		}
+		number := strings.TrimPrefix(parameters[i], name)
+		value, err := strconv.ParseUint(number, 10, 32)
+		if err != nil || strconv.FormatUint(value, 10) != number {
+			return parsed, fmt.Errorf("invalid Argon2id parameters")
+		}
+		values[i] = value
+	}
+	if values[0] < 65536 || values[0] > 262144 || values[1] < 3 || values[1] > 10 || values[2] < 1 || values[2] > 16 {
+		return parsed, fmt.Errorf("unsafe Argon2id parameters")
+	}
+	parsed.memory, parsed.iterations, parsed.parallelism = uint32(values[0]), uint32(values[1]), uint8(values[2])
+	decode := func(text string, minimum int) ([]byte, error) {
+		if len(text) < base64.RawStdEncoding.EncodedLen(minimum) || len(text) > base64.RawStdEncoding.EncodedLen(64) {
+			return nil, fmt.Errorf("invalid Argon2id field length")
+		}
+		data, err := base64.RawStdEncoding.Strict().DecodeString(text)
+		if err != nil || len(data) < minimum || len(data) > 64 || base64.RawStdEncoding.EncodeToString(data) != text {
+			return nil, fmt.Errorf("invalid Argon2id Base64 field")
+		}
+		return data, nil
+	}
+	var err error
+	parsed.salt, err = decode(parts[4], 16)
+	if err != nil {
+		return parsed, err
+	}
+	parsed.digest, err = decode(parts[5], 16)
+	if err != nil {
+		return parsed, err
+	}
+	return parsed, nil
+}
+
+func verifyBoundedArgon2id(password, encoded string) (bool, error) {
+	if len(password) > 4096 {
+		return false, fmt.Errorf("password is too long")
+	}
+	parsed, err := parseArgon2idHash(encoded)
+	if err != nil {
+		return false, err
+	}
+	// Validate before waiting for a slot or allocating Argon2's work memory.
+	oauthArgon2Slots <- struct{}{}
+	defer func() { <-oauthArgon2Slots }()
+	actual := argon2.IDKey([]byte(password), parsed.salt, parsed.iterations, parsed.memory, parsed.parallelism, uint32(len(parsed.digest)))
+	return subtle.ConstantTimeCompare(actual, parsed.digest) == 1, nil
+}
+
+func receiveLimitHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if enforceReceiveBodyLimit(w, r) {
+			next.ServeHTTP(w, r)
+		}
+	})
+}
+
+func newServiceHTTPHandler() http.Handler {
+	mux := http.NewServeMux()
+	// Mark registered routes so mux-generated redirects can be identified
+	// without duplicating ServeMux's escaped-path and trailing-slash rules.
+	type serviceRoute struct{ http.Handler }
+	register := func(pattern string, handler http.Handler) {
+		mux.Handle(pattern, &serviceRoute{Handler: handler})
+	}
+	corsHandler := cors.New(cors.Options{
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"GET", "POST", "OPTIONS", "PUT", "DELETE"},
+		AllowedHeaders: []string{"Content-Type", "Authorization", "MCP-Protocol-Version", "MCP-Session-Id", "Last-Event-ID"},
+		ExposedHeaders: []string{"WWW-Authenticate", "MCP-Protocol-Version", "Retry-After"},
+	})
+
+	register("/nyan-rpc", corsHandler.Handler(http.HandlerFunc(basicAuth(handleJSONRPC, config))))
+
+	register("/nyan/", corsHandler.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		basicAuth(handleNyanOrDetail, config)(w, r)
+	})))
+
+	register("/", corsHandler.Handler(http.HandlerFunc(unifiedHandler)))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// CORS preflight returns before route admission and never consumes a body.
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			closeUnreadRequestBody(w, r)
+		}
+		handler, _ := mux.Handler(r)
+		if _, registered := handler.(*serviceRoute); !registered {
+			// Redirects and other mux-generated replies do not consume bodies.
+			closeUnreadRequestBody(w, r)
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
