@@ -6,6 +6,10 @@ NyanQL（にゃんくる）は、SQLを書くだけで、データベースに�
 
 NyanQLでは、APIを呼び出すと、`api.json` に紐づけられたSQLファイル、またはJavaScriptファイルが実行されます。SQLの実行結果はJSONで返ります。検索だけでなく、登録・更新・削除、複数SQLのトランザクション、JavaScriptによる複雑な処理、WebSocketによるPush配信にも対応しています。
 
+このREADMEは、Version1方針を反映したリポジトリの現行ソースを説明します。配布バイナリを使う場合は、ダウンロードしたリリースと同じタグのREADME・リリースノートを参照してください。現行ソースの機能が過去のバイナリにも含まれるとは限りません。`config.json` の `version` はサービスの表示用設定値で、バイナリの版を判定する値ではありません。
+
+はじめに：[入手とビルド](#インストールと起動) → [最小起動例](#quickstart)。機能別：[MCPの設定](#mcp-setup)、[公開・運用の前提](#deployment)。
+
 ---
 
 ## NyanQLでできること
@@ -108,17 +112,19 @@ GitHub Releasesから、使っているOSに合うファイルをダウンロー
 
 https://github.com/NyanQL/NyanQL/releases
 
-ソースからビルドする場合は、Goの開発環境を用意してからビルドしてください。
+ソースからビルドする場合は、[go.mod](go.mod)に記載されたGoバージョン（現時点では1.26.9）と、対象OS/CPU向けのC/C++コンパイラを用意してください。SQLite・DuckDBのネイティブ依存があるためCGOが必要です。macOSはXcode Command Line Tools、LinuxはC/C++開発ツール、Windowsは対応するMinGW-w64等が必要です。別OS向けのビルドには対応するクロスコンパイラも必要です。DBTypeを変更してもビルド時のネイティブ依存はなくなりません。
 
 ```bash
 git clone https://github.com/NyanQL/NyanQL.git
 cd NyanQL
-go build -o nyanql
+CGO_ENABLED=1 go build -o nyanql .
 ```
+
+WindowsのPowerShellでは `$env:CGO_ENABLED="1"` を設定して `go build -o nyanql.exe .` を実行します。配布バイナリを利用する場合、Goやコンパイラは不要です。配布物のOS/CPUと必要な実行時ライブラリは、該当リリースで確認してください。
 
 ### 2. 設定ファイルを用意する
 
-少なくとも次の2つのファイルを用意します。
+少なくとも次の2つのファイルを用意します。最初の確認には[最小起動例](#quickstart)を使用してください。同梱の業務・background例を使う場合は、参照するSQL/JSの実在、DBテーブル、接続URL、cron式を用途に合わせて確認・準備します。
 
 - `config.json`
 - `api.json`
@@ -156,6 +162,57 @@ NYAN_API_PATH=/path/to/api.json \
 Windowsでは、ビルド済みの実行ファイルをダブルクリックして起動することもできます。ただし、動作確認やエラー確認をしやすくするため、最初はターミナルから起動することをおすすめします。
 
 ---
+
+<a id="quickstart"></a>
+### 最小起動例：テーブルを作らずSQLを実行する
+
+実行ファイルのあるディレクトリに、新しい `quickstart` フォルダを作り、次の3ファイルを保存します。既存の同梱 `config.json`・`api.json` やサンプルDBは使いません。以下のシェル例はmacOS/Linux用です。Windowsでは実行ファイルを `.\nyanql.exe` に読み替えてください。
+
+`quickstart/config.json`：
+
+```json
+{
+  "name": "NyanQL quickstart",
+  "Port": 8080,
+  "DBType": "sqlite",
+  "DBName": "./demo.sqlite",
+  "BasicAuth": {"Username": "demo", "Password": "local-demo-only"},
+  "javascript_include": [],
+  "log": {"EnableLogging": false, "Level": "info"}
+}
+```
+
+`quickstart/api.json`：
+
+```json
+{
+  "hello": {"sql": ["./hello.sql"], "description": "SQLの動作確認"}
+}
+```
+
+`quickstart/hello.sql`：
+
+```sql
+SELECT 1 AS ok;
+```
+
+起動すると `quickstart/demo.sqlite` を作成します。外部DBには接続せず、テーブル作成や初期データも不要です。HTTPは全インターフェースで待ち受けるため、この例は信頼できるローカル環境で確認し、外部公開前に[公開・運用の前提](#deployment)を確認してください。
+
+```bash
+./nyanql --config ./quickstart/config.json --api ./quickstart/api.json
+```
+
+別のターミナルで確認します。
+
+```bash
+curl -u demo:local-demo-only http://127.0.0.1:8080/hello
+```
+
+HTTP 200で次のJSONが返ります（キーの順序は問いません）。終了は起動したターミナルで `Ctrl+C` です。`items` 等の業務テーブルを使う前述の例へ進む場合は、別途そのテーブルとデータを用意してください。
+
+```json
+{"success":true,"status":200,"result":[{"ok":1}]}
+```
 
 ## config.json
 
@@ -905,7 +962,7 @@ const nyanInputSchema = {
 };
 ```
 
-同一ファイル内の別の `const` を参照する場合も、現時点では動的な参照として扱います。明示スキーマが動的、非オブジェクト、重複宣言などで静的に取得できない場合でも、API設定の読み込みは妨げません。対象の `/nyan/{API名}` を取得したときにスキーマ解決エラーを返します。ファイルを修正すれば、次の詳細取得から正常なスキーマが返ります。なお、スキーマ抽出とは別に、paramCheckやoutCheckのJavaScript本体は従来どおり実行可能なコードである必要があります。
+同一ファイル内の別の `const` を参照する場合も、現時点では動的な参照として扱います。通常APIとしてだけ使用する場合、明示スキーマが動的、非オブジェクト、重複宣言などで静的に取得できなくても、API設定の読み込みは妨げず、`/nyan/{API名}` の取得時にスキーマ解決エラーを返します。一方、MCP Toolから参照するAPIは、設定読込時にもスキーマを解決し、入力スキーマを検証します。不正なら起動時は設定エラー、ホットリロード時は候補を採用せず直前の設定を維持します。ファイル修正後の詳細取得はその内容を読み直します。paramCheckやoutCheckのJavaScript本体も実行可能なコードである必要があります。
 
 ---
 
@@ -1505,6 +1562,101 @@ console.log(
 
 ---
 
+<a id="mcp-setup"></a>
+## MCPサーバーの設定
+
+`type: "mcp"` の `tools` に、**実在するscriptを持つ通常API**の名前を指定します。SQLだけのAPIは直接指定できません。SQLを利用するToolはJavaScriptから `nyanRunSQL` を呼びます。入力スキーマを自動検証し、設定されたparamCheck/outCheckを実行します。出力スキーマは公開用で、QLでは本体結果を自動検証しません。
+
+### stdioで試す
+
+[最小起動例](#quickstart)のconfigを使い、次の2ファイルを追加します。JavaScriptだけのToolでも起動時にDBへ接続するため、DB設定は必要です。
+
+`quickstart/mcp-tool.js`：
+
+```javascript
+({status: 200, result: {message: "Hello, MCP!"}});
+```
+
+`quickstart/mcp-api.json`：
+
+```json
+{
+  "hello": {"script": "./mcp-tool.js", "description": "固定メッセージを返す"},
+  "local_mcp": {"type": "mcp", "transport": "stdio", "tools": ["hello"]}
+}
+```
+
+```bash
+./nyanql --config ./quickstart/config.json --api ./quickstart/mcp-api.json --mcp-server local_mcp
+```
+
+標準入力に次のJSONを1行ずつ渡せます。initializeの応答後にinitialized通知を送り、Tool一覧・呼出しへ進みます。Tool呼出しの応答には `Hello, MCP!` が含まれます。
+
+```jsonl
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"readme-demo","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"hello","arguments":{}}}
+```
+
+stdioでは標準出力がMCP専用です。サービスログは標準エラーまたは設定したログファイルへ出ます。HTTP待受・schedule・ws_client・ホットリロードは開始しません。設定変更時は再起動します。
+
+### Streamable HTTPと設定フィールド
+
+同じToolをHTTPで試す場合、上の `local_mcp` 定義を次に置き換え、`--mcp-server` を付けずに起動します。このJSONはAPI定義の一部分です。
+
+```json
+{
+  "local_mcp": {
+    "type": "mcp",
+    "transport": "streamable_http",
+    "allowedOrigins": ["https://example.com"],
+    "tools": ["hello"]
+  }
+}
+```
+
+接続先は `http://127.0.0.1:8080/local_mcp` です。`allowedOrigins` はブラウザの許可Originであり、公開URLを指定する項目ではありません。この例はOAuth未設定で、MCPの呼出しに通常APIのBasic認証は適用されません。認証なしの動作確認用なので、そのまま外部公開しないでください。
+
+```bash
+curl http://127.0.0.1:8080/local_mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-11-25' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+| 項目 | 内容 |
+|---|---|
+| `transport` | `stdio` または `streamable_http`。必須 |
+| `tools` | scriptを持つ通常API名の配列。1件以上。include先は完全名 |
+| `protocolVersions` | 省略時 `2025-11-25` と `2025-06-18`。この2版に対応 |
+| `allowedOrigins` | HTTPで必須。HTTPSのOrigin配列。path/query/fragmentを含めない |
+| `instructions` | initializeに返す利用説明 |
+| `rateLimit` | `{"requests":120,"window":"1m"}` 等。requestsは1〜10000、windowは1秒〜24時間 |
+| `maxConcurrent` | 1〜256。省略時/0は16 |
+| `oauth` | 下記の通常APIへの役割参照。HTTPのみ |
+| `redirectURIAllowedPrefixes` | OAuthで必須。HTTPSで末尾`/`のredirect URI prefix配列 |
+
+対応メソッドはinitialize・ping・tools/list・tools/callです。HTTPはstatelessで、バッチ要求やセッション管理は提供しません。Toolのtitle・description・securitySchemes・annotations、paramCheck/outCheckのスキーマは参照先APIから解決します。旧 `http` 設定、MCPの `path` / `resource` は使用しません。
+
+### OAuth hookを実装する場合
+
+OAuth設定は認証処理そのものを生成しません。利用者認証、PKCE、認可コードの一回限り消費、token発行・期限・scopeの検証はアプリケーションのJavaScriptで実装します。MCP定義の `oauth` に次の役割を、それぞれ異なる通常API名で指定します。
+
+| oauthのキー | 参照先の役割 |
+|---|---|
+| `authorizationServerMetadata` / `protectedResourceMetadata` | Goがメタデータを生成するAPI。script不要 |
+| `authorize` / `token` / `register` | 認可・token・クライアント登録を行うscript付きAPI |
+| `verifyAccess` | access tokenと要求scopeを検証するscript付きAPI。API定義の `scopes` に許可scopeを列挙 |
+| `adminUser` | 任意の管理用API。設定時はloopbackからの接続とconfigのBasic認証が必要 |
+
+OAuthを使う各Toolには `securitySchemes: [{"type":"oauth2","scopes":["example:read"]}]` 等のscopeを宣言し、verifyAccess側のscopesに含めます。hookは `nyanAllParams` の `oauth_hook`、`oauth_api`、`issuer`、`resource`、`scopes` 等を参照できます。HTTP hookにはmethod/query/form/body/cookies/headersが渡り、query/formの各値は配列です。verifyAccessには `authorization`、`tool`、`required_scopes` と `nyan_request` が渡ります。
+
+HTTP hookは `{status, contentType, headers, body}` を返します（status省略時200、指定時は100〜599の整数）。例えば拒否応答は `({status:400,contentType:"application/json",body:{error:"invalid_request"}});` です。verifyAccessはHTTP応答ではなく `{authenticated:true,principal:{...}}` または拒否の `{authenticated:false}` を返します。認証成功にはprincipalも必要です。JSオブジェクトと、それをJSON化した文字列を利用できます。チェックの `{success,status,result}` とは別の契約です。
+
+OAuthのscriptと前後チェックは、通常APIより機能を制限したVMで実行します。各参照先APIの `runtime` に `capabilities`（`sql`・`crypto`・`password`）を指定し、`sql`を使う場合は `sqlFiles` に許可SQLファイルを列挙します。`settings` は `nyanRuntimeSettings` から取得できます。例えば `"runtime":{"capabilities":["crypto","password"],"settings":{}}` です。外部HTTP、HostExec、汎用ファイル操作、nyanCallMeは利用できず、実行上限は15秒です。通常API全体を隔離する設定ではありません。
+
 ## JSON-RPC
 
 NyanQLは、通常のHTTP APIに加えて、JSON-RPC 2.0形式でも呼び出せます。
@@ -1537,9 +1689,18 @@ curl -u admin:secret \
 
 ---
 
+<a id="deployment"></a>
 ## セキュリティ上の注意
 
-NyanQLは、SQLやJavaScriptを使って強力なAPIを手軽に作れます。そのぶん、設定や公開範囲には注意が必要です。
+NyanQLは信頼できる管理者が用意したSQL・JavaScriptを、サービス実行ユーザーの権限で実行します。config、include先を含むAPI定義、共通JSとその配置先も、信頼できる管理者だけが書き換えられるようにしてください。
+
+通常HTTPは全インターフェースで待ち受けます。localhostへのアクセス例は、他の端末からの到達を制限する設定ではありません。OSのファイアウォール等で到達元を制限し、公開する入口を選んでください。
+
+通常API・JSON-RPCのBasic認証、publicのparamCheck、WebSocketの接続前チェック、MCPのOAuthは別々の保護です。MCP Toolの参照先は通常APIとしても存在するため、MCPだけの設定で全経路が保護されるわけではありません。publicとWS購読には通常APIのBasic認証を適用しないため、必要な認証をparamCheckで行います。CORSやOrigin制限は利用者認証の代わりにはなりません。
+
+MCP/OAuthの公開URLは実際のリクエストのTLS接続とHostから生成し、X-Forwarded-Proto等で自動補正しません。直接TLSで受けるか、proxyからNyanQLまでもTLSを使い公開Hostを保つなど、発行されるissuer/resource URLが公開URLと一致する構成を確認してください。
+
+DB接続の暗号化はHTTPのHTTPS設定とは別です。現在のPostgreSQL接続は `sslmode=disable`、MySQLの接続文字列もTLSを指定しません。別ホストのDBへ接続する場合は、信頼できる隔離された通信経路を用意し、DBユーザーへ必要な権限だけを与えてください。SQLite/DuckDBのファイルとバックアップも公開フォルダから分離します。
 
 - Basic認証のユーザ名とパスワードは、公開環境では必ず変更してください。
 - `nyanHostExec` はOSコマンドを実行できるため、外部入力をそのまま渡さないでください。
