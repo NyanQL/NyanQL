@@ -572,7 +572,7 @@ var db *sql.DB
 var apiSnapshot atomic.Pointer[APIConfigSnapshot]
 var backgroundRuntimes *backgroundRuntimeManager
 var dbType string
-var buildVersion = "v0.0.22"
+var buildVersion = "v1.0.23"
 
 type serviceFilePath struct {
 	Path   string
