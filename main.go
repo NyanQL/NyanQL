@@ -242,28 +242,69 @@ func newConfiguredHTTPServer(address string, handler http.Handler, timeouts HTTP
 	}
 }
 
+// SQLResultLimitsConfig applies to each SQL result converted by RowsToJSON.
+// Zero preserves the existing defaults; positive values may raise or lower them.
+type SQLResultLimitsConfig struct {
+	MaxRows  int `json:"maxRows"`
+	MaxBytes int `json:"maxBytes"`
+}
+
+func (limits *SQLResultLimitsConfig) UnmarshalJSON(data []byte) error {
+	type plain SQLResultLimitsConfig
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return fmt.Errorf("sqlResultLimits: %w", err)
+	}
+	if decoded.MaxRows < 0 {
+		return fmt.Errorf("sqlResultLimits.maxRows must be a non-negative integer")
+	}
+	if decoded.MaxBytes < 0 {
+		return fmt.Errorf("sqlResultLimits.maxBytes must be a non-negative integer byte count")
+	}
+	*limits = SQLResultLimitsConfig(decoded)
+	return nil
+}
+
+func (limits SQLResultLimitsConfig) rowLimit() int {
+	if limits.MaxRows > 0 {
+		return limits.MaxRows
+	}
+	return defaultSQLJSONRows
+}
+
+func (limits SQLResultLimitsConfig) byteLimit() int {
+	if limits.MaxBytes > 0 {
+		return limits.MaxBytes
+	}
+	return defaultSQLJSONBytes
+}
+
 type Config struct {
-	HTTPTimeouts           HTTPTimeoutsConfig  `json:"httpTimeouts"`
-	ReceiveLimits          ReceiveLimitsConfig `json:"receiveLimits"`
-	Name                   string              `json:"name"`
-	Profile                string              `json:"profile"`
-	Version                string              `json:"version"`
-	Port                   int                 `json:"Port"`
-	CertPath               string              `json:"CertPath"`
-	KeyPath                string              `json:"KeyPath"`
-	DatabaseType           string              `json:"DBType"`
-	DBUsername             string              `json:"DBUser"`
-	DBPassword             string              `json:"DBPassword"`
-	DBName                 string              `json:"DBName"`
-	DBHost                 string              `json:"DBHost"`
-	DBPort                 string              `json:"DBPort"`
-	MaxOpenConnections     int                 `json:"MaxOpenConnections"`
-	MaxIdleConnections     int                 `json:"MaxIdleConnections"`
-	ConnMaxLifetimeSeconds int                 `json:"ConnMaxLifetimeSeconds"`
-	BasicAuth              BasicAuthConfig     `json:"BasicAuth"`
-	Log                    LogConfig           `json:"log"`
-	JavascriptInclude      []string            `json:"javascript_include,omitempty"`
-	APIHotReload           APIHotReloadConfig  `json:"APIHotReload"`
+	HTTPTimeouts           HTTPTimeoutsConfig    `json:"httpTimeouts"`
+	ReceiveLimits          ReceiveLimitsConfig   `json:"receiveLimits"`
+	SQLResultLimits        SQLResultLimitsConfig `json:"sqlResultLimits"`
+	Name                   string                `json:"name"`
+	Profile                string                `json:"profile"`
+	Version                string                `json:"version"`
+	Port                   int                   `json:"Port"`
+	CertPath               string                `json:"CertPath"`
+	KeyPath                string                `json:"KeyPath"`
+	DatabaseType           string                `json:"DBType"`
+	DBUsername             string                `json:"DBUser"`
+	DBPassword             string                `json:"DBPassword"`
+	DBName                 string                `json:"DBName"`
+	DBHost                 string                `json:"DBHost"`
+	DBPort                 string                `json:"DBPort"`
+	MaxOpenConnections     int                   `json:"MaxOpenConnections"`
+	MaxIdleConnections     int                   `json:"MaxIdleConnections"`
+	ConnMaxLifetimeSeconds int                   `json:"ConnMaxLifetimeSeconds"`
+	BasicAuth              BasicAuthConfig       `json:"BasicAuth"`
+	Log                    LogConfig             `json:"log"`
+	JavascriptInclude      []string              `json:"javascript_include,omitempty"`
+	JavascriptIncludeCache bool                  `json:"javascript_include_cache,omitempty"`
+	APIHotReload           APIHotReloadConfig    `json:"APIHotReload"`
+	// Prepared before serving requests; the source is immutable until restart.
+	cachedJavascriptIncludes *string
 }
 
 type APIHotReloadConfig struct {
@@ -572,7 +613,7 @@ var db *sql.DB
 var apiSnapshot atomic.Pointer[APIConfigSnapshot]
 var backgroundRuntimes *backgroundRuntimeManager
 var dbType string
-var buildVersion = "v1.0.24"
+var buildVersion = "v1.0.25"
 
 type serviceFilePath struct {
 	Path   string
@@ -598,8 +639,8 @@ const (
 	mcpProtocolVersion20251125       = "2025-11-25"
 	maxMCPStdioMessageBytes          = 1 << 20
 	maxConfiguredHTTPResponseBytes   = 4 << 20
-	maxSQLJSONRows                   = 10000
-	maxSQLJSONBytes                  = maxConfiguredHTTPResponseBytes
+	defaultSQLJSONRows               = 10000
+	defaultSQLJSONBytes              = 4 << 20
 	maxRestrictedScriptRuntime       = 15 * time.Second
 	maxWebSocketConnections          = 128
 	webSocketWriteTimeout            = 5 * time.Second
@@ -728,6 +769,9 @@ func main() {
 	adjustPaths(configBaseDir, &config)
 	if err := setupLogger(configBaseDir); err != nil {
 		fatalServiceError("Invalid log.Level: expected debug, info, warn, or error", err)
+	}
+	if err := config.prepareJavascriptIncludes(); err != nil {
+		fatalServiceError("javascript_include_load_failed", err)
 	}
 	serviceLog(slog.LevelInfo, "starting", "binary_version", buildVersion, "go_version", runtime.Version(), "config_version", config.Version)
 	serviceLog(slog.LevelInfo, "config_loaded", "file", paths.Config.Path, "source", paths.Config.Source)
@@ -6180,6 +6224,8 @@ func scanBalancedSQLValue(s string, start int, open byte, close byte) int {
 }
 
 func RowsToJSON(rows *sql.Rows) ([]byte, error) {
+	limits := config.SQLResultLimits
+	maxRows, maxBytes := limits.rowLimit(), limits.byteLimit()
 	columns, err := rows.Columns()
 	if err != nil {
 		return nil, err
@@ -6191,8 +6237,8 @@ func RowsToJSON(rows *sql.Rows) ([]byte, error) {
 
 	estimatedJSONBytes := 2
 	for rows.Next() {
-		if len(results) >= maxSQLJSONRows {
-			return nil, fmt.Errorf("SQL result exceeds the maximum row count of %d", maxSQLJSONRows)
+		if len(results) >= maxRows {
+			return nil, fmt.Errorf("SQL result exceeds the maximum row count of %d", maxRows)
 		}
 		for i := range columns {
 			valuePtrs[i] = &values[i]
@@ -6207,8 +6253,8 @@ func RowsToJSON(rows *sql.Rows) ([]byte, error) {
 
 			switch v := val.(type) {
 			case []byte:
-				if len(v) > maxSQLJSONBytes-estimatedJSONBytes {
-					return nil, fmt.Errorf("SQL result exceeds the maximum JSON size of %d bytes", maxSQLJSONBytes)
+				if len(v) > maxBytes-estimatedJSONBytes {
+					return nil, fmt.Errorf("SQL result exceeds the maximum JSON size of %d bytes", maxBytes)
 				}
 				// JSON っぽいならパースを試みる（先頭が { または [ または "n"=null）
 				s := string(v)
@@ -6222,8 +6268,8 @@ func RowsToJSON(rows *sql.Rows) ([]byte, error) {
 				// それ以外は文字列として扱う
 				entry[col] = s
 			case string:
-				if len(v) > maxSQLJSONBytes-estimatedJSONBytes {
-					return nil, fmt.Errorf("SQL result exceeds the maximum JSON size of %d bytes", maxSQLJSONBytes)
+				if len(v) > maxBytes-estimatedJSONBytes {
+					return nil, fmt.Errorf("SQL result exceeds the maximum JSON size of %d bytes", maxBytes)
 				}
 				entry[col] = v
 			default:
@@ -6234,12 +6280,18 @@ func RowsToJSON(rows *sql.Rows) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Check before adding so even a configured limit near MaxInt cannot
+		// overflow the accumulated size. Include array separators in the budget.
+		remainingBytes := maxBytes - estimatedJSONBytes
+		if len(results) > 0 {
+			remainingBytes--
+		}
+		if len(rowJSON) > remainingBytes {
+			return nil, fmt.Errorf("SQL result exceeds the maximum JSON size of %d bytes", maxBytes)
+		}
 		estimatedJSONBytes += len(rowJSON)
 		if len(results) > 0 {
 			estimatedJSONBytes++
-		}
-		if estimatedJSONBytes > maxSQLJSONBytes {
-			return nil, fmt.Errorf("SQL result exceeds the maximum JSON size of %d bytes", maxSQLJSONBytes)
 		}
 		results = append(results, entry)
 	}
@@ -6250,8 +6302,8 @@ func RowsToJSON(rows *sql.Rows) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(encoded) > maxSQLJSONBytes {
-		return nil, fmt.Errorf("SQL result exceeds the maximum JSON size of %d bytes", maxSQLJSONBytes)
+	if len(encoded) > maxBytes {
+		return nil, fmt.Errorf("SQL result exceeds the maximum JSON size of %d bytes", maxBytes)
 	}
 	return encoded, nil
 }
@@ -7641,16 +7693,51 @@ func paramCheckRejectionJSON(status int, checkJSON string) (string, error) {
 	return string(body), err
 }
 
-func runCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, string, error) {
+func readJavascriptIncludeFiles(paths []string) (string, error) {
 	var combinedScript strings.Builder
-	for _, includePath := range config.JavascriptInclude {
+	for _, includePath := range paths {
 		content, err := os.ReadFile(includePath)
 		if err != nil {
-			return false, 500, nil, "", fmt.Errorf("failed to read javascript include file %s: %v", includePath, err)
+			return "", fmt.Errorf("failed to read javascript include file %s: %w", includePath, err)
 		}
 		combinedScript.Write(content)
 		combinedScript.WriteString("\n")
 	}
+	return combinedScript.String(), nil
+}
+
+// Called after resolving config-relative paths, before starting any workers.
+// Cache only source text, preserving concatenation and fresh VM semantics.
+func (cfg *Config) prepareJavascriptIncludes() error {
+	cfg.cachedJavascriptIncludes = nil
+	if !cfg.JavascriptIncludeCache {
+		return nil
+	}
+	source, err := readJavascriptIncludeFiles(cfg.JavascriptInclude)
+	if err != nil {
+		return err
+	}
+	cfg.cachedJavascriptIncludes = &source
+	return nil
+}
+
+func (cfg *Config) javascriptIncludes() (string, error) {
+	if !cfg.JavascriptIncludeCache {
+		return readJavascriptIncludeFiles(cfg.JavascriptInclude)
+	}
+	if cfg.cachedJavascriptIncludes == nil {
+		return "", fmt.Errorf("javascript include cache has not been initialized")
+	}
+	return *cfg.cachedJavascriptIncludes, nil
+}
+
+func runCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, string, error) {
+	includes, err := config.javascriptIncludes()
+	if err != nil {
+		return false, 500, nil, "", err
+	}
+	var combinedScript strings.Builder
+	combinedScript.WriteString(includes)
 	checkContent, err := os.ReadFile(apiCheckScriptPath)
 	if err != nil {
 		return false, 500, nil, "", fmt.Errorf("failed to read check script %s: %v", apiCheckScriptPath, err)
@@ -7814,16 +7901,12 @@ func runScriptWithRuntimeWithSnapshot(snapshot *APIConfigSnapshot, scriptPaths [
 	}()
 
 	// javascript_include に指定されたファイルと scriptPaths の内容を結合
-	var combinedScript strings.Builder
-
-	for _, includePath := range config.JavascriptInclude {
-		content, err := os.ReadFile(includePath)
-		if err != nil {
-			return "", fmt.Errorf("failed to read javascript include file %s: %v", includePath, err)
-		}
-		combinedScript.Write(content)
-		combinedScript.WriteString("\n")
+	includes, err := config.javascriptIncludes()
+	if err != nil {
+		return "", err
 	}
+	var combinedScript strings.Builder
+	combinedScript.WriteString(includes)
 	for _, scriptPath := range scriptPaths {
 		content, err := os.ReadFile(scriptPath)
 		if err != nil {

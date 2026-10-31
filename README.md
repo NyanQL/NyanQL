@@ -271,9 +271,34 @@ HTTP 200で次のJSONが返ります（キーの順序は問いません）。�
 | `DBName` | データベース名、またはSQLite/DuckDBのファイルパスです。 |
 | `BasicAuth` | API呼び出し時のBasic認証ユーザ名とパスワードです。 |
 | `APIHotReload` | `api.json` の定期的な変更確認を設定します。省略時も有効です。 |
+| `sqlResultLimits` | SQL結果ごとの行数・JSONバイト数の上限です。省略時は10,000行・4MiBです。 |
 | `javascript_include` | `check` や `script` の実行前に読み込む共通JavaScriptです。 |
+| `javascript_include_cache` | `true`で共通JSのソースを起動時に読み込み、再起動まで保持します。省略時は`false`です。 |
 
 `config.json` 内の相対パスは、`config.json` がある場所を基準にして扱われます。対象は `CertPath`、`KeyPath`、SQLite/DuckDB の `DBName`、`log.Filename`、`javascript_include` です。
+
+### SQL結果の上限と共通JSの読込設定
+
+次は既存の`config.json`へ追加する項目の例です。SQL結果の上限を10万行・32MiBに引き上げ、共通JSのソースを再起動まで保持します。
+
+```json
+{
+  "sqlResultLimits": {
+    "maxRows": 100000,
+    "maxBytes": 33554432
+  },
+  "javascript_include": ["./javascript/common.js"],
+  "javascript_include_cache": true
+}
+```
+
+`sqlResultLimits.maxRows`は行数、`maxBytes`はSQL結果をJSONに変換したときのバイト数です。項目の省略または`0`は、それぞれ10,000行・4MiB（4,194,304バイト）を意味し、無制限にはなりません。正の整数で上限を上げ下げできます。負数・小数・文字列・実行環境の整数範囲を超える値は起動時エラーになります。
+
+上限は各SQL結果セットに適用され、超過時は途中までの結果を返さずエラーにします。通常HTTP、JSON-RPC、内部呼び出し、`nyanRunSQL`と、それらを使うMCP・WebSocket・scheduleで共通です。SQLの更新件数や、複数のSQL結果を組み合わせた最終応答全体の上限ではありません。MCPのTool結果2MiB・応答全体4MiBなどの応答制限は別に適用されます。
+
+`javascript_include_cache: true`では、共通JSを設定順に起動時に読み込みます。読み込めないファイルがあれば起動を中止します。起動後にファイルを変更・削除しても、再起動までは読み込んだソースを使用します。`false`または省略時は、従来どおり各実行時にファイルを読み込みます。
+
+保持するのは共通JSのソースだけです。実行結果や変数は引き継がず、本体JSやチェックJSは引き続き各実行時に読み込みます。チェック、本体、OAuth用の制限付き実行、scheduleなどで同じ設定を使用します。これらの`config.json`設定の変更には再起動が必要です。
 
 ### ログ
 
@@ -1558,7 +1583,7 @@ console.log(
 "schedule_debug executed at " + now.toISOString();
 ```
 
-`javascript_include` に設定した共通JavaScriptは、scheduleのscript実行時にも毎回読み込まれます。
+`javascript_include` に設定した共通JavaScriptは、scheduleにも適用されます。`javascript_include_cache`が`false`または省略時は毎回読み込み、`true`では起動時に保持したソースを使用します。
 
 ---
 

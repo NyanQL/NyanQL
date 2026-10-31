@@ -7284,7 +7284,7 @@ func TestVPSDeploymentAppliesRefreshMigrationOnlyWhenPending(t *testing.T) {
 
 func TestSQLAndMCPResponseSizeLimits(t *testing.T) {
 	testDB := setTestSQLiteDB(t)
-	rows, err := testDB.Query(`SELECT zeroblob(?) AS oversized`, maxSQLJSONBytes+1)
+	rows, err := testDB.Query(`SELECT zeroblob(?) AS oversized`, defaultSQLJSONBytes+1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -12346,4 +12346,376 @@ func unmodifiedMuxRedirectStatus(t *testing.T, path string) int {
 		t.Fatalf("expected standard mux redirect: %d", rec.Code)
 	}
 	return rec.Code
+}
+
+func TestSQLResultLimitsConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		input       string
+		rows, bytes int
+		bad         bool
+	}{
+		{`{}`, 10000, 4 << 20, false},
+		{`{"sqlResultLimits":{}}`, 10000, 4 << 20, false},
+		{`{"sqlResultLimits":{"maxRows":0,"maxBytes":0}}`, 10000, 4 << 20, false},
+		{`{"sqlResultLimits":{"maxRows":100000,"maxBytes":33554432}}`, 100000, 32 << 20, false},
+		{`{"sqlResultLimits":{"maxRows":2}}`, 2, 4 << 20, false},
+		{`{"sqlResultLimits":{"maxBytes":1}}`, 10000, 1, false},
+		{`{"sqlResultLimits":{"maxRows":-1}}`, 0, 0, true},
+		{`{"sqlResultLimits":{"maxBytes":-1}}`, 0, 0, true},
+		{`{"sqlResultLimits":{"maxRows":1.5}}`, 0, 0, true},
+		{`{"sqlResultLimits":{"maxBytes":1.5}}`, 0, 0, true},
+		{`{"sqlResultLimits":{"maxRows":"100000"}}`, 0, 0, true},
+		{`{"sqlResultLimits":{"maxBytes":"32MiB"}}`, 0, 0, true},
+		{`{"sqlResultLimits":{"maxRows":true}}`, 0, 0, true},
+		{`{"sqlResultLimits":{"maxRows":9223372036854775808}}`, 0, 0, true},
+		{`{"sqlResultLimits":{"maxBytes":9223372036854775808}}`, 0, 0, true},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			var cfg Config
+			err := json.Unmarshal([]byte(tc.input), &cfg)
+			if tc.bad {
+				if err == nil {
+					t.Fatal("invalid SQL limit accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.SQLResultLimits.rowLimit() != tc.rows || cfg.SQLResultLimits.byteLimit() != tc.bytes {
+				t.Fatalf("wrong effective limits: %+v", cfg.SQLResultLimits)
+			}
+		})
+	}
+}
+
+func queryTestRowsJSON(t *testing.T, query string, args ...interface{}) ([]byte, error) {
+	t.Helper()
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, resultErr := RowsToJSON(rows)
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return result, resultErr
+}
+
+func TestSQLResultLimitsRowBoundaries(t *testing.T) {
+	setTestSQLiteDB(t)
+	old := config.SQLResultLimits
+	t.Cleanup(func() { config.SQLResultLimits = old })
+	for _, tc := range []struct {
+		name        string
+		limit, rows int
+		bad         bool
+	}{
+		{"default exact", 0, 10000, false},
+		{"default exceeded", 0, 10001, true},
+		{"raised exact", 10001, 10001, false},
+		{"raised exceeded", 10001, 10002, true},
+		{"lowered exact", 2, 2, false},
+		{"lowered exceeded", 2, 3, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config.SQLResultLimits = SQLResultLimitsConfig{MaxRows: tc.limit}
+			body, err := queryTestRowsJSON(t, `WITH RECURSIVE counter(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM counter WHERE n < ?) SELECT n FROM counter`, tc.rows)
+			if tc.bad {
+				if err == nil || !strings.Contains(err.Error(), "maximum row count") || body != nil {
+					t.Fatalf("oversized result was not rejected: err=%v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var rows []map[string]interface{}
+			if err := json.Unmarshal(body, &rows); err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != tc.rows {
+				t.Fatalf("rows=%d, want %d", len(rows), tc.rows)
+			}
+		})
+	}
+}
+
+func TestSQLResultLimitsByteBoundaries(t *testing.T) {
+	setTestSQLiteDB(t)
+	old := config.SQLResultLimits
+	t.Cleanup(func() { config.SQLResultLimits = old })
+	for _, tc := range []struct{ name, query, want string }{
+		{"string", `SELECT 'a' AS value`, `[{"value":"a"}]`},
+		{"escaped string", `SELECT '<>&' AS value`, `[{"value":"\u003c\u003e\u0026"}]`},
+		{"UTF8", `SELECT '猫' AS "項目"`, `[{"項目":"猫"}]`},
+		{"JSON blob", `SELECT CAST('{"x":1}' AS BLOB) AS value`, `[{"value":{"x":1}}]`},
+		{"plain blob", `SELECT CAST('abc' AS BLOB) AS value`, `[{"value":"abc"}]`},
+		{"null", `SELECT NULL AS value`, `[{"value":null}]`},
+		{"array separator", `SELECT 1 AS value UNION ALL SELECT 2`, `[{"value":1},{"value":2}]`},
+		{"no rows", `SELECT 1 AS value WHERE 0`, `null`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config.SQLResultLimits = SQLResultLimitsConfig{MaxBytes: len(tc.want)}
+			body, err := queryTestRowsJSON(t, tc.query)
+			if err != nil || string(body) != tc.want {
+				t.Fatalf("body=%s err=%v", body, err)
+			}
+			config.SQLResultLimits.MaxBytes--
+			body, err = queryTestRowsJSON(t, tc.query)
+			if err == nil || !strings.Contains(err.Error(), "maximum JSON size") || body != nil {
+				t.Fatalf("one byte over limit was not rejected: body=%s err=%v", body, err)
+			}
+		})
+	}
+	config.SQLResultLimits = SQLResultLimitsConfig{MaxBytes: 1}
+	if _, err := queryTestRowsJSON(t, `SELECT 1 AS value`); err == nil {
+		t.Fatal("one-byte limit ignored")
+	}
+
+	large := strings.Repeat("x", (4<<20)+1)
+	for _, query := range []string{`SELECT ? AS value`, `SELECT CAST(? AS BLOB) AS value`} {
+		config.SQLResultLimits = SQLResultLimitsConfig{}
+		if _, err := queryTestRowsJSON(t, query, large); err == nil {
+			t.Fatal("default byte limit ignored")
+		}
+		config.SQLResultLimits.MaxBytes = 32 << 20
+		body, err := queryTestRowsJSON(t, query, large)
+		if err != nil || len(body) != len(large)+len(`[{"value":""}]`) {
+			t.Fatalf("raised byte limit failed: bytes=%d err=%v", len(body), err)
+		}
+	}
+}
+
+func TestSQLResultLimitsAcrossCallPaths(t *testing.T) {
+	setTestSQLiteDB(t)
+	resetJavascriptInclude(t)
+	old := config.SQLResultLimits
+	t.Cleanup(func() { config.SQLResultLimits = old })
+	sqlPath := filepath.Join(t.TempDir(), "rows.sql")
+	writeTestFile(t, sqlPath, `SELECT 1 AS value UNION ALL SELECT 2`)
+	quotedPath, _ := json.Marshal(sqlPath)
+	script := writeTestScript(t, fmt.Sprintf(`({success:true,status:200,result:nyanRunSQL(%s)});`, quotedPath))
+	setTestSQLFiles(t, map[string]APIConfig{"rows": {SQL: []string{sqlPath}}, "tool": {Script: script}})
+	for _, route := range []string{"http", "jsonrpc", "nyanCallMe", "script", "mcp_http", "mcp_stdio"} {
+		for _, limit := range []int{1, 2} {
+			t.Run(fmt.Sprintf("%s/limit%d", route, limit), func(t *testing.T) {
+				config.SQLResultLimits = SQLResultLimitsConfig{MaxRows: limit}
+				rejected := false
+				switch route {
+				case "http":
+					rec := httptest.NewRecorder()
+					handleRequest(rec, httptest.NewRequest("GET", "/rows", nil))
+					rejected = rec.Code != http.StatusOK
+				case "jsonrpc":
+					rec := httptest.NewRecorder()
+					req := httptest.NewRequest("POST", "/nyan-rpc", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"rows","params":{}}`))
+					req.Header.Set("Content-Type", "application/json")
+					handleJSONRPC(rec, req)
+					rejected = decodeTestJSONObject(t, rec.Body.Bytes())["error"] != nil
+				case "nyanCallMe":
+					_, err := callNyanAPIFromVM("rows", nil)
+					rejected = err != nil
+				case "script":
+					_, err := runScript([]string{script}, nil)
+					rejected = err != nil
+				case "mcp_http", "mcp_stdio":
+					server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", Tools: []MCPToolConfig{{API: "tool"}}}
+					message := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":{}}}`
+					var response map[string]interface{}
+					if route == "mcp_http" {
+						rec := performTestMCPRequest(t, currentAPISnapshot(), server, message, "")
+						response = decodeTestJSONObject(t, rec.Body.Bytes())
+					} else {
+						state := mcpStdioReady
+						response, _ = handleMCPStdioMessage(currentAPISnapshot(), "mcp", server, &state, []byte(message))
+					}
+					toolResult, ok := response["result"].(map[string]interface{})
+					if !ok {
+						t.Fatalf("unexpected MCP response: %#v", response)
+					}
+					rejected = toolResult["isError"] == true
+				}
+				if rejected != (limit == 1) {
+					t.Fatalf("rejected=%t with limit=%d", rejected, limit)
+				}
+			})
+		}
+	}
+}
+
+func TestSQLResultLimitsRollBackScript(t *testing.T) {
+	testDB := setTestSQLiteDB(t)
+	resetJavascriptInclude(t)
+	old := config.SQLResultLimits
+	t.Cleanup(func() { config.SQLResultLimits = old })
+	config.SQLResultLimits = SQLResultLimitsConfig{MaxRows: 1}
+	if _, err := testDB.Exec(`CREATE TABLE saved (value INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "insert.sql"), `INSERT INTO saved VALUES (1)`)
+	writeTestFile(t, filepath.Join(dir, "read.sql"), `SELECT 1 AS value UNION ALL SELECT 2`)
+	insertPath, _ := json.Marshal(filepath.Join(dir, "insert.sql"))
+	readPath, _ := json.Marshal(filepath.Join(dir, "read.sql"))
+	script := writeTestScript(t, fmt.Sprintf(`nyanRunSQL(%s); nyanRunSQL(%s);`, insertPath, readPath))
+	if _, err := runScript([]string{script}, nil); err == nil || !strings.Contains(err.Error(), "maximum row count") {
+		t.Fatalf("err=%v", err)
+	}
+	var count int
+	if err := testDB.QueryRow(`SELECT COUNT(*) FROM saved`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("limit failure committed %d rows", count)
+	}
+}
+
+func TestJavascriptIncludeCacheAcrossRuntimes(t *testing.T) {
+	setTestSQLiteDB(t)
+	old := config
+	t.Cleanup(func() { config = old })
+	for _, cached := range []bool{false, true} {
+		for _, runtimeName := range []string{"check", "script", "restricted"} {
+			t.Run(fmt.Sprintf("%s/cache%t", runtimeName, cached), func(t *testing.T) {
+				dir := t.TempDir()
+				first, second := filepath.Join(dir, "first.js"), filepath.Join(dir, "second.js")
+				writeInclude := func(value string) { writeTestFile(t, first, fmt.Sprintf(`var sharedCount=0; const prefix=%q;`, value)) }
+				writeInclude("original")
+				writeTestFile(t, second, `const sharedValue=prefix+"!";`)
+				config = old
+				config.JavascriptInclude = []string{"first.js", "second.js"}
+				config.JavascriptIncludeCache = cached
+				adjustPaths(dir, &config)
+				if err := config.prepareJavascriptIncludes(); err != nil {
+					t.Fatal(err)
+				}
+				script := filepath.Join(dir, "body.js")
+				writeBody := func(value string) {
+					writeTestFile(t, script, fmt.Sprintf(`({success:true,status:200,value:sharedValue,count:++sharedCount,body:%q});`, value))
+				}
+				writeBody("one")
+				run := func() (string, error) {
+					if runtimeName == "check" {
+						_, _, _, body, err := runCheckScriptWithSnapshot(nil, script, nil, nil)
+						return body, err
+					}
+					return runScriptWithRuntimeWithSnapshot(nil, []string{script}, nil, APIRuntimeConfig{}, runtimeName == "restricted")
+				}
+				assertResult := func(value, bodyValue string) {
+					t.Helper()
+					body, err := run()
+					if err != nil {
+						t.Fatal(err)
+					}
+					result := decodeTestJSONObject(t, []byte(body))
+					if result["value"] != value+"!" || result["count"] != float64(1) || result["body"] != bodyValue {
+						t.Fatalf("unexpected script result: %#v", result)
+					}
+				}
+				// Changing the file before the first call distinguishes startup
+				// caching from a cache populated on first execution.
+				writeInclude("changed")
+				want := "changed"
+				if cached {
+					want = "original"
+				}
+				assertResult(want, "one")
+				writeBody("two")
+				assertResult(want, "two")
+				assertResult(want, "two") // JS variables are fresh on every execution.
+				if err := os.Remove(first); err != nil {
+					t.Fatal(err)
+				}
+				if cached {
+					assertResult("original", "two")
+				} else if _, err := run(); err == nil {
+					t.Fatal("uncached missing file was ignored")
+				}
+				writeInclude("restarted")
+				// A new startup preparation loads the new source.
+				if err := config.prepareJavascriptIncludes(); err != nil {
+					t.Fatal(err)
+				}
+				assertResult("restarted", "two")
+			})
+		}
+	}
+}
+
+func TestJavascriptIncludeCacheStartupValidation(t *testing.T) {
+	for _, tc := range []struct {
+		input  string
+		cached bool
+		bad    bool
+	}{
+		{`{}`, false, false},
+		{`{"javascript_include_cache":false}`, false, false},
+		{`{"javascript_include_cache":true}`, true, false},
+		{`{"javascript_include_cache":"true"}`, false, true},
+	} {
+		var cfg Config
+		err := json.Unmarshal([]byte(tc.input), &cfg)
+		if (err != nil) != tc.bad || cfg.JavascriptIncludeCache != tc.cached {
+			t.Fatalf("input=%s cfg=%+v err=%v", tc.input, cfg, err)
+		}
+	}
+	dir := t.TempDir()
+	present, missing := filepath.Join(dir, "present.js"), filepath.Join(dir, "missing.js")
+	writeTestFile(t, present, `const present=true;`)
+	cfg := Config{JavascriptInclude: []string{present, missing}, JavascriptIncludeCache: true}
+	if err := cfg.prepareJavascriptIncludes(); err == nil || !strings.Contains(err.Error(), missing) {
+		t.Fatalf("missing include error=%v", err)
+	}
+	if _, err := cfg.javascriptIncludes(); err == nil {
+		t.Fatal("partially populated cache was usable")
+	}
+	cfg.JavascriptIncludeCache = false
+	if err := cfg.prepareJavascriptIncludes(); err != nil {
+		t.Fatalf("disabled cache read files at startup: %v", err)
+	}
+	if _, err := cfg.javascriptIncludes(); err == nil {
+		t.Fatal("missing uncached file was ignored")
+	}
+	cfg = Config{JavascriptIncludeCache: true}
+	if err := cfg.prepareJavascriptIncludes(); err != nil {
+		t.Fatal(err)
+	}
+	if source, err := cfg.javascriptIncludes(); err != nil || source != "" {
+		t.Fatalf("empty includes: source=%q err=%v", source, err)
+	}
+}
+
+func TestJavascriptIncludeCacheConcurrentChecks(t *testing.T) {
+	old := config
+	t.Cleanup(func() { config = old })
+	include := writeTestScript(t, `var count=0;`)
+	check := writeTestScript(t, `({success:++count===1,status:200});`)
+	config.JavascriptInclude = []string{include}
+	config.JavascriptIncludeCache = true
+	if err := config.prepareJavascriptIncludes(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(include); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	failures := make(chan error, 16)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok, _, _, _, err := runCheckScriptWithSnapshot(nil, check, nil, nil)
+			if err != nil {
+				failures <- err
+			} else if !ok {
+				failures <- fmt.Errorf("JS state leaked between requests")
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+	for err := range failures {
+		t.Error(err)
+	}
 }
