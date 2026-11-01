@@ -9227,6 +9227,10 @@ func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map
 	}
 	params["nyan_request"] = requestContext
 	vm.Set("nyanAllParams", params)
+	// Keep the JavaScript array contract: Goja maps a nil []string to null.
+	if acceptedParamsKeys == nil {
+		acceptedParamsKeys = []string{}
+	}
 	vm.Set("nyanAcceptedParamsKeys", acceptedParamsKeys)
 	vm.Set("nyanRequest", requestContext)
 	vm.Set("console", map[string]interface{}{

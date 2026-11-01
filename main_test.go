@@ -12719,3 +12719,73 @@ func TestJavascriptIncludeCacheConcurrentChecks(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestNyanAcceptedParamsKeysAlwaysArray(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		keys []string
+		want string
+	}{
+		{"nil", nil, `[]`},
+		{"empty", []string{}, `[]`},
+		{"populated", []string{"id", "name"}, `["id","name"]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vm := goja.New()
+			registerNyanFuncs(vm, nil, nil, tc.keys)
+			value, err := vm.RunString(`
+				if (!Array.isArray(nyanAcceptedParamsKeys)) {
+					throw new Error("nyanAcceptedParamsKeys must be an array");
+				}
+				const keys = [];
+				nyanAcceptedParamsKeys.forEach(key => keys.push(key));
+				JSON.stringify(keys);
+			`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if value.String() != tc.want {
+				t.Fatalf("accepted keys=%s, want %s", value.String(), tc.want)
+			}
+		})
+	}
+}
+
+func TestNyanRequestCheckWithoutSQLParameters(t *testing.T) {
+	setTestSQLiteDB(t)
+	old := config
+	t.Cleanup(func() { config = old })
+	config.JavascriptInclude = []string{filepath.Join("javascript", "lib", "nyanRequestCheck.js")}
+	config.JavascriptIncludeCache = false
+	check := writeTestScript(t, `nyanRequestCheck(); ({success:true,status:200});`)
+	script := writeTestScript(t, `nyanRequestCheck(); ({success:true,status:200,result:nyanAcceptedParamsKeys.length});`)
+	sqlFile := filepath.Join(t.TempDir(), "no_parameters.sql")
+	writeTestFile(t, sqlFile, `SELECT 1 AS value;`)
+	snapshot := newAPIConfigSnapshot(map[string]APIConfig{
+		"sql":    {SQL: []string{sqlFile}, ParamCheck: check},
+		"script": {Script: script, ParamCheck: check},
+	}, "", [sha256.Size]byte{})
+	for _, api := range []string{"sql", "script"} {
+		t.Run(api, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			handleRequestWithSnapshot(snapshot, rec, httptest.NewRequest("GET", "/"+api, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("parameterless API failed: status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			response := decodeTestJSONObject(t, rec.Body.Bytes())
+			if response["success"] != true || (api == "script" && response["result"] != float64(0)) {
+				t.Fatalf("unexpected response: %#v", response)
+			}
+		})
+	}
+	t.Run("restricted", func(t *testing.T) {
+		body, err := runScriptWithRuntimeWithSnapshot(snapshot, []string{script}, nil, APIRuntimeConfig{}, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := decodeTestJSONObject(t, []byte(body))
+		if response["success"] != true || response["result"] != float64(0) {
+			t.Fatalf("unexpected restricted result: %#v", response)
+		}
+	})
+}
