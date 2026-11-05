@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -3046,6 +3047,108 @@ func TestAPISelectionUsesPathAndRPCMethod(t *testing.T) {
 	}
 }
 
+func TestSQLReviewPlaceholderLiteralBoundaries(t *testing.T) {
+	setTestSQLiteDB(t)
+	for _, test := range []struct {
+		name, source, wantQuery, wantResult string
+	}{
+		{"addition", `SELECT /*value*/1+1 AS value`, `SELECT ?+1 AS value`, `[{"value":10}]`},
+		{"negative", `SELECT /*value*/-1*2 AS value`, `SELECT ?*2 AS value`, `[{"value":18}]`},
+		{"exponent", `SELECT /*value*/1e-3+1 AS value`, `SELECT ?+1 AS value`, `[{"value":10}]`},
+		{"leading_decimal", `SELECT /*value*/.5/3 AS value`, `SELECT ?/3 AS value`, `[{"value":3}]`},
+		{"line_comment", "SELECT /*value*/1-- comment\n+1 AS value", "SELECT ?-- comment\n+1 AS value", `[{"value":10}]`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			query, args := prepareQueryWithParams(test.source, map[string]interface{}{"value": 9})
+			if query != test.wantQuery || !reflect.DeepEqual(args, []interface{}{9}) {
+				t.Fatalf("query=%q args=%#v", query, args)
+			}
+			body, err := queryTestRowsJSON(t, query, args...)
+			if err != nil || string(body) != test.wantResult {
+				t.Fatalf("body=%s err=%v, want %s", body, err, test.wantResult)
+			}
+		})
+	}
+	for _, source := range []string{`SELECT /*note*/1invalid`, `SELECT /*note*/1e+`, `SELECT /*note*/SELECT`} {
+		query, args := prepareQueryWithParams(source, nil)
+		if query != source || len(args) != 0 {
+			t.Fatalf("nonliteral was replaced: query=%q args=%#v", query, args)
+		}
+	}
+}
+
+func TestSQLReviewDialectParameterBinding(t *testing.T) {
+	oldType := dbType
+	t.Cleanup(func() { dbType = oldType })
+	for _, test := range []struct {
+		name, driver, source, wantQuery string
+	}{
+		{"postgres_cast", "postgres", `SELECT /*value*/1::bigint AS value`, `SELECT $1::bigint AS value`},
+		{"postgres_boolean_cast", "postgres", `SELECT /*value*/true::text AS value`, `SELECT $1::text AS value`},
+		{"postgres_array", "postgres", `SELECT ARRAY[/*value*/1] AS value`, `SELECT ARRAY[$1] AS value`},
+		{"postgres_subscript", "postgres", `SELECT values[/*value*/1] AS value`, `SELECT values[$1] AS value`},
+		{"duckdb_list", "duckdb", `SELECT [/*value*/1] AS value`, `SELECT [?] AS value`},
+		{"sqlite_identifier", "sqlite3", `SELECT [/*ignored*/1], /*value*/1 AS value`, `SELECT [/*ignored*/1], ? AS value`},
+		{"mysql_escape", "mysql", `SELECT 'it\'s /*ignored*/1', /*value*/1 AS value`, `SELECT 'it\'s /*ignored*/1', ? AS value`},
+		{"postgres_escape", "postgres", `SELECT E'it\'s /*ignored*/1', /*value*/1 AS value`, `SELECT E'it\'s /*ignored*/1', $1 AS value`},
+		{"postgres_standard_string", "postgres", `SELECT '\', /*value*/1 AS value`, `SELECT '\', $1 AS value`},
+		{"sqlite_default_string", "sqlite3", `SELECT /*value*/'\' AS value`, `SELECT ? AS value`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dbType = test.driver
+			query, args := prepareQueryWithParams(test.source, map[string]interface{}{"value": 9})
+			if query != test.wantQuery || !reflect.DeepEqual(args, []interface{}{9}) {
+				t.Fatalf("query=%q args=%#v, want %q with [9]", query, args, test.wantQuery)
+			}
+		})
+	}
+	for _, source := range []string{`SELECT /*value*/1+1`, `SELECT /*value*/1::bigint`} {
+		schema := generateSQLInputSchemaFromSources([]string{source})
+		property := schema["properties"].(map[string]interface{})["value"].(map[string]interface{})
+		if property["type"] != "integer" || !reflect.DeepEqual(property["examples"], []interface{}{int64(1)}) {
+			t.Fatalf("schema default includes operator or cast: %#v", property)
+		}
+	}
+}
+
+func TestSQLReviewBackslashLiteralPreservesConditionalParameters(t *testing.T) {
+	setTestSQLiteDB(t)
+	if _, err := db.Exec(`CREATE TABLE items(id INTEGER); INSERT INTO items VALUES(1),(2)`); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "backslash.sql")
+	writeTestFile(t, path, `SELECT '\' AS path,id FROM items /*BEGIN*/ WHERE /*IF id != null*/ id=/*id*/1 /*END*/ /*END*/ ORDER BY id`)
+	for _, test := range []struct {
+		name   string
+		params map[string]interface{}
+		want   string
+	}{
+		{"provided", map[string]interface{}{"id": 2}, `{"success":true,"status":200,"result":[{"id":2,"path":"\\"}]}`},
+		{"absent", nil, `{"success":true,"status":200,"result":[{"id":1,"path":"\\"},{"id":2,"path":"\\"}]}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body, err := executeSQLAPI("test", []string{path}, test.params)
+			if err != nil || string(body) != test.want {
+				t.Fatalf("body=%s err=%v, want %s", body, err, test.want)
+			}
+		})
+	}
+}
+
+func TestSQLReviewCTEResults(t *testing.T) {
+	setTestSQLiteDB(t)
+	for _, alias := range []string{"updated_items", "inserted_items", "deleted_items"} {
+		t.Run(alias, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "cte.sql")
+			writeTestFile(t, path, fmt.Sprintf(`WITH %s AS (SELECT 42 AS id) SELECT id FROM %s`, alias, alias))
+			body, err := executeSQLAPI("test", []string{path}, nil)
+			if err != nil || string(body) != `{"success":true,"status":200,"result":[{"id":42}]}` {
+				t.Fatalf("body=%s err=%v", body, err)
+			}
+		})
+	}
+}
+
 func TestPrepareQueryWithParamsScansJSONDocumentCommentDefaults(t *testing.T) {
 	query, args := prepareQueryWithParams(
 		`INSERT INTO hoge2 VALUES /*doc*/{"id":9, "name":"たまこ"};`,
@@ -3389,7 +3492,11 @@ func TestQueryClassification(t *testing.T) {
 		{query: "SELECT 1", wantSelect: true},
 		{query: "  with values_cte as (select 1) select * from values_cte", wantSelect: true},
 		{query: "UPDATE items SET name = 'x'", wantSelect: false},
-		{query: "WITH updated AS (UPDATE items SET name = 'x' RETURNING id) SELECT id FROM updated", wantReturning: true},
+		{query: "WITH updated AS (UPDATE items SET name = 'x' RETURNING id) SELECT id FROM updated", wantSelect: true},
+		{query: "WITH updated_items AS (SELECT 1 AS id) SELECT id FROM updated_items", wantSelect: true},
+		{query: "WITH selected AS (SELECT 1 AS id) UPDATE items SET name = 'x' WHERE id IN (SELECT id FROM selected)"},
+		{query: "WITH updated AS (UPDATE items SET name = 'x' RETURNING id) DELETE FROM items WHERE id IN (SELECT id FROM updated)"},
+		{query: "WITH selected AS (SELECT 1 AS id) DELETE FROM items WHERE id IN (SELECT id FROM selected) RETURNING id", wantReturning: true},
 		{query: "INSERT INTO items(name) VALUES ('x') RETURNING id", wantReturning: true},
 	}
 	for _, tt := range tests {
@@ -7104,6 +7211,111 @@ func TestMCPRateLimit(t *testing.T) {
 
 }
 
+func TestMCPOAuthRateLimitBudgets(t *testing.T) {
+	mcpRateBuckets.Lock()
+	oldBuckets, oldCleanup := mcpRateBuckets.Buckets, mcpRateBuckets.LastCleanup
+	mcpRateBuckets.Buckets = make(map[string]mcpRateBucket)
+	mcpRateBuckets.LastCleanup = time.Time{}
+	mcpRateBuckets.Unlock()
+	t.Cleanup(func() {
+		mcpRateBuckets.Lock()
+		mcpRateBuckets.Buckets, mcpRateBuckets.LastCleanup = oldBuckets, oldCleanup
+		mcpRateBuckets.Unlock()
+	})
+	now := time.Date(2026, time.November, 5, 0, 0, 0, 0, time.UTC)
+	remote := "192.0.2.239:1234"
+
+	t.Run("daily_configured_budget", func(t *testing.T) {
+		server := APIConfig{RateLimit: &HTTPRateLimitConfig{Requests: 60, Window: "24h"}}
+		for i := 0; i < 60; i++ {
+			if allowed, _ := mcpOAuthRateLimitAllows(t.Name(), server, "oauthToken", remote, now); !allowed {
+				t.Fatalf("request %d was rejected", i+1)
+			}
+		}
+		for _, elapsed := range []time.Duration{250 * time.Millisecond, time.Minute} {
+			allowed, retryAfter := mcpOAuthRateLimitAllows(t.Name(), server, "oauthToken", remote, now.Add(elapsed))
+			if allowed || retryAfter != 24*time.Hour-elapsed {
+				t.Fatalf("after %s: allowed=%t retryAfter=%s", elapsed, allowed, retryAfter)
+			}
+		}
+		if allowed, _ := mcpOAuthRateLimitAllows(t.Name(), server, "oauthToken", remote, now.Add(24*time.Hour)); !allowed {
+			t.Fatal("request after daily reset was rejected")
+		}
+	})
+
+	t.Run("short_window_preserves_role_budget", func(t *testing.T) {
+		server := APIConfig{RateLimit: &HTTPRateLimitConfig{Requests: 5, Window: "1s"}}
+		for second := 0; second < 2; second++ {
+			for i := 0; i < 5; i++ {
+				if allowed, _ := mcpOAuthRateLimitAllows(t.Name(), server, "oauthRegister", remote, now.Add(time.Duration(second)*time.Second)); !allowed {
+					t.Fatalf("second=%d request=%d was rejected", second, i+1)
+				}
+			}
+		}
+		allowed, retryAfter := mcpOAuthRateLimitAllows(t.Name(), server, "oauthRegister", remote, now.Add(2*time.Second))
+		if allowed || retryAfter != 58*time.Second {
+			t.Fatalf("role budget relaxed: allowed=%t retryAfter=%s", allowed, retryAfter)
+		}
+		if allowed, _ := mcpOAuthRateLimitAllows(t.Name(), server, "oauthRegister", remote, now.Add(time.Minute)); !allowed {
+			t.Fatal("request after role budget reset was rejected")
+		}
+	})
+
+	t.Run("rejected_attempts_do_not_consume_daily_budget", func(t *testing.T) {
+		server := APIConfig{RateLimit: &HTTPRateLimitConfig{Requests: 120, Window: "24h"}}
+		for minute := 0; minute < 2; minute++ {
+			for i := 0; i < 60; i++ {
+				if allowed, _ := mcpOAuthRateLimitAllows(t.Name(), server, "oauthToken", remote, now.Add(time.Duration(minute)*time.Minute)); !allowed {
+					t.Fatalf("minute=%d request=%d was rejected", minute, i+1)
+				}
+			}
+			if minute == 0 {
+				for i := 0; i < 60; i++ {
+					allowed, retryAfter := mcpOAuthRateLimitAllows(t.Name(), server, "oauthToken", remote, now.Add(time.Second))
+					if allowed || retryAfter != 59*time.Second {
+						t.Fatalf("rejection %d: allowed=%t retryAfter=%s", i+1, allowed, retryAfter)
+					}
+				}
+			}
+		}
+		allowed, retryAfter := mcpOAuthRateLimitAllows(t.Name(), server, "oauthToken", remote, now.Add(2*time.Minute))
+		if allowed || retryAfter != 24*time.Hour-2*time.Minute {
+			t.Fatalf("daily budget not enforced: allowed=%t retryAfter=%s", allowed, retryAfter)
+		}
+	})
+
+	t.Run("identical_budgets_are_not_double_charged", func(t *testing.T) {
+		server := APIConfig{RateLimit: &HTTPRateLimitConfig{Requests: 10, Window: "60s"}}
+		for i := 0; i < 10; i++ {
+			if allowed, _ := mcpOAuthRateLimitAllows(t.Name(), server, "oauthRegister", remote, now); !allowed {
+				t.Fatalf("request %d was double charged", i+1)
+			}
+		}
+		if allowed, retryAfter := mcpOAuthRateLimitAllows(t.Name(), server, "oauthRegister", remote, now); allowed || retryAfter != time.Minute {
+			t.Fatalf("exhausted budget: allowed=%t retryAfter=%s", allowed, retryAfter)
+		}
+	})
+
+	t.Run("http_retry_after_uses_longest_wait", func(t *testing.T) {
+		server := APIConfig{RateLimit: &HTTPRateLimitConfig{Requests: 60, Window: "24h"}}
+		started := time.Now()
+		for i := 0; i < 60; i++ {
+			if allowed, _ := mcpOAuthRateLimitAllows(t.Name(), server, "oauthToken", remote, started); !allowed {
+				t.Fatalf("request %d was rejected", i+1)
+			}
+		}
+		request := httptest.NewRequest(http.MethodPost, "https://service.example/token", strings.NewReader("grant_type=authorization_code"))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		request.RemoteAddr = remote
+		recorder := httptest.NewRecorder()
+		handleMCPOAuthHTTPRequest(nil, recorder, request, t.Name(), server, "token", "oauthToken")
+		retryAfter, err := strconv.Atoi(recorder.Header().Get("Retry-After"))
+		if recorder.Code != http.StatusTooManyRequests || err != nil || retryAfter < 86300 || retryAfter > 86400 {
+			t.Fatalf("status=%d Retry-After=%q err=%v", recorder.Code, recorder.Header().Get("Retry-After"), err)
+		}
+	})
+}
+
 func TestMCPOriginPolicies(t *testing.T) {
 	mcpRequest := httptest.NewRequest(http.MethodPost, "https://server.example/mcp", nil)
 	for _, testCase := range []struct {
@@ -8626,20 +8838,20 @@ if (nyanAllParams.nyan_output.status !== 201 || nyanAllParams.nyan_output_status
 	}
 }
 
-func TestInternalPushSourceAndParentAreIndependent(t *testing.T) {
+func TestInternalPushWaitsForParentCommit(t *testing.T) {
 	for _, test := range []struct {
 		name, child, parent string
 		want                string
 	}{
-		{"both_success", `({success:true,status:200});`, `({success:true,status:200});`, "child,after,parent,"},
+		{"both_success", `({success:true,status:200});`, `({success:true,status:200});`, "after,child,parent,"},
 		{"child_failed", `({success:false,status:200});`, `({success:true,status:200});`, "after,parent,"},
 		{"child_unavailable", `({success:true,status:503});`, `({success:true,status:200});`, "after,parent,"},
-		{"parent_failed", `({success:true,status:200});`, `({success:false,status:200});`, "child,after,"},
-		{"parent_exception", `({success:true,status:200});`, `throw new Error("parent failed");`, "child,after,"},
+		{"parent_failed", `({success:true,status:200});`, `({success:false,status:200});`, "after,child,"},
+		{"parent_exception", `({success:true,status:200});`, `throw new Error("parent failed");`, "after,"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			resetJavascriptInclude(t)
-			setTestSQLiteDB(t).SetMaxOpenConns(8)
+			setTestSQLiteDB(t)
 			trace := filepath.Join(t.TempDir(), "trace")
 			mark := func(stage string) string {
 				return fmt.Sprintf(`nyanSaveFile(nyanBase64Encode((nyanGetFile(%q)||"")+%q),%q);`, trace, stage+",", trace)
@@ -12571,6 +12783,131 @@ func TestSQLResultLimitsRollBackScript(t *testing.T) {
 	}
 }
 
+func TestCaughtSQLFailuresRollbackSharedExecution(t *testing.T) {
+	for _, scenario := range []struct {
+		name, query, failure string
+	}{
+		{"row_error", `SELECT abs(-9223372036854775808) AS value`, "integer overflow"},
+		{"result_limit", `SELECT 1 AS value UNION ALL SELECT 2`, "maximum row count"},
+		{"missing_file", "", "failed to read SQL file"},
+		{"argument_getter", `SELECT 1 AS value`, "argument getter failed"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			database := setTestSQLiteDB(t)
+			resetJavascriptInclude(t)
+			oldLimits := config.SQLResultLimits
+			t.Cleanup(func() { config.SQLResultLimits = oldLimits })
+			config.SQLResultLimits = SQLResultLimitsConfig{MaxRows: 1}
+			if _, err := database.Exec(`CREATE TABLE saved (value INTEGER)`); err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			insert, query := filepath.Join(dir, "insert.sql"), filepath.Join(dir, "query.sql")
+			writeTestFile(t, insert, `INSERT INTO saved VALUES (1)`)
+			if scenario.query != "" {
+				writeTestFile(t, query, scenario.query)
+			}
+			arguments := `{}`
+			if scenario.name == "argument_getter" {
+				arguments = `{get value(){throw new Error("argument getter failed");}}`
+			}
+			script := writeTestScript(t, fmt.Sprintf(`
+nyanRunSQL(%q);
+try { nyanRunSQL(%q, %s); } catch(e) { nyanAllParams.caught = String(e); }
+({success:true});`, insert, query, arguments))
+			params := map[string]interface{}{}
+			_, err := runScript([]string{script}, params)
+			if err == nil || !strings.Contains(err.Error(), scenario.failure) {
+				t.Fatalf("caught failure did not abort transaction: %v", err)
+			}
+			if caught, _ := params["caught"].(string); !strings.Contains(caught, scenario.failure) {
+				t.Fatalf("JavaScript did not receive original exception: %#v", params)
+			}
+			var count int
+			if err := database.QueryRow(`SELECT COUNT(*) FROM saved`).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("rows=%d err=%v", count, err)
+			}
+			if database.Stats().InUse != 0 {
+				t.Fatal("SQL failure leaked a connection")
+			}
+		})
+	}
+}
+
+func TestNestedCheckCancellationRollsBack(t *testing.T) {
+	for _, stage := range []string{"paramCheck", "outCheck"} {
+		for _, location := range []string{"body", "getter"} {
+			t.Run(stage+"/"+location, func(t *testing.T) {
+				resetJavascriptInclude(t)
+				dir := t.TempDir()
+				// Cancellation can discard the SQLite connection; persist the fixture
+				// so rollback can be verified using the replacement connection.
+				database, err := sql.Open("sqlite3", filepath.Join(dir, "test.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				oldDB, oldDBType := db, dbType
+				db, dbType = database, "sqlite3"
+				database.SetMaxOpenConns(1)
+				t.Cleanup(func() {
+					_ = database.Close()
+					db, dbType = oldDB, oldDBType
+				})
+				if _, err := database.Exec(`CREATE TABLE saved (value INTEGER)`); err != nil {
+					t.Fatal(err)
+				}
+				insert := filepath.Join(dir, "insert.sql")
+				writeTestFile(t, insert, `INSERT INTO saved VALUES (1)`)
+				loop := `nyanRequest.entered = true; const until = Date.now()+2000; while(Date.now()<until) {}`
+				checkCode := loop + `; ({success:true,status:200});`
+				if location == "getter" {
+					checkCode = `({success:true,status:200,get value(){` + loop + `; return 1;}});`
+				}
+				check := writeTestScript(t, checkCode)
+				child := APIConfig{Script: writeTestScript(t, `({success:true,status:200});`)}
+				if stage == "paramCheck" {
+					child.ParamCheck = check
+				} else {
+					child.OutCheck = check
+				}
+				snapshot := newAPIConfigSnapshot(map[string]APIConfig{"child": child}, filepath.Join(dir, "api.json"), [32]byte{})
+				parent := writeTestScript(t, fmt.Sprintf(`nyanRunSQL(%q); nyanCallMe({api:"child"});`, insert))
+				request := map[string]interface{}{}
+				params := map[string]interface{}{"nyan_request": request}
+				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+				defer cancel()
+				started := time.Now()
+				_, err = runScriptInExecution(ctx, snapshot, []string{parent}, params, APIRuntimeConfig{}, false, nil)
+				if elapsed := time.Since(started); err == nil || elapsed > time.Second {
+					t.Fatalf("check ignored cancellation: elapsed=%v err=%v", elapsed, err)
+				}
+				if request["entered"] != true {
+					t.Fatal("check did not reach the cancellable JavaScript")
+				}
+				var count int
+				if err := database.QueryRow(`SELECT COUNT(*) FROM saved`).Scan(&count); err != nil || count != 0 {
+					t.Fatalf("rows=%d err=%v", count, err)
+				}
+				if database.Stats().InUse != 0 {
+					t.Fatal("cancelled check leaked a connection")
+				}
+			})
+		}
+	}
+}
+
+func TestCancelledCheckDoesNotExecute(t *testing.T) {
+	resetJavascriptInclude(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	params := map[string]interface{}{}
+	check := writeTestScript(t, `nyanAllParams.executed = true; ({success:true,status:200});`)
+	_, _, _, _, err := runCheckScriptInExecution(newAPIConfigSnapshot(nil, "", [32]byte{}), check, params, nil, &sqlExecution{ctx: ctx})
+	if err == nil || params["executed"] != nil {
+		t.Fatalf("cancelled check ran: params=%v err=%v", params, err)
+	}
+}
+
 func TestJavascriptIncludeCacheAcrossRuntimes(t *testing.T) {
 	setTestSQLiteDB(t)
 	old := config
@@ -12788,4 +13125,542 @@ func TestNyanRequestCheckWithoutSQLParameters(t *testing.T) {
 			t.Fatalf("unexpected restricted result: %#v", response)
 		}
 	})
+}
+
+func TestRegressionSQLConditionalUppercaseParameter(t *testing.T) {
+	setTestSQLiteDB(t)
+	if _, err := db.Exec(`CREATE TABLE items (org_id INTEGER); INSERT INTO items VALUES (1),(2)`); err != nil {
+		t.Fatal(err)
+	}
+	source := `SELECT org_id FROM items /*BEGIN*/ WHERE /*IF ORG_ID != null*/ org_id = /*ORG_ID*/0 /*END*/ /*END*/`
+	params := map[string]interface{}{"ORG_ID": int64(1)}
+	query, args := prepareQueryWithParams(processConditionals(processWhereBlock(source, params), params), params)
+	t.Logf("generated SQL=%q; args=%#v", query, args)
+	got, err := queryTestRowsJSON(t, query, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != `[{"org_id":1}]` {
+		t.Fatalf("provided ORG_ID filter disappeared: %s", got)
+	}
+}
+
+func TestRegressionSQLRunPreservesLiteralWhitespace(t *testing.T) {
+	setTestSQLiteDB(t)
+	resetJavascriptInclude(t)
+	if _, err := db.Exec(`CREATE TABLE items (value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	sqlPath := filepath.Join(t.TempDir(), "literal.sql")
+	writeTestFile(t, sqlPath, "INSERT INTO items(value) VALUES ('a  b\nc')")
+	scriptPath := writeTestScript(t, fmt.Sprintf(`nyanRunSQL(%q); ({success:true,status:200});`, sqlPath))
+	if _, err := runScript([]string{scriptPath}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var value string
+	if err := db.QueryRow(`SELECT value FROM items`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "a  b\nc" {
+		t.Fatalf("SQL literal modified when stored: got %q, want %q", value, "a  b\nc")
+	}
+}
+
+func TestRegressionSQLConditionalOnlySecondParameter(t *testing.T) {
+	setTestSQLiteDB(t)
+	resetJavascriptInclude(t)
+	if _, err := db.Exec(`CREATE TABLE items (id INTEGER, name TEXT, category TEXT); INSERT INTO items VALUES (1,'book 1','book');`); err != nil {
+		t.Fatal(err)
+	}
+	source := `SELECT id, name, category FROM items
+/*BEGIN*/
+WHERE
+  /*IF id != null*/ id = /*id*/1 /*END*/
+  /*IF category != null*/ AND category = /*category*/'book' /*END*/
+/*END*/;`
+	params := map[string]interface{}{"category": "book"}
+	query, args := prepareQueryWithParams(processConditionals(processWhereBlock(source, params), params), params)
+	t.Logf("generated SQL: %s; args=%#v", query, args)
+	sqlPath := filepath.Join(t.TempDir(), "conditional.sql")
+	writeTestFile(t, sqlPath, source)
+	setTestSQLFiles(t, map[string]APIConfig{"review": {SQL: []string{sqlPath}}})
+	request := httptest.NewRequest(http.MethodGet, "/?api=review&category=book", nil)
+	request.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+	response := httptest.NewRecorder()
+	unifiedHandler(response, request)
+	if response.Code != 200 {
+		t.Fatalf("README conditional example returned HTTP %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestRegressionSQLQuoteEscapedDefault(t *testing.T) {
+	setTestSQLiteDB(t)
+	if _, err := db.Exec(`CREATE TABLE items (name TEXT); INSERT INTO items VALUES ('replacement');`); err != nil {
+		t.Fatal(err)
+	}
+	query, args := prepareQueryWithParams(`SELECT name FROM items WHERE name = /*name*/'O''Reilly'`, map[string]interface{}{"name": "replacement"})
+	t.Logf("generated SQL=%q; args=%#v", query, args)
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		t.Fatalf("valid standard SQL string default caused error: %v", err)
+	}
+	defer rows.Close()
+	result, err := RowsToJSON(rows)
+	if err != nil || string(result) != `[{"name":"replacement"}]` {
+		t.Fatalf("result=%s; error=%v", result, err)
+	}
+}
+
+func TestRegressionSQLJSONPreservesLargeIntegers(t *testing.T) {
+	setTestSQLiteDB(t)
+	got, err := queryTestRowsJSON(t, `SELECT CAST('{"id":9007199254740993}' AS BLOB) AS document`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"document":{"id":9007199254740993}}]`
+	if string(got) != want {
+		t.Fatalf("JSON integer corrupted: got %s want %s", got, want)
+	}
+}
+
+func TestRegressionMCPStdioScopeMutation(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	script := writeTestScript(t, `nyanAllParams.mcp_principal.scopes[0] = "changed"; ({success:true});`)
+	snapshot := newAPIConfigSnapshot(map[string]APIConfig{"tool": {Script: script, Scopes: []string{"tool:read"}}}, "", [32]byte{})
+	_, err := executeMCPToolForStdio(snapshot, MCPToolConfig{API: "tool"}, map[string]interface{}{}, json.RawMessage("1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Definitions["tool"].Scopes[0] != "tool:read" {
+		t.Fatalf("tool mutated snapshot scopes: %#v", snapshot.Definitions["tool"].Scopes)
+	}
+}
+
+func TestRegressionNestedTransaction(t *testing.T) {
+	for _, failure := range []string{"", "parent", "child", "caught_child"} {
+		t.Run(failure, func(t *testing.T) {
+			resetJavascriptInclude(t)
+			database := setTestSQLiteDB(t)
+			if _, err := database.Exec(`CREATE TABLE items (value TEXT)`); err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			insert := filepath.Join(dir, "insert.sql")
+			selectSQL := filepath.Join(dir, "select.sql")
+			writeTestFile(t, insert, `INSERT INTO items VALUES (/*value*/'default')`)
+			writeTestFile(t, selectSQL, `SELECT COUNT(*) AS count FROM items`)
+			childCode := fmt.Sprintf(`nyanRunSQL(%q,{value:"child"}); nyanCallMe({api:"read"});`, insert)
+			if failure == "child" || failure == "caught_child" {
+				childCode += `throw new Error("child failed");`
+			}
+			parentCode := fmt.Sprintf(`nyanRunSQL(%q,{value:"parent"});`, insert)
+			call := `nyanCallMe({api:"child"});`
+			if failure == "caught_child" {
+				call = `try { nyanCallMe({api:"child"}); } catch(e) {}`
+			}
+			parentCode += call
+			if failure == "parent" {
+				parentCode += `throw new Error("parent failed");`
+			}
+			parentCode += `nyanCallMe({api:"read"});`
+			snapshot := newAPIConfigSnapshot(map[string]APIConfig{
+				"child": {Script: writeTestScript(t, childCode), ParamCheck: writeTestScript(t, fmt.Sprintf(`nyanRunSQL(%q); ({success:true,status:200});`, selectSQL))},
+				"read":  {SQL: []string{selectSQL}},
+			}, filepath.Join(dir, "api.json"), [32]byte{})
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			body, err := runScriptInExecution(ctx, snapshot, []string{writeTestScript(t, parentCode)}, nil, APIRuntimeConfig{}, false, nil)
+			if failure == "" {
+				if err != nil || !strings.Contains(body, `"count":2`) {
+					t.Fatalf("body=%s err=%v", body, err)
+				}
+			} else if err == nil {
+				t.Fatalf("%s did not abort the transaction: %s", failure, body)
+			}
+			var count int
+			if err := database.QueryRow(`SELECT COUNT(*) FROM items`).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			if failure == "" {
+				want = 2
+			}
+			if count != want {
+				t.Fatalf("committed rows=%d want=%d", count, want)
+			}
+			if database.Stats().InUse != 0 {
+				t.Fatal("connection leaked")
+			}
+		})
+	}
+}
+
+func TestRegressionNestedTransactionConcurrent(t *testing.T) {
+	resetJavascriptInclude(t)
+	database := setTestSQLiteDB(t)
+	database.SetMaxOpenConns(2)
+	dir := t.TempDir()
+	query := filepath.Join(dir, "select.sql")
+	writeTestFile(t, query, `SELECT 42 AS answer`)
+	child := writeTestScript(t, `nyanCallMe({api:"sql"});`)
+	parent := writeTestScript(t, fmt.Sprintf(`nyanRunSQL(%q); nyanCallMe({api:"child"});`, query))
+	snapshot := newAPIConfigSnapshot(map[string]APIConfig{"sql": {SQL: []string{query}}, "child": {Script: child}}, filepath.Join(dir, "api.json"), [32]byte{})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		go func() {
+			body, err := runScriptInExecution(ctx, snapshot, []string{parent}, nil, APIRuntimeConfig{}, false, nil)
+			if err == nil && !strings.Contains(body, `"answer":42`) {
+				err = fmt.Errorf("unexpected body %s", body)
+			}
+			done <- err
+		}()
+	}
+	for i := 0; i < 8; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if database.Stats().InUse != 0 {
+		t.Fatal("connection leaked")
+	}
+}
+
+func TestRegressionNestedPushAfterCommit(t *testing.T) {
+	for _, abort := range []bool{false, true} {
+		t.Run(fmt.Sprint(abort), func(t *testing.T) {
+			resetJavascriptInclude(t)
+			database := setTestSQLiteDB(t)
+			oldHub := hub
+			hub = NewHub()
+			t.Cleanup(func() { hub = oldHub })
+			if _, err := database.Exec(`CREATE TABLE items (value TEXT)`); err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			insert := filepath.Join(dir, "insert.sql")
+			query := filepath.Join(dir, "read.sql")
+			marker := filepath.Join(dir, "pushed")
+			writeTestFile(t, insert, `INSERT INTO items VALUES ('child')`)
+			writeTestFile(t, query, `SELECT COUNT(*) AS count FROM items`)
+			child := writeTestScript(t, fmt.Sprintf(`nyanRunSQL(%q); ({success:true,status:200});`, insert))
+			push := writeTestScript(t, fmt.Sprintf(`const rows=nyanRunSQL(%q); if(rows[0].count!==1) throw new Error("uncommitted data"); nyanWriteTextFile(%q,"sent"); ({success:true});`, query, marker))
+			snapshot := newAPIConfigSnapshot(map[string]APIConfig{"child": {Script: child, Push: "events"}, "events": {Script: push}}, filepath.Join(dir, "api.json"), [32]byte{})
+			code := fmt.Sprintf(`nyanCallMe({api:"child"}); if(nyanGetFile(%q)!==null) throw new Error("Push ran before commit");`, marker)
+			if abort {
+				code += `throw new Error("rollback");`
+			} else {
+				code += `({success:true});`
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_, err := runScriptInExecution(ctx, snapshot, []string{writeTestScript(t, code)}, nil, APIRuntimeConfig{}, false, nil)
+			if (err != nil) != abort {
+				t.Fatalf("abort=%t err=%v", abort, err)
+			}
+			data, readErr := os.ReadFile(marker)
+			if abort {
+				if !os.IsNotExist(readErr) {
+					t.Fatalf("rolled back Push ran: %s %v", data, readErr)
+				}
+			} else if readErr != nil || string(data) != "sent" {
+				t.Fatalf("Push missing: %s %v", data, readErr)
+			}
+		})
+	}
+}
+
+func TestRegressionScriptDeadlineAndExport(t *testing.T) {
+	for _, scenario := range []string{"getter_loop", "getter_throw", "db_wait", "no_sql"} {
+		t.Run(scenario, func(t *testing.T) {
+			resetJavascriptInclude(t)
+			database := setTestSQLiteDB(t)
+			query := filepath.Join(t.TempDir(), "select.sql")
+			writeTestFile(t, query, `SELECT 1`)
+			code := `({ok:true});`
+			switch scenario {
+			case "getter_loop":
+				code = `({get value(){while(true){} }});`
+			case "getter_throw":
+				code = `({get value(){throw new Error("export failed");}});`
+			case "db_wait", "no_sql":
+				held, err := database.Begin()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer held.Rollback()
+				if scenario == "db_wait" {
+					code = fmt.Sprintf(`nyanRunSQL(%q);`, query)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			started := time.Now()
+			body, err := runScriptInExecution(ctx, newAPIConfigSnapshot(nil, "", [32]byte{}), []string{writeTestScript(t, code)}, nil, APIRuntimeConfig{Capabilities: []string{"sql"}, SQLFiles: []string{query}}, true, nil)
+			if scenario == "no_sql" {
+				if err != nil || body != `{"ok":true}` {
+					t.Fatalf("unnecessary DB wait: %s %v", body, err)
+				}
+			} else if err == nil {
+				t.Fatalf("%s unexpectedly succeeded: %s", scenario, body)
+			}
+			if time.Since(started) > time.Second {
+				t.Fatalf("deadline was not enforced: %v", time.Since(started))
+			}
+		})
+	}
+}
+
+func TestRegressionGetterFailureRollsBack(t *testing.T) {
+	resetJavascriptInclude(t)
+	database := setTestSQLiteDB(t)
+	if _, err := database.Exec(`CREATE TABLE items (value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "insert.sql")
+	writeTestFile(t, path, `INSERT INTO items VALUES ('value')`)
+	script := writeTestScript(t, fmt.Sprintf(`nyanRunSQL(%q); ({get value(){throw new Error("bad getter");}});`, path))
+	if _, err := runScript([]string{script}, nil); err == nil {
+		t.Fatal("getter failure ignored")
+	}
+	var count int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM items`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestRegressionHotReloadConcurrentEditRetry(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "api.json")
+	writeTestFile(t, path, `{"active":{"description":"initial"}}`)
+	initial := loadTestAPIConfig(t, path)
+	setTestAPISnapshot(t, initial.Snapshot)
+	writeTestFile(t, path, `{"candidate":{"description":"intermediate"}}`)
+	observed, reloaded, err := reloadAPIConfigGraphWithLoader(path, initial.Snapshot.Files, func(path string) (*apiConfigLoadResult, map[string]APIFileState, bool, error) {
+		loaded, discovered, err := loadAPIConfigFileAttempt(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Edit at the exact boundary between parsing and consistency verification.
+		writeTestFile(t, path, `{"final":{"description":"stable"}}`)
+		return nil, discovered, false, verifyAPIFileStates(loaded.Snapshot.Files)
+	})
+	if err == nil || reloaded {
+		t.Fatalf("concurrent candidate published: reload=%t err=%v", reloaded, err)
+	}
+	if _, ok := currentAPISnapshot().Definitions["active"]; !ok {
+		t.Fatal("active configuration lost")
+	}
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(path, observed)
+	if err != nil || !reloaded {
+		t.Fatalf("stable final config not retried: reload=%t err=%v", reloaded, err)
+	}
+	if _, ok := currentAPISnapshot().Definitions["final"]; !ok {
+		t.Fatal("final configuration missing")
+	}
+}
+
+func TestRegressionExternalPrincipalInjection(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "private.txt"), "private-marker")
+	privateCheck := writeTestScript(t, `const p=nyanAllParams.mcp_principal; const allowed=!!p && p.role==="admin"; ({success:allowed,status:allowed?200:403});`)
+	cleanCheck := writeTestScript(t, `const clean=nyanAllParams.mcp_principal===undefined && nyanAllParams.nyan_guard===undefined; ({success:clean,status:clean?200:403});`)
+	snapshot := newAPIConfigSnapshot(map[string]APIConfig{
+		"private": {Type: apiTypePublic, Path: dir, ParamCheck: privateCheck},
+		"test":    {ParamCheck: cleanCheck, Script: writeTestScript(t, `({success:true,result:{principal:!!nyanAllParams.mcp_principal,guard:!!nyanAllParams.nyan_guard,request:nyanRequest}});`)},
+	}, filepath.Join(dir, "api.json"), [32]byte{})
+	setTestAPISnapshot(t, snapshot)
+	handler := newServiceHTTPHandler()
+	for _, path := range []string{"/private/private.txt", "/private/private.txt?mcp_principal=" + url.QueryEscape(`{"role":"admin"}`)} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest("GET", path, nil))
+		if recorder.Code != 403 || strings.Contains(recorder.Body.String(), "private-marker") {
+			t.Fatalf("private file exposed: %d %s", recorder.Code, recorder.Body.String())
+		}
+	}
+	cases := []struct{ name, method, path, contentType, body string }{
+		{"query", "GET", "/test?mcp_principal=%7B%22role%22%3A%22admin%22%7D&nyan_guard=true", "", ""},
+		{"json", "POST", "/test", "application/json", `{"mcp_principal":{"role":"admin"},"nyan_guard":true}`},
+		{"form", "POST", "/test", "application/x-www-form-urlencoded", "mcp_principal=%7B%22role%22%3A%22admin%22%7D&nyan_guard=true"},
+		{"rpc", "POST", "/nyan-rpc", "application/json", `{"jsonrpc":"2.0","id":1,"method":"test","params":{"mcp_principal":{"role":"admin"},"nyan_guard":true}}`},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(test.method, test.path, strings.NewReader(test.body))
+			req.Header.Set("Content-Type", test.contentType)
+			req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != 200 {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			decoded := decodeTestJSONObject(t, recorder.Body.Bytes())
+			if test.name == "rpc" {
+				decoded = decoded["result"].(map[string]interface{})
+			}
+			result := decoded["result"].(map[string]interface{})
+			if result["principal"] != false || result["guard"] != false {
+				t.Fatalf("untrusted context reached script: %#v", result)
+			}
+			request := result["request"].(map[string]interface{})
+			encoded, _ := json.Marshal(request)
+			if !bytes.Contains(encoded, []byte("mcp_principal")) {
+				t.Fatalf("original request metadata lost: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestRegressionSQLDirectivesAndComments(t *testing.T) {
+	setTestSQLiteDB(t)
+	resetJavascriptInclude(t)
+	tests := []struct {
+		name, source string
+		params       map[string]interface{}
+		want         string
+	}{
+		{"line_comment", "-- report query\nSELECT 42 AS answer", nil, `"answer":42`},
+		{"block_comment", `/* report query */ /*note*/ SELECT 42 AS answer`, nil, `"answer":42`},
+		{"literal_directive", `SELECT '/*IF x != null*/a  b/*END*/' AS value`, nil, `a  b`},
+		{"literal_comment", "SELECT 'a  b\n-- c' AS value", nil, `a  b\n-- c`},
+		{"quoted_default", `SELECT /*name*/'O''Reilly' AS value`, map[string]interface{}{"name": "replacement"}, `"value":"replacement"`},
+		{"identifier_AND", `SELECT 42 AS answer /*IF BRAND != null*/ WHERE 0 /*END*/`, map[string]interface{}{"BRAND": 1}, `"result":[]`},
+		{"compound_AND", `SELECT 42 AS answer /*IF a != null AND b != null*/ WHERE 0 /*END*/`, map[string]interface{}{"a": 1, "b": 1}, `"result":[]`},
+		{"compound_OR", `SELECT 42 AS answer /*IF a != null OR b != null*/ WHERE 0 /*END*/`, map[string]interface{}{"b": 1}, `"result":[]`},
+		{"nested_IF", `SELECT 42 AS answer /*IF a != null*/ /*IF b != null*/ WHERE 0 /*END*/ /*END*/`, map[string]interface{}{"a": 1, "b": 1}, `"result":[]`},
+		{"multiple_BEGIN", `SELECT 42 AS answer /*BEGIN*/ WHERE /*IF a != null*/ AND 0 /*END*/ /*END*/ /*BEGIN*/ /*IF b != null*/ ORDER BY answer /*END*/ /*END*/`, map[string]interface{}{"a": 1, "b": 1}, `"result":[]`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "query.sql")
+			writeTestFile(t, path, test.source)
+			body, err := executeSQLAPI("test", []string{path}, test.params)
+			if err != nil || !strings.Contains(string(body), test.want) {
+				t.Fatalf("body=%s err=%v want=%s", body, err, test.want)
+			}
+		})
+	}
+	for _, source := range []string{
+		`SELECT $$ /*IF x != null*/ a  b /*END*/ $$`,
+		`SELECT $tag$ a  b -- c $tag$`,
+		`SELECT 'a  b', "quoted  name", ` + "`backtick  name`",
+	} {
+		processed := processConditionals(processWhereBlock(source, nil), nil)
+		query, args := prepareQueryWithParams(processed, nil)
+		if query != source || len(args) != 0 {
+			t.Fatalf("literal modified: %q -> %q (%v)", source, query, args)
+		}
+	}
+	for _, source := range []string{`SELECT 'RETURNING' AS value`, `UPDATE items SET value='RETURNING'`, `UPDATE items SET value=1 /* RETURNING value */`} {
+		if isReturningQuery(source) {
+			t.Fatalf("non-keyword RETURNING matched: %s", source)
+		}
+	}
+}
+
+func TestRegressionReadmeConditionalCombinations(t *testing.T) {
+	database := setTestSQLiteDB(t)
+	if _, err := database.Exec(`CREATE TABLE items (id INTEGER,name TEXT,category TEXT); INSERT INTO items VALUES (1,'book1','book'),(2,'other','other')`); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "query.sql")
+	writeTestFile(t, path, `SELECT id,name,category FROM items /*BEGIN*/ WHERE /*IF id != null*/ id=/*id*/1 /*END*/ /*IF category != null*/ AND category=/*category*/'book' /*END*/ /*END*/;`)
+	for _, test := range []struct {
+		params map[string]interface{}
+		count  int
+	}{
+		{nil, 2}, {map[string]interface{}{"id": 1}, 1}, {map[string]interface{}{"category": "book"}, 1}, {map[string]interface{}{"id": 1, "category": "book"}, 1}, {map[string]interface{}{"id": 2, "category": "book"}, 0},
+	} {
+		body, err := executeSQLAPI("test", []string{path}, test.params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var response struct{ Result []interface{} }
+		if err := json.Unmarshal(body, &response); err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Result) != test.count {
+			t.Fatalf("params=%v body=%s want rows=%d", test.params, body, test.count)
+		}
+	}
+}
+
+func TestRegressionReadmeOAuthValuesAndOrigin(t *testing.T) {
+	request := httptest.NewRequest("POST", "https://example.test/token?state=abcd&tag=a&tag=b", strings.NewReader("code=abcd&scope=a&scope=b"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	params, err := mcpOAuthRequestParams(httptest.NewRecorder(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := params["query"].(map[string]interface{})
+	form := params["form"].(map[string]interface{})
+	if query["state"] != "abcd" || form["code"] != "abcd" || !reflect.DeepEqual(query["tag"], []string{"a", "b"}) || !reflect.DeepEqual(form["scope"], []string{"a", "b"}) {
+		t.Fatalf("unexpected OAuth input types: %#v", params)
+	}
+	for _, origin := range []string{"http://client.example", "https://client.example"} {
+		if err := validateAllowedOrigins("test", []string{origin}); err != nil {
+			t.Fatal(err)
+		}
+		if !requestOriginAllowed(origin, "https://server.example", []string{origin}) {
+			t.Fatalf("configured origin rejected: %s", origin)
+		}
+	}
+	if requestOriginAllowed("http://unregistered.example", "https://server.example", []string{"http://client.example"}) {
+		t.Fatal("unregistered origin accepted")
+	}
+}
+
+func TestRegressionWSClientReplyWhitespace(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	received := make(chan string, 1)
+	serverErrors := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+		conn, err := u.Upgrade(w, r, nil)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if err := conn.WriteMessage(websocket.TextMessage, []byte("trigger")); err != nil {
+			serverErrors <- err
+			return
+		}
+		_, body, err := conn.ReadMessage()
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		received <- string(body)
+	}))
+	defer server.Close()
+	script := writeTestScript(t, `"  reply \n";`)
+	cfg := wsClientConfig{name: "review", scriptPath: script, connectURL: "ws" + strings.TrimPrefix(server.URL, "http")}
+	client := newWSClientRuntime(cfg)
+	done := make(chan error, 1)
+	go func() { done <- client.connectAndListen(cfg) }()
+	select {
+	case actual := <-received:
+		t.Logf("script result=%q actual WebSocket message=%q", "  reply \n", actual)
+		if actual != "reply" {
+			t.Errorf("ws_client must trim the reply as documented")
+		}
+	case err := <-serverErrors:
+		t.Fatal(err)
+	case <-time.After(3 * time.Second):
+		client.update(nil)
+		t.Fatal("WebSocket test timed out")
+	}
+	client.update(nil)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("WebSocket cleanup timed out")
+	}
 }

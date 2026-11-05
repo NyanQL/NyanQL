@@ -997,15 +997,16 @@ func configuredRateLimitAllows(bucketName string, rateLimit *HTTPRateLimitConfig
 	if rateLimit == nil {
 		return true, 0
 	}
-	window, err := time.ParseDuration(rateLimit.Window)
-	if err != nil || window <= 0 || rateLimit.Requests <= 0 {
-		return false, time.Second
-	}
+	return configuredRateLimitsAllow(bucketName, remoteAddress, now, rateLimit)
+}
+
+// Check every budget before charging any of them. Rejected attempts must not
+// consume a second budget whose window may outlast the rejecting budget.
+func configuredRateLimitsAllow(bucketName, remoteAddress string, now time.Time, rateLimits ...*HTTPRateLimitConfig) (bool, time.Duration) {
 	host := remoteAddress
 	if parsedHost, _, splitErr := net.SplitHostPort(remoteAddress); splitErr == nil {
 		host = parsedHost
 	}
-	key := bucketName + "\x00" + host + "\x00" + strconv.Itoa(rateLimit.Requests) + "\x00" + window.String()
 
 	mcpRateBuckets.Lock()
 	defer mcpRateBuckets.Unlock()
@@ -1017,16 +1018,37 @@ func configuredRateLimitAllows(bucketName string, rateLimit *HTTPRateLimitConfig
 		}
 		mcpRateBuckets.LastCleanup = now
 	}
-	bucket, exists := mcpRateBuckets.Buckets[key]
-	if !exists || now.Sub(bucket.StartedAt) >= window || now.Before(bucket.StartedAt) {
-		mcpRateBuckets.Buckets[key] = mcpRateBucket{StartedAt: now, Window: window, Count: 1}
-		return true, 0
+	pending := make(map[string]mcpRateBucket, len(rateLimits))
+	var retryAfter time.Duration
+	for _, rateLimit := range rateLimits {
+		if rateLimit == nil {
+			continue
+		}
+		window, err := time.ParseDuration(rateLimit.Window)
+		if err != nil || window <= 0 || rateLimit.Requests <= 0 {
+			return false, time.Second
+		}
+		key := bucketName + "\x00" + host + "\x00" + strconv.Itoa(rateLimit.Requests) + "\x00" + window.String()
+		if _, duplicate := pending[key]; duplicate {
+			continue
+		}
+		bucket, exists := mcpRateBuckets.Buckets[key]
+		if !exists || now.Sub(bucket.StartedAt) >= window || now.Before(bucket.StartedAt) {
+			bucket = mcpRateBucket{StartedAt: now, Window: window}
+		}
+		if bucket.Count >= rateLimit.Requests {
+			retryAfter = max(retryAfter, window-now.Sub(bucket.StartedAt))
+			continue
+		}
+		bucket.Count++
+		pending[key] = bucket
 	}
-	if bucket.Count >= rateLimit.Requests {
-		return false, window - now.Sub(bucket.StartedAt)
+	if retryAfter > 0 {
+		return false, retryAfter
 	}
-	bucket.Count++
-	mcpRateBuckets.Buckets[key] = bucket
+	for key, bucket := range pending {
+		mcpRateBuckets.Buckets[key] = bucket
+	}
 	return true, 0
 }
 
@@ -1409,7 +1431,7 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		http.Error(w, "unsupported Content-Type", http.StatusUnsupportedMediaType)
 		return
 	}
-	if allowed, retryAfter := configuredRateLimitAllows("mcp:"+serverName+":oauth:"+role, mcpOAuthRateLimit(serverConfig, role), r.RemoteAddr, time.Now()); !allowed {
+	if allowed, retryAfter := mcpOAuthRateLimitAllows(serverName, serverConfig, role, r.RemoteAddr, time.Now()); !allowed {
 		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(retryAfter.Seconds())))))
 		closeUnreadRequestBody(w, r)
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
@@ -1499,7 +1521,7 @@ func validateMCPOAuthContentType(role string, r *http.Request) error {
 	return nil
 }
 
-func mcpOAuthRateLimit(serverConfig APIConfig, role string) *HTTPRateLimitConfig {
+func mcpOAuthRateLimitAllows(serverName string, serverConfig APIConfig, role, remoteAddress string, now time.Time) (bool, time.Duration) {
 	requests := 60
 	switch role {
 	case "oauthAdminUser", "oauthRegister":
@@ -1507,10 +1529,8 @@ func mcpOAuthRateLimit(serverConfig APIConfig, role string) *HTTPRateLimitConfig
 	case "oauthAuthorize":
 		requests = 30
 	}
-	if serverConfig.RateLimit != nil && serverConfig.RateLimit.Requests < requests {
-		return serverConfig.RateLimit
-	}
-	return &HTTPRateLimitConfig{Requests: requests, Window: "1m"}
+	return configuredRateLimitsAllow("mcp:"+serverName+":oauth:"+role, remoteAddress, now,
+		&HTTPRateLimitConfig{Requests: requests, Window: "1m"}, serverConfig.RateLimit)
 }
 
 func mcpOAuthMaxConcurrent(serverConfig APIConfig, role string) int {
@@ -1724,7 +1744,7 @@ func executeMCPToolForStdio(snapshot *APIConfigSnapshot, tool MCPToolConfig, arg
 	if err := validateJSONSchemaValue(normalizedMCPInputSchema(schema.Input), arguments); err != nil {
 		return nil, fmt.Errorf("Tool arguments did not match the input schema")
 	}
-	scopes := apiConfig.Scopes
+	scopes := append([]string(nil), apiConfig.Scopes...)
 	if len(apiConfig.SecuritySchemes) > 0 {
 		scopes = mcpRequiredScopes(apiConfig.SecuritySchemes)
 	}
@@ -2907,6 +2927,7 @@ func checkWebSocketConnection(snapshot *APIConfigSnapshot, w http.ResponseWriter
 		return false
 	}
 	params := urlValuesToInterfaceMap(query)
+	stripExternalAuthenticationParams(params)
 	params["nyan_request"] = scriptHTTPRequestContext(r)
 	params["api"] = apiName
 	mode, err := parseExecutionMode(params)
@@ -4459,6 +4480,10 @@ func validateConfiguredServerTransportSecurity(snapshot *APIConfigSnapshot, serv
 }
 
 func reloadAPIConfigGraphIfChanged(apiFilePath string, lastObserved map[string]APIFileState) (map[string]APIFileState, bool, error) {
+	return reloadAPIConfigGraphWithLoader(apiFilePath, lastObserved, loadAndPublishAPIConfigAttempt)
+}
+
+func reloadAPIConfigGraphWithLoader(apiFilePath string, lastObserved map[string]APIFileState, load func(string) (*apiConfigLoadResult, map[string]APIFileState, bool, error)) (map[string]APIFileState, bool, error) {
 	observed, err := observeAPIFileStates(lastObserved)
 	if err != nil {
 		return cloneAPIFileStates(lastObserved), false, err
@@ -4467,12 +4492,17 @@ func reloadAPIConfigGraphIfChanged(apiFilePath string, lastObserved map[string]A
 		return observed, false, nil
 	}
 
-	loadResult, discoveredFiles, reloaded, err := loadAndPublishAPIConfigAttempt(apiFilePath)
+	loadResult, discoveredFiles, reloaded, err := load(apiFilePath)
 	if err != nil {
 		watched := mergeAPIFileStates(currentAPISnapshot().Files, discoveredFiles)
 		observedWatched, observeErr := observeAPIFileStates(watched)
 		if observeErr != nil {
 			return cloneAPIFileStates(lastObserved), false, observeErr
+		}
+		// A failed attempt may have read an older generation than the files
+		// observed here. Keep that attempted generation so the next poll retries.
+		if !reflect.DeepEqual(watched, observedWatched) {
+			return watched, false, err
 		}
 		return observedWatched, false, err
 	}
@@ -4569,6 +4599,10 @@ func runOutCheckScript(apiConfig APIConfig, params map[string]interface{}, statu
 }
 
 func runOutCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiConfig APIConfig, params map[string]interface{}, statusCode int, contentType string, body []byte) (bool, int, string, error) {
+	return runOutCheckScriptInExecution(snapshot, apiConfig, params, statusCode, contentType, body, nil)
+}
+
+func runOutCheckScriptInExecution(snapshot *APIConfigSnapshot, apiConfig APIConfig, params map[string]interface{}, statusCode int, contentType string, body []byte, execution *sqlExecution) (bool, int, string, error) {
 	outCheckPath := strings.TrimSpace(apiConfig.OutCheck)
 	if outCheckPath == "" {
 		return false, statusCode, "", nil
@@ -4591,7 +4625,7 @@ func runOutCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiConfig APICon
 	checkParams["nyan_output_body"] = bodyString
 	checkParams["nyan_output_body_base64"] = bodyBase64
 
-	success, checkStatusCode, _, jsonStr, err := runCheckScriptWithSnapshot(snapshot, outCheckPath, checkParams, nil)
+	success, checkStatusCode, _, jsonStr, err := runCheckScriptInExecution(snapshot, outCheckPath, checkParams, nil, execution)
 	if err != nil {
 		return true, http.StatusInternalServerError, "", err
 	}
@@ -4615,8 +4649,14 @@ func parseExecutionMode(params map[string]interface{}) (string, error) {
 	return mode, nil
 }
 
+func stripExternalAuthenticationParams(params map[string]interface{}) {
+	delete(params, "mcp_principal")
+	delete(params, "nyan_guard")
+}
+
 func collectRequestParams(r *http.Request) (map[string]interface{}, error) {
 	params := make(map[string]interface{})
+	defer stripExternalAuthenticationParams(params)
 	mergeRequestParameterValues(params, r.URL.Query())
 	contentType := r.Header.Get("Content-Type")
 	if strings.HasPrefix(contentType, "application/json") {
@@ -5847,7 +5887,7 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	}
 
 	if apiConfig.Script != "" {
-		scriptResult, err := runScriptWithSnapshot(snapshot, []string{apiConfig.Script}, params)
+		scriptResult, err := runScriptInExecution(r.Context(), snapshot, []string{apiConfig.Script}, params, APIRuntimeConfig{}, false, nil)
 		if err != nil {
 			logServiceError(slog.LevelError, "script_execution_failed", err, "api", apiKey)
 			sendJSONError(w, err.Error(), http.StatusInternalServerError)
@@ -5996,35 +6036,94 @@ func handleRequestWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	w.Write(body)
 }
 
-func isSelectQuery(query string) bool {
-	u := strings.TrimSpace(strings.ToUpper(query))
-	if strings.HasPrefix(u, "SELECT") {
-		return true
-	}
-	// CTE で始まる場合は SELECT かどうかをざっくり判定
-	if strings.HasPrefix(u, "WITH") {
-		// 最初の文の中に SELECT が含まれていれば結果セットを返す想定
-		// （単純化: INSERT/UPDATE/DELETE の CTE を誤判定したくなければ、より厳密にパースする）
-		// まずセミコロンまでを見る（無ければ全文）
-		semi := strings.Index(u, ";")
-		head := u
-		if semi >= 0 {
-			head = u[:semi]
+// sqlQuotedEnd returns zero unless index starts a quoted SQL value/identifier.
+func sqlQuotedEnd(source string, index int) int {
+	switch source[index] {
+	case '\'', '"', '`':
+		return scanSQLSchemaQuotedValue(source, index)
+	case '[':
+		if dbType != "postgres" && dbType != "duckdb" {
+			return scanSQLBracketIdentifier(source, index)
 		}
-		// 代表的なデータ修正文より SELECT が先に現れるなら SELECT とみなす
-		sel := strings.Index(head, "SELECT")
-		ins := strings.Index(head, "INSERT")
-		upd := strings.Index(head, "UPDATE")
-		del := strings.Index(head, "DELETE")
-
-		// SELECT が存在し、かつ INSERT/UPDATE/DELETE より前に出る場合を SELECT とみなす
-		firstMut := -1
-		for _, i := range []int{ins, upd, del} {
-			if i >= 0 && (firstMut == -1 || i < firstMut) {
-				firstMut = i
+	case '$':
+		end := index + 1
+		for end < len(source) && (source[end] == '_' || source[end] >= 'a' && source[end] <= 'z' || source[end] >= 'A' && source[end] <= 'Z' || end > index+1 && source[end] >= '0' && source[end] <= '9') {
+			end++
+		}
+		if end < len(source) && source[end] == '$' {
+			delimiter := source[index : end+1]
+			if close := strings.Index(source[end+1:], delimiter); close >= 0 {
+				return end + 1 + close + len(delimiter)
 			}
+			return len(source)
 		}
-		return sel >= 0 && (firstMut == -1 || sel < firstMut)
+	}
+	return 0
+}
+
+func sqlCommentEnd(source string, index int) int {
+	if strings.HasPrefix(source[index:], "--") || dbType == "mysql" && source[index] == '#' {
+		if end := strings.IndexByte(source[index:], '\n'); end >= 0 {
+			return index + end
+		}
+		return len(source)
+	}
+	if !strings.HasPrefix(source[index:], "/*") {
+		return 0
+	}
+	depth := 1
+	for end := index + 2; end < len(source); {
+		if strings.HasPrefix(source[end:], "/*") {
+			depth++
+			end += 2
+		} else if strings.HasPrefix(source[end:], "*/") {
+			depth--
+			end += 2
+			if depth == 0 {
+				return end
+			}
+		} else {
+			end++
+		}
+	}
+	return len(source)
+}
+
+func sqlClassificationText(source string) string {
+	var result strings.Builder
+	for index := 0; index < len(source); {
+		end := sqlQuotedEnd(source, index)
+		if end == 0 {
+			end = sqlCommentEnd(source, index)
+		}
+		if end > index {
+			result.WriteByte(' ')
+			index = end
+			continue
+		}
+		result.WriteByte(source[index])
+		index++
+	}
+	return result.String()
+}
+
+func isSelectQuery(query string) bool {
+	tokens := scanSQLTopLevelTokens(query)
+	if len(tokens) == 0 {
+		return false
+	}
+	if tokens[0].value != "WITH" {
+		return tokens[0].value == "SELECT"
+	}
+	// CTE bodies are parenthesized; classify the outer statement by tokens
+	// so names such as updated_items do not become mutation keywords.
+	for _, token := range tokens[1:] {
+		switch token.value {
+		case "SELECT":
+			return true
+		case "INSERT", "UPDATE", "DELETE", "MERGE":
+			return false
+		}
 	}
 	return false
 }
@@ -6035,12 +6134,25 @@ func prepareQueryWithParams(query string, params map[string]interface{}) (string
 	var builder strings.Builder
 
 	for i := 0; i < len(query); {
-		start := strings.Index(query[i:], "/*")
-		if start == -1 {
+		start := i
+		for start < len(query) {
+			if end := sqlQuotedEnd(query, start); end > start {
+				start = end
+				continue
+			}
+			if strings.HasPrefix(query[start:], "/*") {
+				break
+			}
+			if end := sqlCommentEnd(query, start); end > start {
+				start = end
+				continue
+			}
+			start++
+		}
+		if start == len(query) {
 			builder.WriteString(query[i:])
 			break
 		}
-		start += i
 		commentEnd := strings.Index(query[start+2:], "*/")
 		if commentEnd == -1 {
 			builder.WriteString(query[i:])
@@ -6054,8 +6166,8 @@ func prepareQueryWithParams(query string, params map[string]interface{}) (string
 			continue
 		}
 
-		_, defaultEnd := findPlaceholderDefault(query, commentEnd+2)
-		if defaultEnd == -1 {
+		defaultStart, defaultEnd := findPlaceholderDefault(query, commentEnd+2)
+		if defaultEnd == -1 || !isSQLPlaceholderLiteral(query[defaultStart:defaultEnd]) {
 			builder.WriteString(query[i : commentEnd+2])
 			i = commentEnd + 2
 			continue
@@ -6136,6 +6248,21 @@ func prepareQueryWithParams(query string, params map[string]interface{}) (string
 	return builder.String(), args
 }
 
+func isSQLPlaceholderLiteral(value string) bool {
+	if value == "" {
+		return false
+	}
+	switch value[0] {
+	case '\'', '"', '{', '[':
+		return true
+	}
+	if strings.EqualFold(value, "null") || strings.EqualFold(value, "true") || strings.EqualFold(value, "false") {
+		return true
+	}
+	_, err := strconv.ParseFloat(value, 64)
+	return err == nil
+}
+
 func nextPlaceholder(counter *int) string {
 	if dbType == "postgres" {
 		place := fmt.Sprintf("$%d", *counter)
@@ -6166,10 +6293,44 @@ func findPlaceholderDefault(query string, offset int) (int, int) {
 		return i, end
 	default:
 		j := i
-		for j < len(query) && !strings.ContainsRune(" \t\r\n,;)", rune(query[j])) {
+		if isSQLIdentifierStart(query[j]) {
+			for j < len(query) && isSQLIdentifierPart(query[j]) {
+				j++
+			}
+			return i, j
+		}
+		if query[j] == '+' || query[j] == '-' {
 			j++
 		}
-		if j == i {
+		digits := 0
+		for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+			j++
+			digits++
+		}
+		if j < len(query) && query[j] == '.' {
+			j++
+			for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+				j++
+				digits++
+			}
+		}
+		if digits == 0 {
+			return i, -1
+		}
+		if j < len(query) && (query[j] == 'e' || query[j] == 'E') {
+			j++
+			if j < len(query) && (query[j] == '+' || query[j] == '-') {
+				j++
+			}
+			exponentStart := j
+			for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+				j++
+			}
+			if j == exponentStart {
+				return i, -1
+			}
+		}
+		if j < len(query) && (isSQLIdentifierPart(query[j]) || query[j] == '.') {
 			return i, -1
 		}
 		return i, j
@@ -6177,17 +6338,7 @@ func findPlaceholderDefault(query string, offset int) (int, int) {
 }
 
 func scanQuotedSQLValue(s string, start int) int {
-	quote := s[start]
-	for i := start + 1; i < len(s); i++ {
-		if s[i] == '\\' {
-			i++
-			continue
-		}
-		if s[i] == quote {
-			return i + 1
-		}
-	}
-	return len(s)
+	return scanSQLSchemaQuotedValue(s, start)
 }
 
 func scanBalancedSQLValue(s string, start int, open byte, close byte) int {
@@ -6259,9 +6410,8 @@ func RowsToJSON(rows *sql.Rows) ([]byte, error) {
 				// JSON っぽいならパースを試みる（先頭が { または [ または "n"=null）
 				s := string(v)
 				if len(s) > 0 && (s[0] == '{' || s[0] == '[' || s == "null") {
-					var any interface{}
-					if err := json.Unmarshal(v, &any); err == nil {
-						entry[col] = any
+					if json.Valid(v) {
+						entry[col] = json.RawMessage(append([]byte(nil), v...))
 						continue
 					}
 				}
@@ -6637,36 +6787,21 @@ func isSQLSchemaParameterName(name string) bool {
 }
 
 func sqlSchemaPlaceholderDefault(source string, offset int) (string, bool) {
-	index := offset
-	for index < len(source) && isSQLSchemaWhitespace(source[index]) {
-		index++
-	}
-	if index >= len(source) {
+	start, end := findPlaceholderDefault(source, offset)
+	if end < 0 {
 		return "", false
 	}
-	start := index
-	switch source[index] {
-	case '\'', '"':
-		index = scanSQLSchemaQuotedValue(source, index)
-	case '{':
-		index = scanBalancedSQLValue(source, index, '{', '}')
-	case '[':
-		index = scanBalancedSQLValue(source, index, '[', ']')
-	default:
-		for index < len(source) && !strings.ContainsRune(" \t\r\n,;)", rune(source[index])) {
-			index++
-		}
-	}
-	if index <= start {
-		return "", false
-	}
-	return source[start:index], true
+	return source[start:end], true
 }
 
 func scanSQLSchemaQuotedValue(source string, start int) int {
 	quote := source[start]
+	backslashEscapes := dbType == "mysql" && (quote == '\'' || quote == '"')
+	if quote == '\'' && (dbType == "postgres" || dbType == "duckdb") && start > 0 && (source[start-1] == 'E' || source[start-1] == 'e') && (start == 1 || !isSQLIdentifierPart(source[start-2])) {
+		backslashEscapes = true
+	}
 	for index := start + 1; index < len(source); index++ {
-		if source[index] == '\\' && index+1 < len(source) {
+		if backslashEscapes && source[index] == '\\' && index+1 < len(source) {
 			index++
 			continue
 		}
@@ -7060,22 +7195,15 @@ func scanSQLTopLevelTokens(source string) []sqlTopLevelToken {
 	tokens := make([]sqlTopLevelToken, 0)
 	depth := 0
 	for index := 0; index < len(source); {
+		if end := sqlQuotedEnd(source, index); end > index {
+			index = end
+			continue
+		}
+		if end := sqlCommentEnd(source, index); end > index {
+			index = end
+			continue
+		}
 		switch {
-		case source[index] == '\'' || source[index] == '"' || source[index] == '`':
-			index = scanSQLSchemaQuotedValue(source, index)
-		case source[index] == '[':
-			index = scanSQLBracketIdentifier(source, index)
-		case index+1 < len(source) && source[index] == '-' && source[index+1] == '-':
-			index += 2
-			for index < len(source) && source[index] != '\n' {
-				index++
-			}
-		case index+1 < len(source) && source[index] == '/' && source[index+1] == '*':
-			commentEnd := strings.Index(source[index+2:], "*/")
-			if commentEnd < 0 {
-				return tokens
-			}
-			index += commentEnd + 4
 		case source[index] == '(':
 			depth++
 			index++
@@ -7506,66 +7634,20 @@ func sendJSONError(w http.ResponseWriter, message interface{}, statusCode int) {
 
 // 従来形式の IF ブロック処理（/*IF ...*/ ... /*END*/）
 func processConditionalsOnce(query string, params map[string]interface{}) string {
-	reIf := regexp.MustCompile(`(?s)/\*IF\s+(.*?)\*/(.*?)/\*END\*/`)
-	query = reIf.ReplaceAllStringFunc(query, func(block string) string {
-		parts := reIf.FindStringSubmatch(block)
-		if len(parts) < 3 {
-			return ""
-		}
-		condition := strings.TrimSpace(parts[1])
-		content := parts[2]
-		if strings.Contains(condition, "!=") {
-			condParts := strings.Split(condition, "!=")
-			if len(condParts) == 2 {
-				paramName := strings.TrimSpace(condParts[0])
-				expected := strings.TrimSpace(condParts[1])
-				if expected == "null" {
-					if val, exists := params[paramName]; exists && !isEmpty(val) {
-						return content
-					}
-				}
-			}
-		} else if strings.Contains(condition, "==") {
-			condParts := strings.Split(condition, "==")
-			if len(condParts) == 2 {
-				paramName := strings.TrimSpace(condParts[0])
-				expected := strings.TrimSpace(condParts[1])
-				if expected == "null" {
-					if val, exists := params[paramName]; !exists || isEmpty(val) {
-						return content
-					}
-				}
-			}
-		}
-		return ""
-	})
-	reBegin := regexp.MustCompile(`(?s)/\*BEGIN\*/(.*?)/\*END\*/`)
-	query = reBegin.ReplaceAllStringFunc(query, func(block string) string {
-		parts := reBegin.FindStringSubmatch(block)
-		if len(parts) < 2 {
-			return ""
-		}
-		content := parts[1]
-		if strings.TrimSpace(content) != "" {
-			return content
-		}
-		return ""
-	})
-	return query
+	return processSQLConditionalBlocks(query, params)
 }
 
 func processConditionals(query string, params map[string]interface{}) string {
-	prev := ""
-	for query != prev {
-		prev = query
-		query = processConditionalsOnce(query, params)
-	}
-	return query
+	return processSQLConditionalBlocks(query, params)
 }
 
 func isReturningQuery(query string) bool {
-	upper := strings.ToUpper(query)
-	return strings.Contains(upper, "RETURNING")
+	for _, token := range scanSQLTopLevelTokens(query) {
+		if token.value == "RETURNING" {
+			return true
+		}
+	}
+	return false
 }
 
 type nyanSQLExecer interface {
@@ -7578,6 +7660,19 @@ func nyanRunSQLHandler(snapshot *APIConfigSnapshot, vm *goja.Runtime, call goja.
 }
 
 func nyanRunSQLHandlerWithExecer(snapshot *APIConfigSnapshot, vm *goja.Runtime, call goja.FunctionCall, execer nyanSQLExecer, allowedSQLFiles map[string]struct{}) goja.Value {
+	if execution, ok := execer.(*sqlExecution); ok {
+		defer func() {
+			if failure := recover(); failure != nil {
+				err, ok := failure.(error)
+				if !ok {
+					err = fmt.Errorf("nyanRunSQL failed: %v", failure)
+				}
+				execution.fail(err)
+				// Preserve the original JavaScript exception for try/catch.
+				panic(failure)
+			}
+		}()
+	}
 	// 第一引数: SQLファイルのパス
 	if len(call.Arguments) < 1 {
 		panic(vm.ToValue("nyanRunSQL requires at least the SQL file path as argument"))
@@ -7615,10 +7710,10 @@ func nyanRunSQLHandlerWithExecer(snapshot *APIConfigSnapshot, vm *goja.Runtime, 
 	if err != nil {
 		panic(vm.ToValue(fmt.Sprintf("failed to read SQL file %s: %v", sqlFilePath, err)))
 	}
-	normalizedSQL := normalizeSQL(string(sqlContent))
+	sourceSQL := string(sqlContent)
 
 	// 外側ブロックと IF ブロックの処理
-	processedSQL := processWhereBlock(normalizedSQL, params)
+	processedSQL := processWhereBlock(sourceSQL, params)
 	processedSQL = processConditionals(processedSQL, params)
 
 	// パラメータ置換
@@ -7637,8 +7732,12 @@ func nyanRunSQLHandlerWithExecer(snapshot *APIConfigSnapshot, vm *goja.Runtime, 
 		}
 		defer rows.Close()
 		jsonBytes, err := RowsToJSON(rows)
+		closeErr := rows.Close()
 		if err != nil {
 			panic(vm.ToValue(fmt.Sprintf("error converting rows to JSON: %v", err)))
+		}
+		if closeErr != nil {
+			panic(vm.ToValue(fmt.Sprintf("error closing SQL rows: %v", closeErr)))
 		}
 		// 返却する前に JSON 文字列を Go の値にパースする
 		var result interface{}
@@ -7732,6 +7831,10 @@ func (cfg *Config) javascriptIncludes() (string, error) {
 }
 
 func runCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string) (bool, int, interface{}, string, error) {
+	return runCheckScriptInExecution(snapshot, apiCheckScriptPath, params, acceptedParamsKeys, nil)
+}
+
+func runCheckScriptInExecution(snapshot *APIConfigSnapshot, apiCheckScriptPath string, params map[string]interface{}, acceptedParamsKeys []string, execution *sqlExecution) (bool, int, interface{}, string, error) {
 	includes, err := config.javascriptIncludes()
 	if err != nil {
 		return false, 500, nil, "", err
@@ -7746,7 +7849,11 @@ func runCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiCheckScriptPath 
 	combinedScript.WriteString("\n")
 
 	vm := goja.New()
-	registerNyanFuncs(vm, snapshot, params, acceptedParamsKeys)
+	registerNyanFuncsInExecution(vm, snapshot, params, acceptedParamsKeys, execution)
+	if execution != nil {
+		stopInterrupt := interruptScriptOnCancellation(execution.ctx, vm)
+		defer stopInterrupt()
+	}
 
 	value, err := vm.RunString(combinedScript.String())
 	if err != nil {
@@ -7755,6 +7862,11 @@ func runCheckScriptWithSnapshot(snapshot *APIConfigSnapshot, apiCheckScriptPath 
 	jsonStr, err := checkResultToJSONString(value)
 	if err != nil {
 		return false, 500, nil, "", err
+	}
+	if execution != nil {
+		if err := execution.ctx.Err(); err != nil {
+			return false, 500, nil, "", err
+		}
 	}
 	var result struct {
 		Success *bool       `json:"success"`
@@ -7782,7 +7894,10 @@ func checkResultToJSONString(value goja.Value) (string, error) {
 	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
 		return "", fmt.Errorf("check script must return JSON")
 	}
-	exported := value.Export()
+	exported, err := exportScriptValue(value)
+	if err != nil {
+		return "", fmt.Errorf("export check result: %w", err)
+	}
 	if jsonStr, ok := exported.(string); ok {
 		return jsonStr, nil
 	}
@@ -7864,7 +7979,7 @@ func getAcceptedParamsKeys(sqlPaths []string) ([]string, error) {
 }
 
 // runScript は、指定された JavaScript ファイル群を結合して実行します。
-// この関数の先頭で DB トランザクションを開始し、nyanRunSQL のclosureだけに渡します。
+// 最初のSQLでトランザクションを開始し、同期的な内部API呼び出しにも引き継ぎます。
 // スクリプト内で複数の nyanRunSQL 呼び出しがあった場合、すべて同一トランザクション下で実行されます。
 // スクリプトの実行が成功すればコミット、エラーがあればロールバックします。
 func runScript(scriptPaths []string, params map[string]interface{}) (string, error) {
@@ -7875,7 +7990,152 @@ func runScriptWithSnapshot(snapshot *APIConfigSnapshot, scriptPaths []string, pa
 	return runScriptWithRuntimeWithSnapshot(snapshot, scriptPaths, params, APIRuntimeConfig{}, false)
 }
 
+const sqlConnectionWaitTimeout = 30 * time.Second
+
+// sqlExecution belongs to a synchronous script call tree. Only its owner commits.
+// Any descendant SQL/script error makes the shared transaction rollback-only.
+type sqlExecution struct {
+	ctx         context.Context
+	conn        *sql.Conn
+	tx          *sql.Tx
+	failure     error
+	afterCommit []func()
+}
+
+func (execution *sqlExecution) fail(err error) error {
+	if err != nil && execution.failure == nil {
+		execution.failure = err
+	}
+	return err
+}
+
+func (execution *sqlExecution) begin() error {
+	if execution.failure != nil {
+		return execution.failure
+	}
+	if err := execution.ctx.Err(); err != nil {
+		return execution.fail(err)
+	}
+	if execution.tx != nil {
+		return nil
+	}
+	wait, cancel := context.WithTimeout(execution.ctx, sqlConnectionWaitTimeout)
+	conn, err := db.Conn(wait)
+	cancel()
+	if err != nil {
+		return execution.fail(err)
+	}
+	execution.conn = conn
+	execution.tx, err = conn.BeginTx(execution.ctx, nil)
+	return execution.fail(err)
+}
+
+func (execution *sqlExecution) Query(query string, args ...interface{}) (*sql.Rows, error) {
+	if err := execution.begin(); err != nil {
+		return nil, err
+	}
+	rows, err := execution.tx.QueryContext(execution.ctx, query, args...)
+	return rows, execution.fail(err)
+}
+
+func (execution *sqlExecution) Exec(query string, args ...interface{}) (sql.Result, error) {
+	if err := execution.begin(); err != nil {
+		return nil, err
+	}
+	result, err := execution.tx.ExecContext(execution.ctx, query, args...)
+	return result, execution.fail(err)
+}
+
+func (execution *sqlExecution) close() {
+	if execution.tx != nil {
+		_ = execution.tx.Rollback()
+		execution.tx = nil
+	}
+	if execution.conn != nil {
+		_ = execution.conn.Close()
+		execution.conn = nil
+	}
+}
+
+func (execution *sqlExecution) commit() error {
+	if execution.failure != nil {
+		return fmt.Errorf("transaction aborted by execution error: %w", execution.failure)
+	}
+	if err := execution.ctx.Err(); err != nil {
+		return err
+	}
+	if execution.tx != nil {
+		if err := execution.tx.Commit(); err != nil {
+			return err
+		}
+		execution.tx = nil
+	}
+	// Release the connection before a queued Push starts its own SQL/script.
+	execution.close()
+	return nil
+}
+
+func exportScriptValue(value goja.Value) (exported interface{}, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			switch failure := recovered.(type) {
+			case *goja.Exception:
+				err = failure
+			case *goja.InterruptedError:
+				err = failure
+			case *goja.StackOverflowError:
+				err = failure
+			default:
+				panic(recovered)
+			}
+		}
+	}()
+	return value.Export(), nil
+}
+
 func runScriptWithRuntimeWithSnapshot(snapshot *APIConfigSnapshot, scriptPaths []string, params map[string]interface{}, runtimeConfig APIRuntimeConfig, restricted bool) (string, error) {
+	return runScriptInExecution(context.Background(), snapshot, scriptPaths, params, runtimeConfig, restricted, nil)
+}
+
+// The caller keeps cancellation active through result export, which can run JS getters.
+func interruptScriptOnCancellation(ctx context.Context, vm *goja.Runtime) func() {
+	if ctx.Done() == nil {
+		return func() {}
+	}
+	if err := ctx.Err(); err != nil {
+		vm.Interrupt(err)
+		return vm.ClearInterrupt
+	}
+	finished := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-ctx.Done():
+			vm.Interrupt(ctx.Err())
+		case <-finished:
+		}
+	}()
+	return func() {
+		close(finished)
+		<-watcherDone
+		vm.ClearInterrupt()
+	}
+}
+
+func runScriptInExecution(ctx context.Context, snapshot *APIConfigSnapshot, scriptPaths []string, params map[string]interface{}, runtimeConfig APIRuntimeConfig, restricted bool, execution *sqlExecution) (result string, resultErr error) {
+	owner := execution == nil
+	if owner {
+		if restricted {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, maxRestrictedScriptRuntime)
+			defer cancel()
+		}
+		execution = &sqlExecution{ctx: ctx}
+		defer execution.close()
+	}
+	defer func() { execution.fail(resultErr) }()
+
 	if restricted && runtimeHasCapability(runtimeConfig, "password") {
 		select {
 		case restrictedPasswordExecutions <- struct{}{}:
@@ -7884,22 +8144,6 @@ func runScriptWithRuntimeWithSnapshot(snapshot *APIConfigSnapshot, scriptPaths [
 			return "", errRestrictedRuntimeBusy
 		}
 	}
-	// トランザクション開始
-	tx, err := db.Begin()
-	if err != nil {
-		return "", fmt.Errorf("failed to begin transaction: %v", err)
-	}
-
-	committed := false
-	defer func() {
-		// committed=false のままなら rollback（成功時や commit 後は rollback しない）
-		if !committed {
-			if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
-				logServiceError(slog.LevelError, "transaction_rollback_failed", rbErr)
-			}
-		}
-	}()
-
 	// javascript_include に指定されたファイルと scriptPaths の内容を結合
 	includes, err := config.javascriptIncludes()
 	if err != nil {
@@ -7920,7 +8164,7 @@ func runScriptWithRuntimeWithSnapshot(snapshot *APIConfigSnapshot, scriptPaths [
 	vm := goja.New()
 
 	// 既存の関数群を登録
-	registerNyanFuncs(vm, snapshot, params, nil)
+	registerNyanFuncsInExecution(vm, snapshot, params, nil, execution)
 	var allowedSQLFiles map[string]struct{}
 	if restricted {
 		allowedSQLFiles = make(map[string]struct{}, len(runtimeConfig.SQLFiles))
@@ -7937,7 +8181,7 @@ func runScriptWithRuntimeWithSnapshot(snapshot *APIConfigSnapshot, scriptPaths [
 		}
 	}
 	vm.Set("nyanRunSQL", func(call goja.FunctionCall) goja.Value {
-		return nyanRunSQLHandlerWithExecer(snapshot, vm, call, tx, allowedSQLFiles)
+		return nyanRunSQLHandlerWithExecer(snapshot, vm, call, execution, allowedSQLFiles)
 	})
 	if runtimeConfig.Settings == nil {
 		vm.Set("nyanRuntimeSettings", map[string]interface{}{})
@@ -7948,53 +8192,42 @@ func runScriptWithRuntimeWithSnapshot(snapshot *APIConfigSnapshot, scriptPaths [
 		restrictNyanRuntimeCapabilities(vm, runtimeConfig.Capabilities)
 	}
 
-	var stopExecutionWatchdog func()
-	if restricted {
-		timer := time.NewTimer(maxRestrictedScriptRuntime)
-		finished := make(chan struct{})
-		watcherDone := make(chan struct{})
-		go func() {
-			defer close(watcherDone)
-			select {
-			case <-timer.C:
-				vm.Interrupt("restricted JavaScript execution timed out")
-			case <-finished:
-			}
-		}()
-		stopExecutionWatchdog = func() {
-			close(finished)
-			timer.Stop()
-			<-watcherDone
-			vm.ClearInterrupt()
-		}
-	}
+	// Remain interruptible through getter execution and result serialization.
+	stopInterrupt := interruptScriptOnCancellation(execution.ctx, vm)
+	defer stopInterrupt()
 
 	// スクリプト実行
 	value, err := vm.RunString(combinedScript.String())
-	if stopExecutionWatchdog != nil {
-		stopExecutionWatchdog()
-	}
 	if err != nil {
-		// committed は false のままなので defer rollback が動く
+		// The owner rolls back the shared transaction on execution/export failure.
 		return "", fmt.Errorf("script execution error: %v", err)
 	}
 
-	// トランザクションコミット
-	if err := tx.Commit(); err != nil {
-		// committed は false のままなので defer rollback が動く（ErrTxDone 以外はログ）
-		return "", fmt.Errorf("failed to commit transaction: %v", err)
-	}
-
-	committed = true
-	exported := value.Export()
-	if text, ok := exported.(string); ok {
-		return text, nil
-	}
-	encoded, err := json.Marshal(exported)
+	exported, err := exportScriptValue(value)
 	if err != nil {
-		return "", fmt.Errorf("encode script result: %w", err)
+		return "", fmt.Errorf("export script result: %w", err)
 	}
-	return string(encoded), nil
+	if text, ok := exported.(string); ok {
+		result = text
+	} else {
+		encoded, err := json.Marshal(exported)
+		if err != nil {
+			return "", fmt.Errorf("encode script result: %w", err)
+		}
+		result = string(encoded)
+	}
+	if err := execution.ctx.Err(); err != nil {
+		return "", err
+	}
+	if owner {
+		if err := execution.commit(); err != nil {
+			return "", fmt.Errorf("failed to commit transaction: %w", err)
+		}
+		for _, push := range execution.afterCommit {
+			push()
+		}
+	}
+	return result, nil
 }
 
 func runtimeHasCapability(runtimeConfig APIRuntimeConfig, target string) bool {
@@ -8063,12 +8296,16 @@ type apiExecutionResult struct {
 }
 
 func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allParams map[string]interface{}) (string, error) {
-	result, err := executeAPIWithSnapshot(snapshot, apiName, allParams)
+	return callNyanAPIInExecution(snapshot, apiName, allParams, nil)
+}
+
+func callNyanAPIInExecution(snapshot *APIConfigSnapshot, apiName string, allParams map[string]interface{}, execution *sqlExecution) (string, error) {
+	result, err := executeAPIInExecution(snapshot, apiName, allParams, execution)
 	if err != nil {
 		return "", err
 	}
 	if !result.CheckRejected && !result.CheckOnly {
-		performPushForResponse(snapshot, snapshot.Definitions[apiName], result.Params, result.Status, []byte(result.Body))
+		performPushForResponseInExecution(snapshot, snapshot.Definitions[apiName], result.Params, result.Status, []byte(result.Body), execution)
 	}
 	return result.Body, nil
 }
@@ -8077,6 +8314,10 @@ func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, 
 // Callers decide whether to return the result or broadcast it, and whether to
 // invoke the API's own Push target.
 func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allParams map[string]interface{}) (apiExecutionResult, error) {
+	return executeAPIInExecution(snapshot, apiName, allParams, nil)
+}
+
+func executeAPIInExecution(snapshot *APIConfigSnapshot, apiName string, allParams map[string]interface{}, execution *sqlExecution) (apiExecutionResult, error) {
 	result := apiExecutionResult{}
 	if strings.TrimSpace(apiName) == "" {
 		return result, fmt.Errorf("api name is required")
@@ -8106,7 +8347,7 @@ func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allPara
 			logServiceError(slog.LevelWarn, "accepted_params_load_failed", err, "api", apiName)
 			acceptedKeys = []string{}
 		}
-		success, checkStatus, _, jsonStr, err := runCheckScriptWithSnapshot(snapshot, checkScriptPath, params, acceptedKeys)
+		success, checkStatus, _, jsonStr, err := runCheckScriptInExecution(snapshot, checkScriptPath, params, acceptedKeys, execution)
 		if err != nil {
 			return result, fmt.Errorf("check script error: %v", err)
 		}
@@ -8126,13 +8367,13 @@ func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allPara
 	}
 	switch {
 	case apiConfig.Script != "":
-		body, err := runScriptWithSnapshot(snapshot, []string{apiConfig.Script}, params)
+		body, err := runScriptInExecution(context.Background(), snapshot, []string{apiConfig.Script}, params, APIRuntimeConfig{}, false, execution)
 		if err != nil {
 			return result, fmt.Errorf("failed to run API %s: %v", apiName, err)
 		}
 		result.Body = body
 	case len(apiConfig.SQL) > 0:
-		body, err := executeSQLAPI(apiName, apiConfig.SQL, params)
+		body, err := executeSQLAPIInExecution(apiName, apiConfig.SQL, params, execution)
 		if err != nil {
 			return result, err
 		}
@@ -8144,7 +8385,7 @@ func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allPara
 	if err != nil {
 		return result, err
 	}
-	handled, outStatusCode, outJSON, err := runOutCheckScriptWithSnapshot(snapshot, apiConfig, params, statusCode, "application/json", []byte(result.Body))
+	handled, outStatusCode, outJSON, err := runOutCheckScriptInExecution(snapshot, apiConfig, params, statusCode, "application/json", []byte(result.Body), execution)
 	result.Status = outStatusCode
 	if handled {
 		if err != nil {
@@ -8156,9 +8397,13 @@ func executeAPIWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allPara
 }
 
 func executeSQLAPI(apiName string, sqlFiles []string, params map[string]interface{}) ([]byte, error) {
+	return executeSQLAPIInExecution(apiName, sqlFiles, params, nil)
+}
+
+func executeSQLAPIInExecution(apiName string, sqlFiles []string, params map[string]interface{}, execution *sqlExecution) ([]byte, error) {
 	var tx *sql.Tx
 	var err error
-	if len(sqlFiles) > 1 {
+	if execution == nil && len(sqlFiles) > 1 {
 		tx, err = db.Begin()
 		if err != nil {
 			return nil, fmt.Errorf("failed to start transaction for API %s: %v", apiName, err)
@@ -8178,7 +8423,9 @@ func executeSQLAPI(apiName string, sqlFiles []string, params map[string]interfac
 
 		if isSelectQuery(queryStr) || isReturningQuery(queryStr) {
 			var rows *sql.Rows
-			if tx != nil {
+			if execution != nil {
+				rows, err = execution.Query(queryStr, args...)
+			} else if tx != nil {
 				rows, err = tx.Query(queryStr, args...)
 			} else {
 				rows, err = db.Query(queryStr, args...)
@@ -8197,7 +8444,9 @@ func executeSQLAPI(apiName string, sqlFiles []string, params map[string]interfac
 			}
 		} else {
 			var result sql.Result
-			if tx != nil {
+			if execution != nil {
+				result, err = execution.Exec(queryStr, args...)
+			} else if tx != nil {
 				result, err = tx.Exec(queryStr, args...)
 			} else {
 				result, err = db.Exec(queryStr, args...)
@@ -8240,10 +8489,10 @@ func executeSQLAPI(apiName string, sqlFiles []string, params map[string]interfac
 // まず "OR" で分割し、各部分についてさらに "AND" で分割、すべてが成立すればそのOR部分は成立とみなし、
 // いずれかが成立すれば全体でtrueを返します。
 func evaluateCondition(cond string, params map[string]interface{}) bool {
-	orParts := strings.Split(cond, "OR")
+	orParts := regexp.MustCompile(`(?i)\bOR\b`).Split(cond, -1)
 	for _, orPart := range orParts {
 		orPart = strings.TrimSpace(orPart)
-		andParts := strings.Split(orPart, "AND")
+		andParts := regexp.MustCompile(`(?i)\bAND\b`).Split(orPart, -1)
 		allTrue := true
 		for _, andPart := range andParts {
 			andPart = strings.TrimSpace(andPart)
@@ -8312,73 +8561,99 @@ func isEmpty(val interface{}) bool {
 // processWhereBlock は、SQL全文から外側ブロック (/*BEGIN*/ ～ /*END*/) を抽出し、
 // ブロック内のIFブロック（/*IF ...*/ ... /*END*/）を処理して、外側ブロックを置き換えます。
 func processWhereBlock(sqlText string, params map[string]interface{}) string {
-	beginIdx := strings.Index(sqlText, "/*BEGIN*/")
-	endIdx := strings.LastIndex(sqlText, "/*END*/")
-	if beginIdx == -1 || endIdx == -1 || beginIdx >= endIdx {
-		return sqlText
+	return processSQLConditionalBlocks(sqlText, params)
+}
+
+// Every directive is processed once; nested BEGIN/IF blocks share one evaluator.
+func processSQLConditionalBlocks(source string, params map[string]interface{}) string {
+	var parse func(int, bool) (string, int, bool)
+	parse = func(index int, nested bool) (string, int, bool) {
+		var result strings.Builder
+		for index < len(source) {
+			if end := sqlQuotedEnd(source, index); end > index {
+				result.WriteString(source[index:end])
+				index = end
+				continue
+			}
+			end := sqlCommentEnd(source, index)
+			if end > index {
+				if strings.HasPrefix(source[index:], "/*") && strings.HasSuffix(source[index:end], "*/") {
+					directive := strings.TrimSpace(source[index+2 : end-2])
+					if strings.EqualFold(directive, "END") && nested {
+						return result.String(), end, true
+					}
+					isBegin := strings.EqualFold(directive, "BEGIN")
+					isIF := len(directive) > 2 && strings.EqualFold(directive[:2], "IF") && isSQLSchemaWhitespace(directive[2])
+					if isBegin || isIF {
+						body, next, closed := parse(end, true)
+						if !closed {
+							result.WriteString(source[index:])
+							return result.String(), len(source), false
+						}
+						if isBegin {
+							result.WriteString(trimConditionalWhere(body))
+						} else if evaluateCondition(strings.TrimSpace(directive[2:]), params) {
+							result.WriteString(body)
+						}
+						index = next
+						continue
+					}
+				}
+				result.WriteString(source[index:end])
+				index = end
+				continue
+			}
+			result.WriteByte(source[index])
+			index++
+		}
+		return result.String(), index, false
 	}
-	// 外側ブロック内の内容を抽出
-	blockContent := sqlText[beginIdx+len("/*BEGIN*/") : endIdx]
-	// ブロック内のIFブロックを処理する（normalize も必要に応じて行う）
-	processedBlock := processCommentConditionals(blockContent, params)
-	if isEmptyConditionalSQLBlock(processedBlock) {
-		processedBlock = ""
-	}
-	// 外側ブロック全体を置き換える
-	result := sqlText[:beginIdx] + processedBlock + sqlText[endIdx+len("/*END*/"):]
+	result, _, _ := parse(0, false)
 	return result
 }
 
-func isEmptyConditionalSQLBlock(block string) bool {
-	trimmed := strings.TrimSpace(block)
-	if trimmed == "" {
-		return true
+func trimConditionalWhere(block string) string {
+	tokens := scanSQLTopLevelTokens(block)
+	if len(tokens) > 0 && tokens[0].value == "WHERE" {
+		for len(tokens) > 1 && (tokens[1].value == "AND" || tokens[1].value == "OR") && strings.TrimSpace(sqlClassificationText(block[tokens[0].end:tokens[1].start])) == "" {
+			block = block[:tokens[1].start] + block[tokens[1].end:]
+			tokens = scanSQLTopLevelTokens(block)
+		}
 	}
-	re := regexp.MustCompile(`(?i)\b(WHERE|AND|OR)\b`)
-	withoutConnectors := re.ReplaceAllString(trimmed, "")
-	return strings.TrimSpace(withoutConnectors) == ""
+	if isEmptyConditionalSQLBlock(block) {
+		return ""
+	}
+	return block
+}
+
+func isEmptyConditionalSQLBlock(block string) bool {
+	for index := 0; index < len(block); {
+		if isSQLSchemaWhitespace(block[index]) {
+			index++
+			continue
+		}
+		if end := sqlCommentEnd(block, index); end > index {
+			index = end
+			continue
+		}
+		start := index
+		for index < len(block) && isSQLIdentifierPart(block[index]) {
+			index++
+		}
+		if index == start {
+			return false
+		}
+		word := strings.ToUpper(block[start:index])
+		if word != "WHERE" && word != "AND" && word != "OR" {
+			return false
+		}
+	}
+	return true
 }
 
 // processCommentConditionals は、IFブロック（/*IF ...*/ ... /*END*/）を処理します。
 func processCommentConditionals(block string, params map[string]interface{}) string {
-	// 正規表現で非貪欲にIFブロックをマッチさせる
-	re := regexp.MustCompile(`(?s)/\*IF\s+(.*?)\*/(.*?)\s*/\*END\*/`)
-	processed := re.ReplaceAllStringFunc(block, func(match string) string {
-		submatches := re.FindStringSubmatch(match)
-		if len(submatches) < 3 {
-			return ""
-		}
-		cond := strings.TrimSpace(submatches[1])
-		content := strings.TrimSpace(submatches[2])
-		// 特別条件 "BEGIN" なら無条件に出力
-		if strings.ToUpper(cond) == "BEGIN" || evaluateCondition(cond, params) {
-			return content
-		}
-		return ""
-	})
-	return processed
-}
-
-// 余分な空白文字（改行、タブ、連続するスペース）を1つのスペースに正規化する関数
-func normalizeSQL(sqlText string) string {
-	// 行コメントを削除してから空白を正規化する
-	lines := strings.Split(sqlText, "\n")
-	for i, line := range lines {
-		inSingleQuote := false
-		for j := 0; j+1 < len(line); j++ {
-			if line[j] == '\'' {
-				inSingleQuote = !inSingleQuote
-				continue
-			}
-			if !inSingleQuote && line[j] == '-' && line[j+1] == '-' {
-				lines[i] = line[:j]
-				break
-			}
-		}
-	}
-	withoutLineComments := strings.Join(lines, "\n")
-	// \s+ は空白文字（スペース、タブ、改行など）の連続にマッチする
-	return regexp.MustCompile(`\s+`).ReplaceAllString(withoutLineComments, " ")
+	return processSQLConditionalBlocks(block, params)
 }
 
 // Send serializes API replies with Push broadcasts on the same connection.
@@ -8898,6 +9173,7 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	for k, v := range rpcReq.Params {
 		allParams[k] = v
 	}
+	stripExternalAuthenticationParams(allParams)
 	allParams["nyan_request"] = newScriptHTTPRequestContext(r, body)
 	apiKey := rpcReq.Method
 	allParams["api"] = apiKey
@@ -8972,7 +9248,7 @@ func handleJSONRPCWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	var finalResult map[string]interface{}
 	var finalBody []byte
 	if apiConfig.Script != "" {
-		scriptResult, err := runScriptWithSnapshot(snapshot, []string{apiConfig.Script}, allParams)
+		scriptResult, err := runScriptInExecution(r.Context(), snapshot, []string{apiConfig.Script}, allParams, APIRuntimeConfig{}, false, nil)
 		if err != nil {
 			respondJSONRPCError(w, rpcReq.ID, -32603, "Script execution error", err.Error())
 			return
@@ -9134,6 +9410,26 @@ func responseAllowsPush(statusCode int, body []byte) bool {
 	return true
 }
 
+func performPushForResponseInExecution(snapshot *APIConfigSnapshot, apiConfig APIConfig, params map[string]interface{}, statusCode int, body []byte, execution *sqlExecution) {
+	if apiConfig.Push == "" || !responseAllowsPush(statusCode, body) {
+		return
+	}
+	if execution == nil {
+		performPush(snapshot, apiConfig, params)
+		return
+	}
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		logServiceError(slog.LevelError, "push_params_copy_failed", err, "api", apiConfig.Push)
+		return
+	}
+	var captured map[string]interface{}
+	if err := json.Unmarshal(encoded, &captured); err != nil {
+		return
+	}
+	execution.afterCommit = append(execution.afterCommit, func() { performPush(snapshot, apiConfig, captured) })
+}
+
 func performPushForResponse(snapshot *APIConfigSnapshot, apiConfig APIConfig, allParams map[string]interface{}, statusCode int, body []byte) {
 	if apiConfig.Push != "" && responseAllowsPush(statusCode, body) {
 		performPush(snapshot, apiConfig, allParams)
@@ -9213,6 +9509,10 @@ func saveBase64ToFileWithSnapshot(snapshot *APIConfigSnapshot, destPath, b64 str
 }
 
 func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map[string]interface{}, acceptedParamsKeys []string) {
+	registerNyanFuncsInExecution(vm, snapshot, params, acceptedParamsKeys, nil)
+}
+
+func registerNyanFuncsInExecution(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map[string]interface{}, acceptedParamsKeys []string, execution *sqlExecution) {
 	writerRoot := ""
 	if snapshot != nil {
 		writerRoot = snapshot.RootPath
@@ -9323,6 +9623,9 @@ func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map
 		return nyanHostExecWrapper(vm, call)
 	})
 	vm.Set("nyanRunSQL", func(call goja.FunctionCall) goja.Value {
+		if execution != nil {
+			return nyanRunSQLHandlerWithExecer(snapshot, vm, call, execution, nil)
+		}
 		return nyanRunSQLHandler(snapshot, vm, call)
 	})
 	vm.Set("nyanGetFile", nyanGetFile(vm, snapshot))
@@ -9363,8 +9666,11 @@ func registerNyanFuncs(vm *goja.Runtime, snapshot *APIConfigSnapshot, params map
 		// separately and cannot be replaced by a nyanCallMe argument.
 		params["nyan_request"] = requestContext
 
-		result, err := callNyanAPIFromVMWithSnapshot(snapshot, apiName, params)
+		result, err := callNyanAPIInExecution(snapshot, apiName, params, execution)
 		if err != nil {
+			if execution != nil {
+				execution.fail(err)
+			}
 			panic(vm.ToValue(err.Error()))
 		}
 		var parsed interface{}
