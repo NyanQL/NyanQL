@@ -10090,26 +10090,15 @@ func TestWebSocketEndpointConfiguredUsesCompleteAPIName(t *testing.T) {
 	}
 }
 
-func TestUnifiedHandlerMountedWebSocketRejectsForeignOrigin(t *testing.T) {
-	setTestSQLFiles(t, map[string]APIConfig{"sub/list": {}})
-	request := httptest.NewRequest(http.MethodGet, "http://localhost/sub/list", nil)
-	request.Header.Set("Upgrade", "websocket")
-	request.Header.Set("Connection", "Upgrade")
-	request.Header.Set("Origin", "https://foreign.example")
-	recorder := httptest.NewRecorder()
-	unifiedHandler(recorder, request)
-	if recorder.Code != http.StatusForbidden {
-		t.Fatalf("status=%d want 403", recorder.Code)
-	}
-}
-
 func TestWebSocketConnectionChecks(t *testing.T) {
 	const allow = `({success:true,status:200,result:{checked:true}});`
 	const deny = `({success:false,status:403,result:{reason:"denied"},error:"denied"});`
+	const originCheck = `const allowed = nyanRequest.headers.origin === "https://trusted.example";
+({success:allowed,status:allowed ? 200 : 403,result:{checked:true}});`
 	for _, test := range []struct {
-		name, script, query, path                        string
-		status                                           int
-		legacyCheck, noCheck, missingFile, foreignOrigin bool
+		name, script, query, path, origin string
+		status                            int
+		legacyCheck, noCheck, missingFile bool
 	}{
 		{name: "allow", script: allow, status: 101},
 		{name: "allow_non_200", script: `({success:true,status:201});`, status: 101},
@@ -10133,8 +10122,15 @@ func TestWebSocketConnectionChecks(t *testing.T) {
 		{name: "no_check", noCheck: true, status: 101},
 		{name: "legacy_check", script: deny, legacyCheck: true, status: 403},
 		{name: "legacy_subscription", path: "/legacy/channel", noCheck: true, status: 101},
+		{name: "legacy_subscription_foreign_origin", path: "/legacy/channel", noCheck: true, origin: "https://foreign.example", status: 101},
 		{name: "legacy_check_only", path: "/legacy/channel", noCheck: true, query: "&nyan_mode=checkOnly", status: 404},
-		{name: "foreign_origin", script: allow, foreignOrigin: true, status: 403},
+		{name: "foreign_origin_allowed", script: allow, origin: "https://foreign.example", status: 101},
+		{name: "foreign_origin_no_check", noCheck: true, origin: "https://foreign.example", status: 101},
+		{name: "null_origin_no_check", noCheck: true, origin: "null", status: 101},
+		{name: "origin_check_allows", script: originCheck, origin: "https://trusted.example", status: 101},
+		{name: "origin_check_denies", script: originCheck, origin: "https://foreign.example", status: 403},
+		{name: "origin_check_denies_missing", script: originCheck, status: 403},
+		{name: "origin_check_only", script: originCheck, origin: "https://trusted.example", query: "&nyan_mode=checkOnly", status: 200},
 		{name: "unknown_endpoint", script: allow, path: "/unknown", status: 404},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -10178,11 +10174,11 @@ if (nyanAllParams.api !== "sub/events" || nyanAllParams.token !== "secret" ||
 			if path == "" {
 				path = "/sub/events"
 			}
-			origin := server.URL
-			if test.foreignOrigin {
-				origin = "https://foreign.example"
+			headers := http.Header{}
+			if test.origin != "" {
+				headers.Set("Origin", test.origin)
 			}
-			conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+path+"?token=secret&tag=a&tag=b"+test.query, http.Header{"Origin": []string{origin}})
+			conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+path+"?token=secret&tag=a&tag=b"+test.query, headers)
 			if conn != nil {
 				t.Cleanup(func() { _ = conn.Close() })
 			}
@@ -10211,7 +10207,7 @@ if (nyanAllParams.api !== "sub/events" || nyanAllParams.token !== "secret" ||
 				if readErr != nil {
 					t.Fatal(readErr)
 				}
-				if (test.status == 200 || test.status == 403) && !test.foreignOrigin {
+				if test.status == 200 || test.status == 403 {
 					result := decodeTestJSONObject(t, body)
 					if _, exists := result["result"]; !exists {
 						t.Fatalf("check result lost: %s", body)
@@ -10228,7 +10224,7 @@ if (nyanAllParams.api !== "sub/events" || nyanAllParams.token !== "secret" ||
 			if count != 0 {
 				t.Fatalf("connections remaining: %d", count)
 			}
-			wantParam := !test.noCheck && !test.missingFile && !test.foreignOrigin && test.path == "" && test.status != 400
+			wantParam := !test.noCheck && !test.missingFile && test.path == "" && test.status != 400
 			for stage, want := range map[string]bool{"param": wantParam, "body": false, "out": false, "push": false} {
 				_, statErr := os.Stat(filepath.Join(dir, stage))
 				if statErr != nil && !os.IsNotExist(statErr) {

@@ -673,7 +673,7 @@ var reSQLSchemaConditionParam = regexp.MustCompile(`(?i)([A-Za-z_][A-Za-z0-9_.-]
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true // 必要に応じてオリジンチェックを追加
+		return true // Originを含む接続可否の判断は、接続先APIのparamCheckに委ねる。
 	},
 }
 
@@ -895,11 +895,6 @@ func unifiedHandler(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		if !validateWebSocketOrigin(r) {
-			closeUnreadRequestBody(w, r)
-			http.Error(w, "forbidden origin", http.StatusForbidden)
-			return
-		}
 		handleWebSocketWithSnapshot(snapshot, w, r)
 		return
 	}
@@ -934,18 +929,6 @@ func webSocketEndpointConfigured(snapshot *APIConfigSnapshot, requestPath string
 		}
 	}
 	return false
-}
-
-func validateWebSocketOrigin(r *http.Request) bool {
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
-		return true
-	}
-	originURL, err := url.Parse(origin)
-	if err != nil || (originURL.Scheme != "http" && originURL.Scheme != "https") || originURL.Path != "" {
-		return false
-	}
-	return strings.EqualFold(originURL.Host, r.Host)
 }
 
 func findMCPServerForRequestInSnapshot(snapshot *APIConfigSnapshot, r *http.Request) (string, APIConfig, bool) {

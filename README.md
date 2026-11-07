@@ -1414,6 +1414,18 @@ NyanQLのWebSocketサーバでは、先頭の `/` を除いたURLパス全体が
 
 接続URLに `nyan_mode=checkOnly` を指定した場合は、成功時もチェック結果をHTTP応答で返し、WebSocketへアップグレードしません。チェック未設定ならHTTP 404です。`nyan_mode` は省略または空文字列で通常接続となり、それ以外の値や複数指定はHTTP 400です。チェック未設定の通常接続と、`ws_client` の `connectURL` による既存の購読パスは引き続き利用できます。購読接続への一律のBasic認証は追加せず、接続後のAPI実行には下記の認証を適用します。
 
+### WebSocket接続可否の判断方針
+
+通常のWebSocket接続では、次のように責務を分担します。
+
+- **接続時**：`paramCheck` があれば、サーバー側のJavaScriptで接続を許可するか判断します。未設定なら事前チェック不要として接続を許可します。`ws_client` の `connectURL` による既存の購読パスも、接続前チェックがなければ同じ扱いです。
+- **接続後**：各APIの `paramCheck`・本体処理で、そのAPI処理を受け付けるか判断します。接続しただけではAPI本体を実行しません。接続後のAPI実行に必要なBasic認証は、下記の説明どおり適用します。
+- **Go側**：WebSocketの通信手順、接続先の存在確認、接続数・受信サイズの上限など、通信基盤の処理を担当します。Originを理由とした接続の許可・拒否はJavaScript側の責務とします。
+
+Originを制限したい場合は、`paramCheck` で `nyanRequest.headers.origin` を参照して判断します。Originがない要求を受け入れるかどうかもJavaScript側で決めます。`paramCheck` 未設定時にはOriginによる制限を設けず、通信基盤の条件を満たす接続を受け入れます。
+
+Go側では、通常WebSocketのOriginの形式や接続先Hostとの一致による固定判定を行いません。別HostのOriginも、`paramCheck` が許可すれば接続できます。MCP/OAuthでは別途 `allowedOrigins` に基づくOrigin検証を行い、この通常WebSocketの責務分担は適用しません。
+
 ### WebSocketからAPIを呼び出す
 
 接続後、`api` に実行対象を指定したJSONオブジェクトをテキストメッセージとして送信できます。その他の項目はAPIのパラメータになります。
