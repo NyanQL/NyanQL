@@ -271,9 +271,34 @@ HTTP 200で次のJSONが返ります（キーの順序は問いません）。�
 | `DBName` | データベース名、またはSQLite/DuckDBのファイルパスです。 |
 | `BasicAuth` | API呼び出し時のBasic認証ユーザ名とパスワードです。 |
 | `APIHotReload` | `api.json` の定期的な変更確認を設定します。省略時も有効です。 |
+| `sqlResultLimits` | SQL結果ごとの行数・JSONバイト数の上限です。省略時は10,000行・4MiBです。 |
 | `javascript_include` | `check` や `script` の実行前に読み込む共通JavaScriptです。 |
+| `javascript_include_cache` | `true`で共通JSのソースを起動時に読み込み、再起動まで保持します。省略時は`false`です。 |
 
 `config.json` 内の相対パスは、`config.json` がある場所を基準にして扱われます。対象は `CertPath`、`KeyPath`、SQLite/DuckDB の `DBName`、`log.Filename`、`javascript_include` です。
+
+### SQL結果の上限と共通JSの読込設定
+
+次は既存の`config.json`へ追加する項目の例です。SQL結果の上限を10万行・32MiBに引き上げ、共通JSのソースを再起動まで保持します。
+
+```json
+{
+  "sqlResultLimits": {
+    "maxRows": 100000,
+    "maxBytes": 33554432
+  },
+  "javascript_include": ["./javascript/common.js"],
+  "javascript_include_cache": true
+}
+```
+
+`sqlResultLimits.maxRows`は行数、`maxBytes`はSQL結果をJSONに変換したときのバイト数です。項目の省略または`0`は、それぞれ10,000行・4MiB（4,194,304バイト）を意味し、無制限にはなりません。正の整数で上限を上げ下げできます。負数・小数・文字列・実行環境の整数範囲を超える値は起動時エラーになります。
+
+上限は各SQL結果セットに適用され、超過時は途中までの結果を返さずエラーにします。通常HTTP、JSON-RPC、内部呼び出し、`nyanRunSQL`と、それらを使うMCP・WebSocket・scheduleで共通です。SQLの更新件数や、複数のSQL結果を組み合わせた最終応答全体の上限ではありません。MCPのTool結果2MiB・応答全体4MiBなどの応答制限は別に適用されます。
+
+`javascript_include_cache: true`では、共通JSを設定順に起動時に読み込みます。読み込めないファイルがあれば起動を中止します。起動後にファイルを変更・削除しても、再起動までは読み込んだソースを使用します。`false`または省略時は、従来どおり各実行時にファイルを読み込みます。
+
+保持するのは共通JSのソースだけです。実行結果や変数は引き継がず、本体JSやチェックJSは引き続き各実行時に読み込みます。チェック、本体、OAuth用の制限付き実行、scheduleなどで同じ設定を使用します。これらの`config.json`設定の変更には再起動が必要です。
 
 ### ログ
 
@@ -327,7 +352,7 @@ Goのduration形式には日を表す `d` 単位がないため、1日は `"1d"`
 
 確認時刻はNyanQLを起動した時点を基準にします。たとえば `"24h"` は起動後24時間ごとの確認であり、「毎日午前0時」のような固定時刻での確認ではありません。間隔を長くすると、`api.json` の変更反映にも最大でその間隔と同程度の時間がかかります。
 
-確認のたびに監視対象ごとのファイル内容のSHA-256とリンク解決後のパスを比較し、いずれかが変わった場合はルートからincludeグラフ全体を1回再構築します。ルート設定やinclude先がシンボリックリンクの場合、その参照先の差し替えも検知します。同じ実体を指す複数のリンクも個別に監視します。子ファイルだけを部分的に差し替えることはありません。
+確認のたびに監視対象ごとのファイル内容のSHA-256とリンク解決後のパスを比較し、いずれかが変わった場合はルートからincludeグラフ全体を1回再構築します。ルート設定やinclude先がシンボリックリンクの場合、その参照先の差し替えも検知します。同じ実体を指す複数のリンクも個別に監視します。子ファイルだけを部分的に差し替えることはありません。読み込み中に再編集されて整合性検証に失敗した場合は、次の確認で安定した最新内容を再試行します。
 
 includeの追加・変更・削除に成功すると、監視対象も同時に追加・削除されます。参照中のincludeファイルが削除された場合や、候補設定のinclude先がまだ存在しない場合は、現在稼働中の正常な設定を維持したまま、そのパスの確認を続けます。ファイルが再作成または修正されると、次の変更確認時に再読み込みします。
 
@@ -678,6 +703,10 @@ GETのクエリ文字列では、`ids=1,2,3` のようにカンマ区切りで�
 
 ---
 
+SQLファイルの文字列リテラル内の空白・タブ・改行は、通常のSQL APIと `nyanRunSQL()` のどちらでも保持します。デフォルト値の引用符エスケープ（例：`/*name*/'O''Reilly'`）にも対応します。先頭に行コメントやブロックコメントのあるSELECTも、結果行を返します。
+
+DBドライバがバイト列で返すJSONオブジェクト・配列は、SQL結果のJSON化で数値の桁を保持します。JavaScriptへ渡す経路ではJavaScriptの数値精度の制約があるため、大きなIDを正確に扱う場合は文字列を使用してください。
+
 ## 条件つきSQL
 
 検索条件があるときだけWHERE句を出したい場合は、`/*BEGIN*/` と `/*IF ...*/` を使います。
@@ -704,7 +733,9 @@ WHERE
 /*IF id == null*/ ... /*END*/
 ```
 
-`AND` と `OR` を使った条件判定にも対応しています。ただし、複雑な式を自由に評価するものではありません。基本は「値があるか、ないか」を見てSQLの一部を出し分ける機能として使うのが安全です。
+`AND` と `OR` を使った条件判定は、`/*BEGIN*/` の内外で同じように利用できます。`AND` を先に評価し、次に `OR` を評価します。演算子の大文字・小文字は区別せず、`ORG_ID` や `BRAND` などのパラメータ名の一部を演算子として扱いません。括弧を使った任意の式には対応していません。
+
+BEGIN内で先頭の条件が消えた場合は、残ったWHERE句先頭の不要な `AND` / `OR` を取り除きます。上の例は、条件なし・idのみ・categoryのみ・両方指定に対応します。SQLの文字列リテラルや通常のコメント内に書かれたIF風の文字列は条件として処理しません。
 
 ---
 
@@ -1046,7 +1077,9 @@ OAuth参照先APIの `paramCheck`（別名 `check`）と `outCheck` も実行し
 
 OAuthのHTTP要求でも `nyan_mode=checkOnly` を指定すると、入力チェックの結果だけを返します。クエリと本文の両方に指定した場合はJSON／フォーム本文を優先し、空文字列は通常実行、`checkOnly` 以外の非空値や文字列以外はHTTP 400とします。入力チェック未設定時は本体を実行せずHTTP 500です。HTTPメソッド・Content-Type・本文上限・管理者認証などの検証は省略しません。OPTIONSではチェックも本体も実行しません。メタデータを含むHTTP経路にOAuthのレート・同時実行数制限を適用します。
 
-前後チェックと本体は、それぞれ新しいOAuth用VMで実行します。参照先APIの `runtime.capabilities`、SQLファイルの許可リスト、実行ごとの15秒制限とトランザクションを使います。既存の `javascript_include` も読み込みます。各段階に入力情報のコピーを渡すため、チェック内でのパラメータ書換えを後段の入力変更には使えません。チェックや本体で既に完了したDB更新などは、後続の拒否では取り消しません。
+OAuthのHTTP経路では、役割ごとの既定上限（管理者ユーザー作成・クライアント登録は毎分10回、認可は毎分30回、その他は毎分60回）と、`rateLimit` に指定した回数・期間を両方適用します。いずれかに達するとHTTP 429を返し、`Retry-After` は両方の枠が利用可能になるまでの待ち秒数です。レート制限で拒否された要求は枠を消費しません。
+
+前後チェックと本体は、それぞれ新しいOAuth用VMで実行します。参照先APIの `runtime.capabilities`、SQLファイルの許可リスト、戻り値変換とDB接続取得・実行にも適用する実行ごとの15秒の期限とトランザクションを使います。既存の `javascript_include` も読み込みます。各段階に入力情報のコピーを渡すため、チェック内でのパラメータ書換えを後段の入力変更には使えません。チェックや本体で既に完了したDB更新などは、後続の拒否では取り消しません。
 
 出力チェックの `nyanAllParams.nyan_output` には、送信予定の本文全体を文字列の `body` として渡し、`status`、`contentType`、検証済みの `headers`、`bodyBase64`、本文バイト数も渡します。`headers` のキーはHTTPの標準表記（`Location`、`Set-Cookie` など）で、値は1件なら文字列、複数件なら配列です。これらを書き換えても送信内容は変わりません。`verifyAccess` ではHTTP応答の代わりに認証判定全体のJSONを `body` に渡し、検査用の `status` は200とします。
 
@@ -1132,7 +1165,7 @@ JSON.stringify({
 });
 ```
 
-`script` の実行中は、NyanQLがトランザクションを開始します。`nyanRunSQL()` で実行したSQLは、同じトランザクションの中で処理されます。途中でエラーが起きた場合はロールバックされます。
+`script` では、最初のSQL実行時にNyanQLがトランザクションを開始します。`nyanRunSQL()` で実行したSQLは、同じトランザクションの中で処理されます。途中でエラーが起きた場合はロールバックされます。
 
 通常HTTP・ルートHTTPでは、本体が返したJSONオブジェクトのトップレベルの `status` をHTTP応答ステータスに使います。例えば `{"success":false,"status":503}` はHTTP 503、`{"status":201}` はHTTP 201になります。`success:false` だけではHTTPステータスは変更しません。本文の `status` は保持しますが、204・304などではHTTPの規則により本文は送信されません。
 
@@ -1140,7 +1173,7 @@ JSON.stringify({
 
 `outCheck` の `nyan_output.status` と `nyan_output_status` にも本体のステータスを渡します。`nyanCallMe()`・WebSocketのAPI実行・MCP・Push先の出力チェックでも同様です。`outCheck` が通過したら本文・ステータスとも本体のものを使い、拒否したら出力チェックの結果を返してPushを止めます。`outCheck` 未設定時は本体のステータスを使います。MCPのHTTP応答やWebSocketの通信形式は変更しません。内部呼び出しで本体が `status:503` を返しても、それだけではJavaScript例外になりません。
 
-本体の返却ステータスは、SQL更新のロールバックを指示するものではありません。本体が正常終了した後のステータス検証や `outCheck` でエラーになっても、本体が既にコミットした更新は取り消しません。
+本体の返却ステータスは、SQL更新のロールバックを指示するものではありません。最上位scriptが戻り値変換まで正常終了し、コミットした後のステータス検証や `outCheck` でエラーになっても、コミット済みの更新は取り消しません。`nyanCallMe()` の子APIの更新は親scriptと共有し、親がコミットするまでは未確定です。
 
 ---
 
@@ -1312,15 +1345,21 @@ nyanWriteBase64File("./files/hello.bin", "aGVsbG8="); // hello のバイト列�
 
 この場合、1つ目のSQLと2つ目のSQLは同じトランザクションで実行されます。途中でエラーが起きると、全体がロールバックされます。
 
-現在の実装では、`sql` が1つだけの場合は明示的なトランザクションを開始しません。データベース側の通常の自動コミット動作になります。
+最上位のSQL APIで `sql` が1つだけの場合は明示的なトランザクションを開始せず、データベース側の通常の自動コミット動作になります。scriptの `nyanCallMe()` から呼ばれた場合は、ファイル数にかかわらず親scriptのトランザクションに参加します。
 
 ---
 
 ## scriptでのトランザクション
 
-`script` を使うAPIでは、NyanQLがscript実行の開始時にトランザクションを開始します。
+`script` を使うAPIでは、最初のSQL実行時にトランザクションを開始します。SQLを使わないscriptはDB接続を確保しません。接続プールの空き待ちは最大30秒で、呼び出し元のキャンセルやOAuthの15秒の期限が先に来た場合はそちらを優先します。
 
-script内で `nyanRunSQL()` を何度呼んでも、同じトランザクションの中で実行されます。scriptが最後まで正常に終わるとコミットされます。scriptの実行でエラーが起きた場合はロールバックされます。
+script内で `nyanRunSQL()` を何度呼んでも、同じトランザクションの中で実行されます。`nyanCallMe()` の子API・孫APIのSQL、script、前後チェックもこのトランザクションを共有します。子APIは親の未コミット更新を参照でき、接続上限が1でも別接続の空きを待ちません。子APIの `paramCheck`・`outCheck` は、戻り値のgetter評価中も親scriptのキャンセルに従います。
+
+最上位scriptの実行と戻り値の変換が正常に終了してから、まとめてコミットします。親・子の実行で例外が起きた場合は全体をロールバックします。子APIの例外や `nyanRunSQL()` の引数評価・SQLファイル読込・SQL実行・結果読込のエラーをJavaScriptの `try/catch` で捕捉しても、失敗した共有トランザクションはコミットせず、最上位scriptをエラーにします。`success:false` やエラーステータスを通常の戻り値として返すだけでは、ロールバックは指示しません。
+
+子APIのPushは呼び出し完了時の引数を保持し、共有トランザクションのコミット後に実行します。親の本体が失敗した場合は未送信のPushも取り消します。ファイル保存や外部HTTPなど、DB以外の副作用はロールバックできません。
+
+この共有はscriptからの同期的な内部呼び出しに適用します。最上位APIの本体より前の `paramCheck`、コミット後の `outCheck`、Push先は別の実行です。
 
 複雑な登録処理をひとまとまりにしたい場合は、複数SQLの配列よりも `script` が向いています。
 
@@ -1375,6 +1414,18 @@ NyanQLのWebSocketサーバでは、先頭の `/` を除いたURLパス全体が
 
 接続URLに `nyan_mode=checkOnly` を指定した場合は、成功時もチェック結果をHTTP応答で返し、WebSocketへアップグレードしません。チェック未設定ならHTTP 404です。`nyan_mode` は省略または空文字列で通常接続となり、それ以外の値や複数指定はHTTP 400です。チェック未設定の通常接続と、`ws_client` の `connectURL` による既存の購読パスは引き続き利用できます。購読接続への一律のBasic認証は追加せず、接続後のAPI実行には下記の認証を適用します。
 
+### WebSocket接続可否の判断方針
+
+通常のWebSocket接続では、次のように責務を分担します。
+
+- **接続時**：`paramCheck` があれば、サーバー側のJavaScriptで接続を許可するか判断します。未設定なら事前チェック不要として接続を許可します。`ws_client` の `connectURL` による既存の購読パスも、接続前チェックがなければ同じ扱いです。
+- **接続後**：各APIの `paramCheck`・本体処理で、そのAPI処理を受け付けるか判断します。接続しただけではAPI本体を実行しません。接続後のAPI実行に必要なBasic認証は、下記の説明どおり適用します。
+- **Go側**：WebSocketの通信手順、接続先の存在確認、接続数・受信サイズの上限など、通信基盤の処理を担当します。Originを理由とした接続の許可・拒否はJavaScript側の責務とします。
+
+Originを制限したい場合は、`paramCheck` で `nyanRequest.headers.origin` を参照して判断します。Originがない要求を受け入れるかどうかもJavaScript側で決めます。`paramCheck` 未設定時にはOriginによる制限を設けず、通信基盤の条件を満たす接続を受け入れます。
+
+Go側では、通常WebSocketのOriginの形式や接続先Hostとの一致による固定判定を行いません。別HostのOriginも、`paramCheck` が許可すれば接続できます。MCP/OAuthでは別途 `allowedOrigins` に基づくOrigin検証を行い、この通常WebSocketの責務分担は適用しません。
+
 ### WebSocketからAPIを呼び出す
 
 接続後、`api` に実行対象を指定したJSONオブジェクトをテキストメッセージとして送信できます。その他の項目はAPIのパラメータになります。
@@ -1399,7 +1450,7 @@ MCP（HTTP／stdio）では、本体・`outCheck`の処理後、返却する本�
 
 MCP（HTTP／stdio）の本体結果に、最上位の真偽値 `success: false` があれば `isError: true` を返します。元の結果は `content` のtextと `structuredContent` に保持します。文字列の `"false"`、`null`、数値、入れ子の値、`success` の省略は、この条件ではエラーにしません。チェック・実行・応答検証の既存のエラー判定は引き続き適用します。
 
-内部呼び出し先と親APIのPushは、それぞれの結果で独立して判定します。内部呼び出し先のPushが完了した後で親が拒否・エラーになっても、完了済みの配信は取り消しません。上記の成功条件は呼び出し元に対するもので、Push先自身が返すエラー通知を一律に配信禁止にするものではありません。
+内部呼び出し先と親APIのPushは、それぞれの結果で独立して判定します。script内の内部呼び出し先のPushは、親と共有するトランザクションのコミット後に実行し、親の本体が失敗した場合は実行しません。コミット後に子のPushが完了し、その後に親の `outCheck` が拒否・エラーになった場合は、完了済みの配信を取り消しません。上記の成功条件は呼び出し元に対するもので、Push先自身が返すエラー通知を一律に配信禁止にするものではありません。
 
 `push` の参照先がSQL APIの場合、NyanQLはそのSQLを実行し、次のような形に包んで配信します。
 
@@ -1470,7 +1521,7 @@ ws_clientがinclude先にある場合、内部名と `nyanAllParams.ws_client` �
 | `nyanAllParams.ws_connect_url` | 接続先URLです。 |
 | `nyanAllParams.ws_description` | `api.json` に書いた説明です。 |
 
-scriptが空文字を返した場合、接続先へ返信しません。空でない文字列を返した場合、その文字列をWebSocketのテキストメッセージとして接続先へ送信します。
+scriptの結果は前後の空白・改行を除去してから扱います。空文字または空白・改行だけなら返信せず、それ以外は除去後の文字列をWebSocketのテキストメッセージとして送信します。
 
 `connectURL` には、環境変数を使うこともできます。
 
@@ -1558,7 +1609,7 @@ console.log(
 "schedule_debug executed at " + now.toISOString();
 ```
 
-`javascript_include` に設定した共通JavaScriptは、scheduleのscript実行時にも毎回読み込まれます。
+`javascript_include` に設定した共通JavaScriptは、scheduleにも適用されます。`javascript_include_cache`が`false`または省略時は毎回読み込み、`true`では起動時に保持したソースを使用します。
 
 ---
 
@@ -1631,7 +1682,7 @@ curl http://127.0.0.1:8080/local_mcp \
 | `transport` | `stdio` または `streamable_http`。必須 |
 | `tools` | scriptを持つ通常API名の配列。1件以上。include先は完全名 |
 | `protocolVersions` | 省略時 `2025-11-25` と `2025-06-18`。この2版に対応 |
-| `allowedOrigins` | HTTPで必須。HTTPSのOrigin配列。path/query/fragmentを含めない |
+| `allowedOrigins` | HTTPで必須。HTTP(S)のOrigin配列。path/query/fragmentを含めない |
 | `instructions` | initializeに返す利用説明 |
 | `rateLimit` | `{"requests":120,"window":"1m"}` 等。requestsは1〜10000、windowは1秒〜24時間 |
 | `maxConcurrent` | 1〜256。省略時/0は16 |
@@ -1651,11 +1702,11 @@ OAuth設定は認証処理そのものを生成しません。利用者認証、
 | `verifyAccess` | access tokenと要求scopeを検証するscript付きAPI。API定義の `scopes` に許可scopeを列挙 |
 | `adminUser` | 任意の管理用API。設定時はloopbackからの接続とconfigのBasic認証が必要 |
 
-OAuthを使う各Toolには `securitySchemes: [{"type":"oauth2","scopes":["example:read"]}]` 等のscopeを宣言し、verifyAccess側のscopesに含めます。hookは `nyanAllParams` の `oauth_hook`、`oauth_api`、`issuer`、`resource`、`scopes` 等を参照できます。HTTP hookにはmethod/query/form/body/cookies/headersが渡り、query/formの各値は配列です。verifyAccessには `authorization`、`tool`、`required_scopes` と `nyan_request` が渡ります。
+OAuthを使う各Toolには `securitySchemes: [{"type":"oauth2","scopes":["example:read"]}]` 等のscopeを宣言し、verifyAccess側のscopesに含めます。hookは `nyanAllParams` の `oauth_hook`、`oauth_api`、`issuer`、`resource`、`scopes` 等を参照できます。HTTP hookにはmethod/query/form/body/cookies/headersが渡り、query/formの各値は、1件なら文字列、同じキーが複数件あれば文字列の配列です。単一値に `[0]` を付けると先頭の1文字になるため、そのまま参照してください。verifyAccessには `authorization`、`tool`、`required_scopes` と `nyan_request` が渡ります。
 
 HTTP hookは `{status, contentType, headers, body}` を返します（status省略時200、指定時は100〜599の整数）。例えば拒否応答は `({status:400,contentType:"application/json",body:{error:"invalid_request"}});` です。verifyAccessはHTTP応答ではなく `{authenticated:true,principal:{...}}` または拒否の `{authenticated:false}` を返します。認証成功にはprincipalも必要です。JSオブジェクトと、それをJSON化した文字列を利用できます。チェックの `{success,status,result}` とは別の契約です。
 
-OAuthのscriptと前後チェックは、通常APIより機能を制限したVMで実行します。各参照先APIの `runtime` に `capabilities`（`sql`・`crypto`・`password`）を指定し、`sql`を使う場合は `sqlFiles` に許可SQLファイルを列挙します。`settings` は `nyanRuntimeSettings` から取得できます。例えば `"runtime":{"capabilities":["crypto","password"],"settings":{}}` です。外部HTTP、HostExec、汎用ファイル操作、nyanCallMeは利用できず、実行上限は15秒です。通常API全体を隔離する設定ではありません。
+OAuthのscriptと前後チェックは、通常APIより機能を制限したVMで実行します。各参照先APIの `runtime` に `capabilities`（`sql`・`crypto`・`password`）を指定し、`sql`を使う場合は `sqlFiles` に許可SQLファイルを列挙します。`settings` は `nyanRuntimeSettings` から取得できます。例えば `"runtime":{"capabilities":["crypto","password"],"settings":{}}` です。外部HTTP、HostExec、汎用ファイル操作、nyanCallMeは利用できません。各script・前後チェックの開始から15秒の期限を設け、JavaScript本体と戻り値変換中のgetterを監視します。同じ期限をSQLの接続取得・実行にも渡します。SQLを使わないscriptはDB接続を確保しません。期限切れや戻り値変換の例外では、その実行の未コミットSQLをロールバックします。これは各段階の期限であり、複数のチェックと本体を含むHTTP要求全体が15秒で完了する保証ではありません。同期ファイル読み込み、暗号計算、DBドライバ内のキャンセル不能な処理は、処理が戻るまで待つ場合があります。通常API全体を隔離する設定ではありません。
 
 ## JSON-RPC
 
@@ -1711,6 +1762,8 @@ DB接続の暗号化はHTTPのHTTPS設定とは別です。現在のPostgreSQL�
 ---
 
 ## 予約語
+
+`mcp_principal` と `nyan_guard` はサーバー側の認証・認可コンテキスト用です。通常HTTP・public・JSON-RPC・WebSocket接続前チェックでは、外部パラメータの同名キーを除去します。WebSocketのAPI実行メッセージでは拒否し、MCPでは入力スキーマ検証後に除去して検証済みの情報を設定します。`nyanRequest` の元リクエスト情報には外部入力が記録されますが、その内容を認証済みのprincipalとして信頼しないでください。サーバー内部で設定した引数まで一律に除去するものではありません。
 
 リクエストパラメータ名として、次の名前は避けてください。
 
