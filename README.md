@@ -278,6 +278,7 @@ HTTP 200で次のJSONが返ります（キーの順序は問いません）。�
 | `BasicAuth` | API呼び出し時のBasic認証ユーザ名とパスワードです。 |
 | `APIHotReload` | `api.json` の定期的な変更確認を設定します。省略時も有効です。 |
 | `webSocketLimits` | 全チャネル合計のWebSocket受入接続数の上限です。省略時は128件です。[設定仕様](#websocket-connection-limits)を参照してください。 |
+| `oauthRuntime` | OAuth用VMの混雑時の応答を選択します。省略時は従来の応答を維持します。[混雑応答の設定](#oauth-runtime-busy-response)を参照してください。 |
 | `sqlResultLimits` | SQL結果ごとの行数・JSONバイト数の上限です。省略時は10,000行・4MiBです。 |
 | `javascript_include` | `check` や `script` の実行前に読み込む共通JavaScriptです。 |
 | `javascript_include_cache` | `true`で共通JSのソースを起動時に読み込み、再起動まで保持します。省略時は`false`です。 |
@@ -1842,9 +1843,47 @@ HTTPのMCP枠とOAuth各役割の枠は別々です。`verifyAccess` は独立�
 
 OAuthの `paramCheck`・本体script・`outCheck` は、それぞれ別のVM実行です。`password` が許可されていれば、その段階で実際にパスワード関数を呼ぶかどうかにかかわらず、開始時に同時1件の枠を取得し、段階の終了時に解放します。次の段階が始まるまで同じ要求が枠を予約し続けるわけではありません。`password` を許可していないVMと、通常APIとしての実行にはこのVM受付枠は適用しません。
 
-VM受付で拒否された場合、OAuthのHTTP hookではHTTP 500 `OAuth hook failed` になります。MCPの `verifyAccess` の実行中に拒否された場合は認証判定失敗となり、`tools/call` はHTTP 401と `WWW-Authenticate` の `invalid_token` を返します。これはHTTP受付枠が満杯の場合の503とは異なる、現在の実装の動作です。VMの1件・Argon2の2件は固定値で、`maxConcurrent` を増やしても変更されません。
+VM受付で拒否された場合、既定ではOAuthのHTTP hookはHTTP 500 `OAuth hook failed` を返します。MCPの `verifyAccess` の実行中に拒否された場合は認証判定失敗となり、`tools/call` はHTTP 401と `WWW-Authenticate` の `invalid_token` を返します。`config.json` の `oauthRuntime.busyResponse` を `"serviceUnavailable"` にすると、このVM受付の混雑をHTTP 503として区別できます。詳細は [混雑応答の設定](#oauth-runtime-busy-response) を参照してください。VMの1件・Argon2の2件は固定値で、`maxConcurrent` や `busyResponse` を変更しても件数は変わりません。
 
 Argon2の計算枠待ちと計算自体は同期処理です。OAuth用VMの15秒の期限を過ぎても、枠待ちや計算が終わるまで制御が戻らない場合があります。15秒で計算や待機を必ず打ち切る仕様ではありません。
+
+<a id="oauth-runtime-busy-response"></a>
+
+#### OAuth用VMの混雑応答を設定する
+
+`config.json` のトップレベルに次の設定を追加すると、Go側のOAuth用VM受付枠が満杯の場合にHTTP 503を返します。全MCPサーバーのOAuth経路で共通です。`api.json` の `oauth` や各APIの `runtime` に指定する項目ではありません。
+
+```json
+"oauthRuntime": {
+  "busyResponse": "serviceUnavailable"
+}
+```
+
+| `busyResponse` の指定 | 動作 |
+|---|---|
+| 未指定・`null`・`"legacy"` | 従来どおり、OAuth HTTP hookは500、MCP `verifyAccess` は401・`invalid_token`。既存の応答本文・認証要求ヘッダーも維持します。 |
+| `"serviceUnavailable"` | Goの専用VM混雑エラーに限り、両経路とも503に変更します。 |
+| 上記以外の文字列（空文字列・大文字小文字違い・前後空白を含む値も含む）、数値・真偽値・配列・オブジェクト | 設定エラーで起動しません。 |
+
+`oauthRuntime` 自体が未指定・`null`・`{}` の場合も従来の動作です。サンプルの `config.json` は `"legacy"` を明記しています。設定変更の反映にはサービスの再起動が必要で、`APIHotReload` の対象ではありません。
+
+503モードのOAuth HTTP hookは、本文 `OAuth runtime is busy`（末尾改行付き）のテキスト応答になります。MCPの `tools/call` は要求IDを保持したJSON-RPC応答で、`result.isError: true` と同じ文言のテキストcontentを返します。この混雑応答には `WWW-Authenticate` ヘッダーと `mcp/www_authenticate` メタデータを付けません。`verifyAccess` を完了できなかった場合はToolの入力チェック・本体を実行しません。
+
+`Retry-After` は次の条件で扱います。ここでの「実行済み」は、同じOAuth hookの呼び出し内で前のJavaScript段階が正常終了したことを指します。共通JSもその段階の実行に含みます。
+
+| 混雑した位置 | 503モードの `Retry-After` |
+|---|---|
+| 最初の `paramCheck`（旧名 `check`）のVM受付 | `1` |
+| 入力チェックがない場合の本体scriptのVM受付 | `1` |
+| 入力チェックがないメタデータ経路の `outCheck` のVM受付（メタデータ本体はGoで生成） | `1` |
+| 入力チェックの正常終了後、本体scriptのVM受付 | 付けない |
+| 本体scriptまたは入力チェックの正常終了後、`outCheck` のVM受付 | 付けない |
+
+`Retry-After: 1` は再試行までの待ち時間の目安（秒）であり、1秒後の受付成功を保証しません。許可されたOriginへの応答では、ブラウザーからこのヘッダーを読めるよう公開します。`nyan_mode=checkOnly` でも、その経路で実行する入力チェックのVM受付に同じ規則を適用します。MCPの `verifyAccess` は常に通常の認証処理として実行します。
+
+後段のVM受付で混雑した時点では、前段のSQL更新などがすでにコミットされている場合があります。503は「要求全体が未実行」や「前段をロールバックした」という意味ではありません。NyanQLはこの設定による自動再試行を行いません。利用側もPOST等を無条件に再実行せず、重複実行の影響を確認してください。
+
+この設定は、Goの `password` capability用VM受付が返す専用エラーだけを対象とします。同じ文言をJavaScript例外として投げても混雑には分類しません。JavaScriptが返した認証・認可の判断、チェック拒否、独自のHTTP 503・ヘッダー、一般のスクリプト例外の扱いは維持します。HTTP受付枠の既存503・`Retry-After: 1`、レート制限の429、Argon2計算枠の待機、通常APIとしての実行にも変更はありません。
 
 ## JSON-RPC
 

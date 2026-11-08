@@ -162,6 +162,27 @@ func (limits WebSocketLimitsConfig) connectionLimit() int {
 	return defaultWebSocketConnections
 }
 
+// OAuthRuntimeConfig controls how runtime admission failures reach clients.
+// The zero value preserves the historical HTTP responses.
+type OAuthRuntimeConfig struct {
+	BusyResponse string `json:"busyResponse,omitempty"`
+}
+
+func (runtimeConfig *OAuthRuntimeConfig) UnmarshalJSON(data []byte) error {
+	type plain OAuthRuntimeConfig
+	decoded := plain{BusyResponse: "legacy"}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return fmt.Errorf("oauthRuntime: %w", err)
+	}
+	switch decoded.BusyResponse {
+	case "legacy", "serviceUnavailable":
+	default:
+		return fmt.Errorf("oauthRuntime.busyResponse must be legacy or serviceUnavailable")
+	}
+	*runtimeConfig = OAuthRuntimeConfig(decoded)
+	return nil
+}
+
 // Avoid net/http draining a body that the rejected client may never send.
 func closeUnreadRequestBody(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
@@ -309,6 +330,7 @@ type Config struct {
 	HTTPTimeouts           HTTPTimeoutsConfig    `json:"httpTimeouts"`
 	ReceiveLimits          ReceiveLimitsConfig   `json:"receiveLimits"`
 	WebSocketLimits        WebSocketLimitsConfig `json:"webSocketLimits"`
+	OAuthRuntime           OAuthRuntimeConfig    `json:"oauthRuntime"`
 	SQLResultLimits        SQLResultLimitsConfig `json:"sqlResultLimits"`
 	Name                   string                `json:"name"`
 	Profile                string                `json:"profile"`
@@ -1477,6 +1499,10 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	params["nyan_mode"] = mode
 	result, err := invokeMCPOAuthHook(snapshot, serverName, serverConfig, runtimeURLs, role, params)
 	if err != nil {
+		if prepareOAuthRuntimeBusyResponse(w, err) {
+			http.Error(w, "OAuth runtime is busy", http.StatusServiceUnavailable)
+			return
+		}
 		logServiceError(slog.LevelError, "oauth_hook_failed", err, "api", apiName, "role", role)
 		http.Error(w, "OAuth hook failed", http.StatusInternalServerError)
 		return
@@ -2270,7 +2296,11 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 	}
 	principal := interface{}(map[string]interface{}{"anonymous": true, "transport": "streamable_http"})
 	if mcpOAuthConfigured(serverConfig.OAuth) {
-		verifiedPrincipal, authenticated, forbidden := validateMCPAccessToken(snapshot, serverName, serverConfig, runtimeURLs, r, toolConfig.API, requiredScopes)
+		verifiedPrincipal, authenticated, forbidden, err := validateMCPAccessToken(snapshot, serverName, serverConfig, runtimeURLs, r, toolConfig.API, requiredScopes)
+		if prepareOAuthRuntimeBusyResponse(w, err) {
+			writeMCPResultWithStatus(w, request.ID, mcpToolErrorResult("OAuth runtime is busy", nil), http.StatusServiceUnavailable)
+			return
+		}
 		if !authenticated {
 			status := http.StatusUnauthorized
 			errorCode := "invalid_token"
@@ -2428,17 +2458,17 @@ func runMCPGuard(snapshot *APIConfigSnapshot, r *http.Request, serverConfig APIC
 	return decision, nil
 }
 
-func validateMCPAccessToken(snapshot *APIConfigSnapshot, serverName string, serverConfig APIConfig, runtimeURLs mcpRuntimeURLs, r *http.Request, tool string, requiredScopes []string) (interface{}, bool, bool) {
+func validateMCPAccessToken(snapshot *APIConfigSnapshot, serverName string, serverConfig APIConfig, runtimeURLs mcpRuntimeURLs, r *http.Request, tool string, requiredScopes []string) (interface{}, bool, bool, error) {
 	execution, err := invokeMCPOAuthHook(snapshot, serverName, serverConfig, runtimeURLs, "oauthValidateAccessToken", map[string]interface{}{
 		"authorization": r.Header.Get("Authorization"), "tool": tool, "required_scopes": requiredScopes,
 		"nyan_request": scriptHTTPRequestContext(r),
 	})
 	if err != nil || execution.CheckRejected || execution.CheckOnly {
-		return nil, false, false
+		return nil, false, false, err
 	}
 	result, ok := execution.Value.(map[string]interface{})
 	if !ok {
-		return nil, false, false
+		return nil, false, false, nil
 	}
 	authenticated, _ := result["authenticated"].(bool)
 	forbidden, _ := result["forbidden"].(bool)
@@ -2465,7 +2495,7 @@ func validateMCPAccessToken(snapshot *APIConfigSnapshot, serverName string, serv
 			}
 		}
 	}
-	return principal, authenticated && principal != nil, forbidden
+	return principal, authenticated && principal != nil, forbidden, nil
 }
 
 func mcpOAuthChallenge(runtimeURLs mcpRuntimeURLs, scopes []string, errorCode, description string) string {
@@ -2509,6 +2539,44 @@ type mcpOAuthExecutionResult struct {
 	Response      mcpOAuthHTTPResponse
 	CheckRejected bool
 	CheckOnly     bool
+}
+
+type oauthRuntimeBusyError struct {
+	BeforeExecution bool
+}
+
+func (err *oauthRuntimeBusyError) Error() string { return errRestrictedRuntimeBusy.Error() }
+func (err *oauthRuntimeBusyError) Unwrap() error { return errRestrictedRuntimeBusy }
+
+// Each OAuth stage commits independently. Retrying after a completed stage
+// could repeat its effects, even if the next stage could not acquire a VM.
+type oauthScriptExecution struct {
+	completedStage bool
+}
+
+func (execution *oauthScriptExecution) run(snapshot *APIConfigSnapshot, path string, params map[string]interface{}, runtimeConfig APIRuntimeConfig) (string, error) {
+	result, err := runScriptWithRuntimeWithSnapshot(snapshot, []string{path}, params, runtimeConfig, true)
+	if errors.Is(err, errRestrictedRuntimeBusy) {
+		return "", &oauthRuntimeBusyError{BeforeExecution: !execution.completedStage}
+	}
+	if err == nil {
+		execution.completedStage = true
+	}
+	return result, err
+}
+
+func prepareOAuthRuntimeBusyResponse(w http.ResponseWriter, err error) bool {
+	if config.OAuthRuntime.BusyResponse != "serviceUnavailable" || !errors.Is(err, errRestrictedRuntimeBusy) {
+		return false
+	}
+	var busy *oauthRuntimeBusyError
+	if errors.As(err, &busy) && busy.BeforeExecution {
+		w.Header().Set("Retry-After", "1")
+		if w.Header().Get("Access-Control-Allow-Origin") != "" && w.Header().Get("Access-Control-Expose-Headers") == "" {
+			w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
+		}
+	}
+	return true
 }
 
 func isMCPOAuthMetadataRole(role string) bool {
@@ -2591,12 +2659,12 @@ func prepareMCPOAuthHTTPResponse(value interface{}) (mcpOAuthHTTPResponse, error
 	return prepared, nil
 }
 
-func runMCPOAuthCheck(snapshot *APIConfigSnapshot, path string, params map[string]interface{}, runtimeConfig APIRuntimeConfig) (bool, mcpOAuthHTTPResponse, error) {
+func runMCPOAuthCheck(execution *oauthScriptExecution, snapshot *APIConfigSnapshot, path string, params map[string]interface{}, runtimeConfig APIRuntimeConfig) (bool, mcpOAuthHTTPResponse, error) {
 	response := mcpOAuthHTTPResponse{}
 	// Each check has its own restricted VM, transaction and time limit. It
 	// receives a copy so inspection cannot rewrite the response or credentials.
 	copyParams := cloneJSONCompatibleValue(params).(map[string]interface{})
-	body, err := runScriptWithRuntimeWithSnapshot(snapshot, []string{path}, copyParams, runtimeConfig, true)
+	body, err := execution.run(snapshot, path, copyParams, runtimeConfig)
 	if err != nil {
 		return false, response, err
 	}
@@ -2666,11 +2734,12 @@ func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverCo
 	runtimeConfig.Settings["scopes"] = append([]string(nil), snapshot.Definitions[serverConfig.OAuth.VerifyAccess].Scopes...)
 	runtimeConfig.Settings["redirectURIAllowedPrefixes"] = append([]string(nil), serverConfig.RedirectURIAllowedPrefixes...)
 	checkPath := getParamCheckScriptPath(definition)
+	scriptExecution := &oauthScriptExecution{}
 	if execution.CheckOnly && checkPath == "" {
 		return execution, fmt.Errorf("OAuth API has no input check")
 	}
 	if checkPath != "" {
-		allowed, checked, err := runMCPOAuthCheck(snapshot, checkPath, params, runtimeConfig)
+		allowed, checked, err := runMCPOAuthCheck(scriptExecution, snapshot, checkPath, params, runtimeConfig)
 		if err != nil {
 			return execution, err
 		}
@@ -2701,7 +2770,7 @@ func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverCo
 		execution.Response = mcpOAuthHTTPResponse{Status: http.StatusOK, Headers: http.Header{"Content-Type": {"application/json"}}, Body: body}
 	} else {
 		bodyParams := cloneJSONCompatibleValue(params).(map[string]interface{})
-		result, err := runScriptWithRuntimeWithSnapshot(snapshot, []string{definition.Script}, bodyParams, runtimeConfig, true)
+		result, err := scriptExecution.run(snapshot, definition.Script, bodyParams, runtimeConfig)
 		if err != nil {
 			return execution, err
 		}
@@ -2737,7 +2806,7 @@ func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverCo
 		}
 		checkParams["nyan_output_status"], checkParams["nyan_output_content_type"] = response.Status, response.Headers.Get("Content-Type")
 		checkParams["nyan_output_body"], checkParams["nyan_output_body_base64"] = body, encoded
-		allowed, checked, err := runMCPOAuthCheck(snapshot, path, checkParams, runtimeConfig)
+		allowed, checked, err := runMCPOAuthCheck(scriptExecution, snapshot, path, checkParams, runtimeConfig)
 		if err != nil {
 			return execution, err
 		}

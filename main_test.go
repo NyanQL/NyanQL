@@ -5824,6 +5824,245 @@ if (nyanRuntimeSettings.issuer !== "https://service.example") throw new Error("m
 	return definitions, server, mark, stages
 }
 
+func TestOAuthRuntimeConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		input, want string
+		bad         bool
+	}{
+		{`{}`, "", false},
+		{`{"oauthRuntime":null}`, "legacy", false},
+		{`{"oauthRuntime":{}}`, "legacy", false},
+		{`{"oauthRuntime":{"busyResponse":null}}`, "legacy", false},
+		{`{"oauthRuntime":{"busyResponse":"legacy"}}`, "legacy", false},
+		{`{"oauthRuntime":{"busyResponse":"serviceUnavailable"}}`, "serviceUnavailable", false},
+		{`{"oauthRuntime":{"busyResponse":""}}`, "", true},
+		{`{"oauthRuntime":{"busyResponse":"unknown"}}`, "", true},
+		{`{"oauthRuntime":{"busyResponse":"ServiceUnavailable"}}`, "", true},
+		{`{"oauthRuntime":{"busyResponse":" legacy "}}`, "", true},
+		{`{"oauthRuntime":{"busyResponse":503}}`, "", true},
+		{`{"oauthRuntime":{"busyResponse":true}}`, "", true},
+		{`{"oauthRuntime":[]}`, "", true},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			var cfg Config
+			err := json.Unmarshal([]byte(tc.input), &cfg)
+			if tc.bad {
+				if err == nil {
+					t.Fatal("invalid OAuth runtime setting accepted")
+				}
+				return
+			}
+			if err != nil || cfg.OAuthRuntime.BusyResponse != tc.want {
+				t.Fatalf("config=%+v err=%v", cfg.OAuthRuntime, err)
+			}
+			encoded, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(encoded, &Config{}); err != nil {
+				t.Fatalf("serialized config cannot be read: %v", err)
+			}
+		})
+	}
+}
+
+func setTestOAuthBusyResponse(t *testing.T, mode string) {
+	t.Helper()
+	old := config.OAuthRuntime
+	config.OAuthRuntime = OAuthRuntimeConfig{BusyResponse: mode}
+	t.Cleanup(func() { config.OAuthRuntime = old })
+}
+
+func holdTestOAuthPasswordSlot(t *testing.T) func() {
+	t.Helper()
+	select {
+	case restrictedPasswordExecutions <- struct{}{}:
+	default:
+		t.Fatal("password VM slot already occupied")
+	}
+	release := sync.OnceFunc(func() { <-restrictedPasswordExecutions })
+	t.Cleanup(release)
+	return release
+}
+
+func performOAuthRuntimeTestRequest(t *testing.T, definitions map[string]APIConfig, server APIConfig, role, query string) *httptest.ResponseRecorder {
+	t.Helper()
+	apiName := mcpOAuthAPIForRole(server, role)
+	method, contentType, body := http.MethodPost, "application/x-www-form-urlencoded", "value=1"
+	if role == "oauthRegister" || role == "oauthAdminUser" {
+		contentType, body = "application/json", `{"value":1}`
+	}
+	if role == "oauthAuthorize" || isMCPOAuthMetadataRole(role) {
+		method, body = http.MethodGet, ""
+	}
+	if role == "oauthValidateAccessToken" {
+		apiName, contentType = "mcp", "application/json"
+		body = `{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"tool","arguments":{}}}`
+	}
+	req := httptest.NewRequest(method, "https://service.example/"+apiName+query, strings.NewReader(body))
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Origin", "https://client.example")
+	req.RemoteAddr = "127.0.0.1:1234"
+	server.AllowedOrigins = []string{"https://client.example"}
+	rec := httptest.NewRecorder()
+	snapshot := newAPIConfigSnapshot(definitions, "", [sha256.Size]byte{})
+	if role == "oauthValidateAccessToken" {
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("MCP-Protocol-Version", mcpProtocolVersion20251125)
+		req.Header.Set("Authorization", "Bearer good")
+		handleMCPRequestWithSnapshot(snapshot, rec, req, t.Name(), server)
+	} else {
+		req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+		handleMCPOAuthHTTPRequest(snapshot, rec, req, t.Name(), server, apiName, role)
+	}
+	return rec
+}
+
+func TestOAuthRuntimeBusyResponses(t *testing.T) {
+	for _, mode := range []string{"", "legacy", "serviceUnavailable"} {
+		for _, role := range []string{"oauthAuthorize", "oauthToken", "oauthRegister", "oauthAdminUser", "authorizationServerMetadata", "protectedResourceMetadata", "oauthValidateAccessToken"} {
+			for _, first := range []string{"input", "without_input", "check_only"} {
+				t.Run(mode+"/"+role+"/"+first, func(t *testing.T) {
+					setTestOAuthBusyResponse(t, mode)
+					definitions, server, _, stages := newOAuthChecksFixture(t)
+					apiName := mcpOAuthAPIForRole(server, role)
+					definition := definitions[apiName]
+					definition.Runtime.Capabilities = []string{"sql", "password"}
+					query := ""
+					if first == "without_input" {
+						definition.ParamCheck = ""
+					} else if first == "check_only" {
+						query = "?nyan_mode=checkOnly"
+					}
+					definitions[apiName] = definition
+					release := holdTestOAuthPasswordSlot(t)
+					rec := performOAuthRuntimeTestRequest(t, definitions, server, role, query)
+					wantStatus, wantRetry := http.StatusInternalServerError, ""
+					if role == "oauthValidateAccessToken" {
+						wantStatus = http.StatusUnauthorized
+					}
+					if mode == "serviceUnavailable" {
+						wantStatus, wantRetry = http.StatusServiceUnavailable, "1"
+					}
+					if rec.Code != wantStatus || rec.Header().Get("Retry-After") != wantRetry || stages() != "" {
+						t.Fatalf("status=%d headers=%v stages=%s body=%s", rec.Code, rec.Header(), stages(), rec.Body.String())
+					}
+					if mode == "serviceUnavailable" {
+						if rec.Header().Get("WWW-Authenticate") != "" || strings.Contains(rec.Body.String(), "mcp/www_authenticate") || strings.Contains(rec.Body.String(), "invalid_token") {
+							t.Fatalf("busy response challenges authentication: %v %s", rec.Header(), rec.Body.String())
+						}
+						if !strings.Contains(rec.Header().Get("Access-Control-Expose-Headers"), "Retry-After") {
+							t.Fatalf("Retry-After is not exposed to browsers: %v", rec.Header())
+						}
+						if role == "oauthValidateAccessToken" {
+							response := decodeTestJSONObject(t, rec.Body.Bytes())
+							if response["id"] != float64(42) || response["result"].(map[string]interface{})["isError"] != true {
+								t.Fatalf("invalid MCP busy result: %s", rec.Body.String())
+							}
+						} else if rec.Body.String() != "OAuth runtime is busy\n" {
+							t.Fatalf("unexpected busy body: %s", rec.Body.String())
+						}
+					} else if role == "oauthValidateAccessToken" {
+						if !strings.Contains(rec.Header().Get("WWW-Authenticate"), "invalid_token") || !strings.Contains(rec.Body.String(), "mcp/www_authenticate") {
+							t.Fatal("legacy authentication challenge changed")
+						}
+					} else if rec.Body.String() != "OAuth hook failed\n" {
+						t.Fatalf("legacy body changed: %s", rec.Body.String())
+					}
+					release()
+					recovered := performOAuthRuntimeTestRequest(t, definitions, server, role, query)
+					if recovered.Code >= 400 || stages() == "" {
+						t.Fatalf("request did not recover: %d %s", recovered.Code, recovered.Body.String())
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestOAuthRuntimeBusyAfterCompletedStage(t *testing.T) {
+	for _, previous := range []string{"input", "body"} {
+		t.Run(previous, func(t *testing.T) {
+			setTestOAuthBusyResponse(t, "serviceUnavailable")
+			definitions, _, mark, stages := newOAuthChecksFixture(t)
+			runtimeConfig := definitions["token"].Runtime
+			runtimeConfig.Capabilities = []string{"sql", "password"}
+			execution := &oauthScriptExecution{}
+			first := writeTestScript(t, mark(previous)+`({success:true,status:200});`)
+			if previous == "input" {
+				if allowed, _, err := runMCPOAuthCheck(execution, nil, first, map[string]interface{}{}, runtimeConfig); err != nil || !allowed {
+					t.Fatalf("input failed: allowed=%v err=%v", allowed, err)
+				}
+			} else if _, err := execution.run(nil, first, nil, runtimeConfig); err != nil {
+				t.Fatal(err)
+			}
+			holdTestOAuthPasswordSlot(t)
+			next := writeTestScript(t, mark("must_not_run")+`({success:true,status:200});`)
+			var err error
+			if previous == "input" {
+				_, err = execution.run(nil, next, nil, runtimeConfig)
+			} else {
+				_, _, err = runMCPOAuthCheck(execution, nil, next, map[string]interface{}{}, runtimeConfig)
+			}
+			if !errors.Is(err, errRestrictedRuntimeBusy) {
+				t.Fatalf("busy error lost: %v", err)
+			}
+			rec := httptest.NewRecorder()
+			if !prepareOAuthRuntimeBusyResponse(rec, fmt.Errorf("wrapped: %w", err)) || rec.Header().Get("Retry-After") != "" {
+				t.Fatalf("late busy response suggests retry: %v", rec.Header())
+			}
+			if got := stages(); got != previous {
+				t.Fatalf("completed stage effects lost or next stage executed: %s", got)
+			}
+		})
+	}
+}
+
+func TestOAuthRuntimeBusyModePreservesScriptDecisions(t *testing.T) {
+	for _, tc := range []struct {
+		name, role, result string
+		status             int
+	}{
+		{"invalid_token", "oauthValidateAccessToken", `({authenticated:false});`, 401},
+		{"insufficient_scope", "oauthValidateAccessToken", `({authenticated:false,forbidden:true});`, 403},
+		{"verification_exception", "oauthValidateAccessToken", `throw new Error("restricted JavaScript runtime is busy");`, 401},
+		{"http_exception", "oauthToken", `throw new Error("restricted JavaScript runtime is busy");`, 500},
+		{"script_503", "oauthToken", `({status:503,headers:{"Retry-After":"9"},body:"script busy"});`, 503},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setTestOAuthBusyResponse(t, "serviceUnavailable")
+			definitions, server, _, _ := newOAuthChecksFixture(t)
+			apiName := mcpOAuthAPIForRole(server, tc.role)
+			definition := definitions[apiName]
+			definition.Script = writeTestScript(t, tc.result)
+			definitions[apiName] = definition
+			rec := performOAuthRuntimeTestRequest(t, definitions, server, tc.role, "")
+			if rec.Code != tc.status {
+				t.Fatalf("status=%d want=%d body=%s", rec.Code, tc.status, rec.Body.String())
+			}
+			if tc.status == 401 || tc.status == 403 {
+				code := "invalid_token"
+				if tc.status == 403 {
+					code = "insufficient_scope"
+				}
+				if !strings.Contains(rec.Header().Get("WWW-Authenticate"), code) {
+					t.Fatalf("authentication challenge changed: %v", rec.Header())
+				}
+			}
+			wantRetry := ""
+			if tc.name == "script_503" {
+				wantRetry = "9"
+				if rec.Body.String() != "script busy" {
+					t.Fatal("script busy response was replaced")
+				}
+			}
+			if rec.Header().Get("Retry-After") != wantRetry {
+				t.Fatalf("unexpected Retry-After: %v", rec.Header())
+			}
+		})
+	}
+}
+
 func TestOAuthChecksHTTPRoutes(t *testing.T) {
 	for _, role := range []string{"oauthAuthorize", "oauthToken", "oauthRegister", "oauthAdminUser", "authorizationServerMetadata", "protectedResourceMetadata"} {
 		for _, test := range []string{"allowed", "output_non_200_success", "input_denied", "output_denied", "input_exception", "output_exception", "invalid_input", "invalid_output", "missing_file", "check_only", "check_only_denied", "check_only_missing", "check_alias"} {
