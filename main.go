@@ -136,6 +136,32 @@ func (limits ReceiveLimitsConfig) webSocketMessageBytes() int64 {
 	return defaultReceiveBytes
 }
 
+// WebSocketLimitsConfig bounds incoming connections across all channels.
+// Zero preserves the existing limit; negative values are configuration errors.
+type WebSocketLimitsConfig struct {
+	MaxConnections int `json:"maxConnections"`
+}
+
+func (limits *WebSocketLimitsConfig) UnmarshalJSON(data []byte) error {
+	type plain WebSocketLimitsConfig
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return fmt.Errorf("webSocketLimits: %w", err)
+	}
+	if decoded.MaxConnections < 0 {
+		return fmt.Errorf("webSocketLimits.maxConnections must be a non-negative integer")
+	}
+	*limits = WebSocketLimitsConfig(decoded)
+	return nil
+}
+
+func (limits WebSocketLimitsConfig) connectionLimit() int {
+	if limits.MaxConnections > 0 {
+		return limits.MaxConnections
+	}
+	return defaultWebSocketConnections
+}
+
 // Avoid net/http draining a body that the rejected client may never send.
 func closeUnreadRequestBody(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
@@ -282,6 +308,7 @@ func (limits SQLResultLimitsConfig) byteLimit() int {
 type Config struct {
 	HTTPTimeouts           HTTPTimeoutsConfig    `json:"httpTimeouts"`
 	ReceiveLimits          ReceiveLimitsConfig   `json:"receiveLimits"`
+	WebSocketLimits        WebSocketLimitsConfig `json:"webSocketLimits"`
 	SQLResultLimits        SQLResultLimitsConfig `json:"sqlResultLimits"`
 	Name                   string                `json:"name"`
 	Profile                string                `json:"profile"`
@@ -642,7 +669,7 @@ const (
 	defaultSQLJSONRows               = 10000
 	defaultSQLJSONBytes              = 4 << 20
 	maxRestrictedScriptRuntime       = 15 * time.Second
-	maxWebSocketConnections          = 128
+	defaultWebSocketConnections      = 128
 	webSocketWriteTimeout            = 5 * time.Second
 )
 
@@ -665,7 +692,7 @@ var mcpConcurrencyLimiters = struct {
 
 var restrictedPasswordExecutions = make(chan struct{}, 1)
 var errRestrictedRuntimeBusy = errors.New("restricted JavaScript runtime is busy")
-var websocketConnectionSlots = make(chan struct{}, maxWebSocketConnections)
+var websocketConnectionSlots = make(chan struct{}, defaultWebSocketConnections)
 
 // reParams は、/*id*/ のようなプレースホルダーを抽出する正規表現
 var reParams = regexp.MustCompile(`(?s)/\*\s*([^*\/]+)\s*\*/\s*(?:'([^']*)'|"([^"]*)"|([^\s,;)]+))`)
@@ -761,6 +788,8 @@ func main() {
 	if err = json.NewDecoder(configFile).Decode(&config); err != nil {
 		fatalServiceError("config_decode_failed", err, "file", paths.Config.Path)
 	}
+	// config.json is loaded once, before any connections can acquire a slot.
+	websocketConnectionSlots = make(chan struct{}, config.WebSocketLimits.connectionLimit())
 	apiHotReloadInterval, err := parseAPIHotReloadInterval(config.APIHotReload.Interval)
 	if err != nil {
 		fatalServiceError("Invalid APIHotReload.Interval: expected a positive duration", err)
@@ -2955,9 +2984,10 @@ func checkWebSocketConnection(snapshot *APIConfigSnapshot, w http.ResponseWriter
 
 // WebSocketアップグレードと接続管理を行う関数
 func handleWebSocketWithSnapshot(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *http.Request) {
+	slots := websocketConnectionSlots
 	select {
-	case websocketConnectionSlots <- struct{}{}:
-		defer func() { <-websocketConnectionSlots }()
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
 	default:
 		closeUnreadRequestBody(w, r)
 		http.Error(w, "too many WebSocket connections", http.StatusServiceUnavailable)

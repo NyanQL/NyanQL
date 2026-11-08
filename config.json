@@ -27,6 +27,9 @@
     "httpBodyBytes": "20MB",
     "webSocketMessageBytes": "20MB"
   },
+  "webSocketLimits": {
+    "maxConnections": 128
+  },
   "BasicAuth": {
     "Username": "neko",
     "Password": "nyan"

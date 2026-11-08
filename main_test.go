@@ -10090,6 +10090,198 @@ func TestWebSocketEndpointConfiguredUsesCompleteAPIName(t *testing.T) {
 	}
 }
 
+func TestWebSocketLimitsConfiguration(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	for _, tc := range []struct {
+		input string
+		want  int
+		bad   bool
+	}{
+		{`{}`, 128, false},
+		{`{"webSocketLimits":null}`, 128, false},
+		{`{"webSocketLimits":{}}`, 128, false},
+		{`{"webSocketLimits":{"maxConnections":0}}`, 128, false},
+		{`{"webSocketLimits":{"maxConnections":null}}`, 128, false},
+		{`{"webSocketLimits":{"maxConnections":1}}`, 1, false},
+		{`{"webSocketLimits":{"maxConnections":512}}`, 512, false},
+		{fmt.Sprintf(`{"webSocketLimits":{"maxConnections":%d}}`, maxInt), maxInt, false},
+		{`{"webSocketLimits":{"maxConnections":-1}}`, 0, true},
+		{`{"webSocketLimits":{"maxConnections":1.5}}`, 0, true},
+		{`{"webSocketLimits":{"maxConnections":"512"}}`, 0, true},
+		{`{"webSocketLimits":{"maxConnections":true}}`, 0, true},
+		{fmt.Sprintf(`{"webSocketLimits":{"maxConnections":%d}}`, uint64(maxInt)+1), 0, true},
+		{`{"webSocketLimits":[]}`, 0, true},
+		{`{"webSocketLimits":128}`, 0, true},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			var cfg Config
+			err := json.Unmarshal([]byte(tc.input), &cfg)
+			if tc.bad {
+				if err == nil {
+					t.Fatal("invalid WebSocket limit accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.WebSocketLimits.connectionLimit(); got != tc.want {
+				t.Fatalf("limit=%d want %d", got, tc.want)
+			}
+			// Even the maximum accepted integer must be usable at startup.
+			slots := make(chan struct{}, cfg.WebSocketLimits.connectionLimit())
+			slots <- struct{}{}
+			<-slots
+		})
+	}
+}
+
+func setTestWebSocketConnectionLimit(t *testing.T, input string) {
+	t.Helper()
+	var cfg Config
+	if err := json.Unmarshal([]byte(input), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	old := websocketConnectionSlots
+	websocketConnectionSlots = make(chan struct{}, cfg.WebSocketLimits.connectionLimit())
+	t.Cleanup(func() { websocketConnectionSlots = old })
+}
+
+type pausedWebSocketHandshakeBody struct {
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (body *pausedWebSocketHandshakeBody) Read([]byte) (int, error) {
+	body.entered <- struct{}{}
+	<-body.release
+	return 0, io.EOF
+}
+
+func (body *pausedWebSocketHandshakeBody) Close() error { return nil }
+
+func TestWebSocketConnectionLimitPendingHandshakes(t *testing.T) {
+	for _, tc := range []struct {
+		name, input string
+		limit       int
+	}{
+		{"default", `{}`, 128},
+		{"lowered", `{"webSocketLimits":{"maxConnections":2}}`, 2},
+		{"raised", `{"webSocketLimits":{"maxConnections":129}}`, 129},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setTestWebSocketConnectionLimit(t, tc.input)
+			resetJavascriptInclude(t)
+			marker := filepath.Join(t.TempDir(), "checked")
+			check := writeTestScript(t, fmt.Sprintf(`nyanSaveFile(nyanBase64Encode("done"), %q); ({success:true,status:200});`, marker))
+			setTestSQLFiles(t, map[string]APIConfig{"first": {}, "second": {ParamCheck: check}})
+			entered, release := make(chan struct{}, tc.limit), make(chan struct{})
+			var pending sync.WaitGroup
+			finish := sync.OnceFunc(func() { close(release); pending.Wait() })
+			defer finish()
+			for i := 0; i < tc.limit; i++ {
+				pending.Add(1)
+				go func() {
+					defer pending.Done()
+					// Invalid query ends the handshake after the body is released.
+					req := httptest.NewRequest("GET", "/first?token=%ZZ", nil)
+					req.Header.Set("Upgrade", "websocket")
+					req.Body = &pausedWebSocketHandshakeBody{entered: entered, release: release}
+					req.ContentLength = -1
+					rec := httptest.NewRecorder()
+					unifiedHandler(rec, req)
+					if rec.Code != http.StatusBadRequest {
+						t.Errorf("pending handshake status=%d want 400", rec.Code)
+					}
+				}()
+			}
+			for i := 0; i < tc.limit; i++ {
+				waitForSignal(t, entered, "handshake body read")
+			}
+			probe := &admissionBodyProbe{reader: strings.NewReader("unread")}
+			req := httptest.NewRequest("GET", "/second?nyan_mode=checkOnly", nil)
+			req.Header.Set("Upgrade", "websocket")
+			req.Body, req.ContentLength = probe, -1
+			rec := httptest.NewRecorder()
+			unifiedHandler(rec, req)
+			if rec.Code != http.StatusServiceUnavailable || strings.TrimSpace(rec.Body.String()) != "too many WebSocket connections" {
+				t.Fatalf("full limit: status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if probe.reads != 0 || probe.closed != 0 {
+				t.Fatalf("busy handshake consumed body: reads=%d closed=%d", probe.reads, probe.closed)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("busy handshake ran paramCheck: %v", err)
+			}
+			finish()
+			// All failed handshakes must release their slots. checkOnly must too.
+			for i := 0; i <= tc.limit; i++ {
+				req := httptest.NewRequest("GET", "/second?nyan_mode=checkOnly", nil)
+				req.Header.Set("Upgrade", "websocket")
+				rec := httptest.NewRecorder()
+				unifiedHandler(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("released slot unavailable: status=%d body=%s", rec.Code, rec.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestWebSocketConnectionLimitEstablishedConnections(t *testing.T) {
+	setTestWebSocketConnectionLimit(t, `{"webSocketLimits":{"maxConnections":1}}`)
+	resetJavascriptInclude(t)
+	deny := writeTestScript(t, `({success:false,status:403});`)
+	setTestSQLFiles(t, map[string]APIConfig{"first": {}, "second": {}, "denied": {ParamCheck: deny}})
+	oldHub := hub
+	hub = NewHub()
+	t.Cleanup(func() { hub = oldHub })
+	finished := make(chan struct{}, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { finished <- struct{}{} }()
+		unifiedHandler(w, r)
+	}))
+	t.Cleanup(server.Close)
+	address := "ws" + strings.TrimPrefix(server.URL, "http")
+	dialer := websocket.Dialer{HandshakeTimeout: 3 * time.Second}
+	dial := func(path string, want int) *websocket.Conn {
+		t.Helper()
+		conn, response, err := dialer.Dial(address+path, nil)
+		if conn != nil {
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+		if response == nil {
+			t.Fatalf("no handshake response: %v", err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != want {
+			t.Fatalf("handshake %s: status=%d want %d err=%v", path, response.StatusCode, want, err)
+		}
+		if want == http.StatusSwitchingProtocols && (err != nil || conn == nil) {
+			t.Fatalf("connection failed: %v", err)
+		}
+		return conn
+	}
+	// Rejected checks and failed upgrades must not consume the only slot.
+	dial("/denied", http.StatusForbidden)
+	waitForSignal(t, finished, "denied connection exit")
+	req := httptest.NewRequest("GET", "/first", nil)
+	req.Header.Set("Upgrade", "websocket")
+	rec := httptest.NewRecorder()
+	unifiedHandler(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid upgrade status=%d want 400", rec.Code)
+	}
+	first := dial("/first", http.StatusSwitchingProtocols)
+	dial("/second", http.StatusServiceUnavailable)
+	waitForSignal(t, finished, "busy connection exit")
+	_ = first.Close()
+	waitForSignal(t, finished, "first connection exit")
+	second := dial("/second", http.StatusSwitchingProtocols)
+	_ = second.Close()
+	waitForSignal(t, finished, "second connection exit")
+}
+
 func TestWebSocketConnectionChecks(t *testing.T) {
 	const allow = `({success:true,status:200,result:{checked:true}});`
 	const deny = `({success:false,status:403,result:{reason:"denied"},error:"denied"});`

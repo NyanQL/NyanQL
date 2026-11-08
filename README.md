@@ -23,7 +23,7 @@ NyanQLは、主に次のような用途に向いています。
 - JavaScriptで、SQLだけでは書きにくい一連の処理をまとめる
 - `api.json` をincludeして、API定義を複数ファイル・複数階層に分割する
 - WebSocketを使って、API実行後の結果を別の画面へPush配信する
-- `/nyan` で、利用できるAPIの情報を取得する
+- `/nyan/` で、利用できるAPIの情報を取得する
 
 NyanQLは、画面を作るためのフレームワークではありません。役割は、データベースアクセスに特化したAPIサービスを作ることです。
 
@@ -262,20 +262,31 @@ HTTP 200で次のJSONが返ります（キーの順序は問いません）。�
 
 | 項目 | 説明 |
 |---|---|
-| `name` | `/nyan` で返すサーバ名です。 |
-| `profile` | `/nyan` で返すサーバ説明です。 |
-| `version` | `/nyan` で返す設定上のバージョンです。 |
+| `name` | `/nyan/` で返すサーバ名です。 |
+| `profile` | `/nyan/` で返すサーバ説明です。 |
+| `version` | `/nyan/` で返す設定上のバージョンです。 |
 | `Port` | NyanQLが待ち受けるポート番号です。 |
 | `CertPath`, `KeyPath` | 両方を指定するとHTTPSで起動します。空ならHTTPで起動します。 |
 | `DBType` | `mysql`、`postgres`、`sqlite`、`duckdb` のいずれかを指定します。 |
 | `DBName` | データベース名、またはSQLite/DuckDBのファイルパスです。 |
+| `DBUser`, `DBPassword` | MySQL/PostgreSQLへ接続するユーザー名・パスワード（文字列）です。HTTPの `BasicAuth` とは独立しています。SQLite/DuckDBの接続には使いません。 |
+| `DBHost` | MySQL/PostgreSQLの接続先ホスト（文字列）です。SQLite/DuckDBの接続には使いません。 |
+| `DBPort` | MySQL/PostgreSQLの接続先ポートを文字列で指定します（例：`"3306"`、`"5432"`）。SQLite/DuckDBの接続には使いません。 |
+| `MaxOpenConnections` | DB接続プールの最大オープン接続数（整数）。正数ならその値、未指定・0・負数なら無制限です。 |
+| `MaxIdleConnections` | プールに保持する最大アイドル接続数（整数）。正数ならその値を設定します。未指定・0・負数ならGoの `database/sql` の既定値を使います。 |
+| `ConnMaxLifetimeSeconds` | DB接続を再利用できる最大時間（整数、秒）。正数ならその時間、未指定・0・負数なら経過時間による破棄を設定しません。 |
 | `BasicAuth` | API呼び出し時のBasic認証ユーザ名とパスワードです。 |
 | `APIHotReload` | `api.json` の定期的な変更確認を設定します。省略時も有効です。 |
+| `webSocketLimits` | 全チャネル合計のWebSocket受入接続数の上限です。省略時は128件です。[設定仕様](#websocket-connection-limits)を参照してください。 |
 | `sqlResultLimits` | SQL結果ごとの行数・JSONバイト数の上限です。省略時は10,000行・4MiBです。 |
 | `javascript_include` | `check` や `script` の実行前に読み込む共通JavaScriptです。 |
 | `javascript_include_cache` | `true`で共通JSのソースを起動時に読み込み、再起動まで保持します。省略時は`false`です。 |
 
 `config.json` 内の相対パスは、`config.json` がある場所を基準にして扱われます。対象は `CertPath`、`KeyPath`、SQLite/DuckDB の `DBName`、`log.Filename`、`javascript_include` です。
+
+DB接続設定の未指定文字列は空文字列です。NyanQLは `DBHost` や `DBPort` を補完せず、その値をドライバの接続文字列へ渡します。上のSQLite用サンプルをMySQL/PostgreSQLへ変更する場合は、接続先・認証情報も指定してください。接続プールの3項目は全DB種類で共通です。`MaxIdleConnections` の既定値は現在のGo標準ライブラリでは2ですが、正の `MaxOpenConnections` がそれより小さければ、その上限までに調整されます。明示したアイドル接続数も同様に最大オープン接続数を超えません。
+
+NyanQLは `MaxIdleConnections` が0以下のとき `SetMaxIdleConns` を呼ばないため、`MaxIdleConnections: 0` は「アイドル接続を保持しない」の指定にはなりません。`ConnMaxLifetimeSeconds` は実行中SQLのタイムアウトではなく、接続の再利用期間です。DB接続設定の変更には再起動が必要です。
 
 ### SQL結果の上限と共通JSの読込設定
 
@@ -425,6 +436,33 @@ HTTPでは、本文のサイズ検証に先立ち、各経路のヘッダーで�
 本文を使うJavaScriptの `paramCheck` はサイズ検証後に実行します。許可されたOriginへの413応答にもCORSヘッダーを付けます。上限超過時は残りの本文を待たずに応答し、HTTP/1接続は再利用しません。
 
 単位は `B`・`KB`・`MB`・`GB`（`KiB`・`MiB`・`GiB` も可）で、大文字・小文字は区別しません。既定値との整合のため1024倍で換算します（`1MB = 1,048,576` バイト、`1GB = 1,073,741,824` バイト）。前後および数値と単位の間の空白は許可し、単位なしの文字列はバイト数として扱います。負数・小数・不明な単位・空文字列・換算後にint64の範囲外となる値は設定エラーです。0は無制限にはなりません。変更の反映にはサービスの再起動が必要です。この設定はURL・HTTPヘッダー・HTTPクライアントの取得応答・出力本文・MCPのstdioメッセージには適用しません。MCP/OAuthのHTTP本文の従来の固定1 MiB上限はこの設定へ置き換わり、出力・state等の既存上限は維持します。
+
+MCP stdioの入力には、別途 [stdioのメッセージ上限](#mcp-stdio-limits) を適用します。
+
+<a id="websocket-connection-limits"></a>
+
+### WebSocketの同時接続数上限
+
+`config.json` のトップレベルに `webSocketLimits` を追加し、`maxConnections` に受入接続数の上限を整数で指定します。以下は512件に増やす例です。128未満の正数を指定すれば上限を減らせます。
+
+```json
+"webSocketLimits": {
+  "maxConnections": 512
+}
+```
+
+| 指定 | 動作 |
+|---|---|
+| `webSocketLimits` を省略・`null`・`{}` | 従来どおり128件 |
+| `maxConnections` を省略・`0`・`null` | 従来どおり128件。無制限や接続禁止の指定にはならない |
+| `maxConnections` が正の整数 | 指定件数まで許可 |
+| 負数・小数・文字列（`"512"` 等）・真偽値・Goの `int` の範囲外 | 設定エラーで起動しない |
+
+NyanQL独自の固定最大値は設けません。設定可能な数値の上限は実行バイナリのGoの `int` に従い、64ビットでは9,223,372,036,854,775,807、32ビットでは2,147,483,647です。これは設定値として受理できる範囲であり、その件数の接続を維持できる保証ではありません。実運用の上限はOSのファイルディスクリプタ数、メモリ、通信量、Push配信量等に依存するため、利用環境と想定負荷で確認してください。
+
+上限は**1プロセス内の全チャネルで共有**します。接続済みクライアントに加えて、アップグレード前の本文サイズ検証・`paramCheck` 実行中の要求も1件として数えます。`nyan_mode=checkOnly` も処理終了まで数えます。満杯の場合は待機せず、本文読み取り・`paramCheck` より前にHTTP 503と `too many WebSocket connections` を返します。本文エラー・チェック拒否・チェックのみの完了・アップグレード失敗・接続終了で枠を解放します。
+
+`ws_client` が接続先へ張る外向きの接続は対象外です。`ws_client.connectURL` のパスを使ってNyanQLへ接続する購読クライアントは対象です。変更の反映にはサービスの再起動が必要です。`APIHotReload` による再読み込みの対象ではありません。1メッセージの受信バイト数は、別設定の `receiveLimits.webSocketMessageBytes` で制御します。
 
 ## api.json
 
@@ -739,9 +777,11 @@ BEGIN内で先頭の条件が消えた場合は、残ったWHERE句先頭の不�
 
 ---
 
-## `/nyan` でAPI情報を見る
+## `/nyan/` でAPI情報を見る
 
 NyanQLでは、APIの一覧や、各APIが受け取るパラメータ情報を確認できます。
+
+API一覧のURLは末尾スラッシュ付きの `/nyan/` です。`/nyan` はGo標準のHTTPルーターにより `/nyan/` へリダイレクトされます。リダイレクトを追わないクライアントでもJSONを取得できるよう、一覧取得には最初から `/nyan/` を指定してください。API一覧・詳細の取得にはBasic認証が必要です。
 
 ### API一覧を見る
 
@@ -770,7 +810,7 @@ curl -u admin:secret "http://localhost:8080/nyan/"
 }
 ```
 
-`apis` は通常APIだけを完全API名のキーで示すフラットな一覧です。include定義、public、schedule、ws_clientは一覧に含まれません。
+`apis` は `type: "api"`（type省略時を含む）の通常APIだけを完全API名のキーで示すフラットな一覧です。`include` 定義、`public`、`schedule`、`ws_client`、`mcp` 定義は一覧に含まれません。include先の通常API、MCP ToolやOAuthの参照先になっている通常APIは一覧に含まれます。
 
 ### APIごとの詳細を見る
 
@@ -1196,6 +1236,9 @@ JSON.stringify({
 | `nyanBase64Decode(base64)` | Base64を文字列に戻します。 |
 | `nyanRandomBase64URL(bytes)` | 1〜1024バイトの乱数を、末尾の `=` なしのBase64URL文字列として返します。引数省略時は32バイトです。 |
 | `nyanCrypto.randomBase64URL(bytes)` | 同じ形式の乱数を生成します。1〜1024バイトの指定が必須です。 |
+| `nyanCrypto.sha256Base64URL(text)` | 文字列化した値のUTF-8バイト列をSHA-256でハッシュ化し、パディングなしのBase64URL文字列（43文字）を返します。引数はちょうど1つ必要です。 |
+| `nyanCrypto.sha256Hex(text)` | 同じSHA-256を小文字の16進文字列（64文字）で返します。引数はちょうど1つ必要です。 |
+| `nyanCrypto.timingSafeEqual(a, b)` | 2つの値を文字列化して比較し、真偽値を返します。引数はちょうど2つ必要です。比較方法は下記を参照してください。 |
 | `nyanSHA256Base64URL(value)` | 文字列のSHA-256を、パディングなしのBase64URL文字列で返します。引数省略時は `TypeError`。明示した空文字列は有効です。 |
 | `nyanSaveFile(base64, path)` | Base64文字列をデコードし、一番親の `api.json` のフォルダを基準に保存します。 |
 | `nyanWriteTextFile(path, text)` | UTF-8テキストを保存します。成功時true、失敗時例外。 |
@@ -1235,6 +1278,8 @@ nyanJsonAPI(url, jsonText, "", "", {
 ```
 
 `nyanRandomBase64URL()` のサイズは、Base64URL変換前のバイト数です。省略時の32バイトは43文字になります。範囲外の値や明示的な `undefined`・`null`、乱数生成の失敗はJavaScript例外になります。`nyanCrypto.randomBase64URL(bytes)` も同じサイズ範囲ですが、引数をちょうど1つ指定する必要があります。
+
+`nyanCrypto` の各メソッドは、引数が不足している場合だけでなく、上記の個数を超える場合もJavaScript例外になります。`sha256Base64URL`・`sha256Hex`・`timingSafeEqual` では、明示した `undefined`・`null` もそれぞれ文字列 `"undefined"`・`"null"` に変換します。空文字列も有効です。`timingSafeEqual` は各文字列のSHA-256ダイジェストを定数時間比較し、元の文字列のUTF-8バイト長も一致するときに `true` を返します。入力のハッシュ計算も含めた総処理時間が、入力長によらず一定になるという保証ではありません。OAuth用VMでは、これらの関数に [crypto capability](#oauth-runtime-capabilities) が必要です。
 
 `nyanSaveFile()`・`nyanGetFile()`・`nyanRunSQL()` に渡す相対パスは、起動時に指定した一番親の `api.json` があるフォルダを基準にします。include先のAPIや `nyanCallMe()` で呼び出したAPI、`paramCheck`・`outCheck` の中でも同じ基準です。絶対パスはそのまま使用します。
 
@@ -1315,11 +1360,13 @@ PHC文字列は `$argon2id$v=19$m=65536,t=3,p=2$ソルト$ハッシュ` の形�
 
 検証関数は一致時に `true`、不一致・不正形式・範囲外・長すぎるパスワードでは `false` を返します。検証時の空文字列は従来どおり照合対象にできますが、生成関数は空パスワードを拒否します。引数の省略・型変換に関する既存のJavaScriptラッパーの仕様は今回変更していません。
 
-形式・上限の検査はArgon2計算前に行い、1プロセス内の生成・検証を合わせて同時2件までに制限します。枠が埋まっている場合、有効な入力の計算は待機します。記録された `m` や `t` が大きいハッシュは、標準設定よりメモリや処理時間を使います。
+形式・上限の検査はArgon2計算前に行い、1プロセス内の生成・検証を合わせて同時2件までに制限します。この計算枠は、通常APIとOAuth用VM、`nyanArgon2idHash`・`nyanArgon2idVerify`・`nyanPassword.hash`・`nyanPassword.verify` のすべてで共有します。枠が埋まっている場合、検査を通った計算は空きができるまで待機します。記録された `m` や `t` が大きいハッシュは、標準設定よりメモリや処理時間を使います。
+
+NyanQLのOAuth用VMには計算枠とは別に、`password` capabilityを持つVM全体を1プロセスで同時1件までにする受付制限があります。この受付は待機せず、競合した実行をスクリプト開始前にエラーにします。そのため「Argon2の計算枠では待機する」ことから「OAuth要求もすべて待機する」と解釈しないでください。適用単位・処理順・HTTP応答は [OAuthの受付制限と実行枠](#oauth-execution-limits) に示します。
 
 既存の標準ハッシュはそのまま利用できます。ハッシュの自動再生成・保存やパスワード再設定は行いません。QL/Nyan8で以前読めた非正規の表記は拒否されるため、外部から取り込んだハッシュは上記形式を確認してください。生成・検証条件を変更するconfig.json項目を追加したものではありません。
 
-`nyanPassword.hash()` / `nyanPassword.verify()` も同じ生成・検証処理を使います。capabilitiesで制限する実行環境では、従来どおり `password` の許可が必要です。
+`nyanPassword.hash(password)` / `nyanPassword.verify(password, encodedHash)` も同じ生成・検証処理を使います。引数はそれぞれちょうど1個・2個で、個数の過不足はJavaScript例外です。capabilitiesで制限する実行環境では、`password` の許可が必要です。
 
 ### 共通ファイル保存：nyanWriteTextFile / nyanWriteBase64File
 
@@ -1425,6 +1472,10 @@ ws.onmessage = function (event) {
 ```
 
 NyanQLのWebSocketサーバでは、先頭の `/` を除いたURLパス全体がチャネル名になります。上の例では、`listItems` がチャネル名です。mount配下の `sub/listItems` をpush先にする場合は、WebSocketも `/sub/listItems` へ接続してください。
+
+通常WebSocketの受入枠は、1プロセス内の全チャネルで既定128件までです。`config.json` の `webSocketLimits.maxConnections` で増減できます。接続済みのクライアントだけでなく、アップグレード前の本文サイズ検証・`paramCheck` の実行中も1枠を使用します。`nyan_mode=checkOnly` の要求もチェック終了まで数えます。満杯の場合は待機せず、`paramCheck` を実行する前にHTTP 503と `too many WebSocket connections` を返します。チェック拒否・アップグレード失敗・接続終了で枠を解放します。チャネル単位の上限ではありません。設定値・再起動要否は [WebSocketの同時接続数上限](#websocket-connection-limits) を参照してください。
+
+この枠はNyanQLが受け付ける接続に適用します。`ws_client` が接続先へ張る外向きの接続は数えません。`ws_client.connectURL` のパスを使ってNyanQLへ接続する購読クライアントは受信接続なので数えます。受信メッセージのバイト上限は、別途 `receiveLimits.webSocketMessageBytes` を使います。
 
 接続先APIに `paramCheck`（旧名 `check`）がある場合は、WebSocketへのアップグレード・購読登録の前に実行します。チェックにはURLのクエリパラメータを渡します（単一値は文字列、同名の複数値は文字列配列）。`api` は接続先の完全API名に固定し、クエリでは変更できません。入力チェックが必要とするパラメータは、`/sub/listItems?token=...` のように接続URLにも指定してください。`success:true` なら接続を許可し、拒否時はチェック結果のJSONと `status` をHTTP応答で返します。例外・チェックファイルの読み込み失敗・不正なステータス（200〜599の整数以外）はHTTP 500となり、接続しません。接続時にはAPI本体・`outCheck`・Pushを実行しません。
 
@@ -1668,6 +1719,16 @@ console.log(
 
 stdioでは標準出力がMCP専用です。サービスログは標準エラーまたは設定したログファイルへ出ます。HTTP待受・schedule・ws_client・ホットリロードは開始しません。設定変更時は再起動します。
 
+<a id="mcp-stdio-limits"></a>
+
+#### stdioのメッセージ上限
+
+入力は1行に1つのJSON-RPCメッセージです。1行の固定上限は **1 MiB（1,048,576バイト）** で、文字数ではなく入力バイト数（日本語などはUTF-8のバイト数）で数えます。終端のLFは上限に含めません。CRLFを使う場合、LF直前のCRも入力バッファの上限を消費します。JSON文字列の改行は実際の改行ではなく `\n` としてエスケープしてください。
+
+上限を超える行はJSON-RPCとして解析せず、`stdio MCP input failed` の読み取りエラーでstdio処理を終了します。その行に対するJSON-RPCエラー応答は生成せず、後続の行も処理しません。`config.json` の `receiveLimits` ではこの固定上限を変更できません。HTTP MCPの入力本文は `receiveLimits.httpBodyBytes` の対象であり、この1 MiB制限は適用しません。
+
+出力側は別の制限です。Tool結果本文は2 MiB、JSON化したMCP応答全体は4 MiBまでです。stdioの4 MiBには末尾に付加するLFを含めません。stdioは入力を1行ずつ順番に処理し、MCPのHTTP向け `rateLimit`・`maxConcurrent` による受付制限は使いません。
+
 ### Streamable HTTPと設定フィールド
 
 同じToolをHTTPで試す場合、上の `local_mcp` 定義を次に置き換え、`--mcp-server` を付けずに起動します。このJSONはAPI定義の一部分です。
@@ -1698,14 +1759,25 @@ curl http://127.0.0.1:8080/local_mcp \
 | `transport` | `stdio` または `streamable_http`。必須 |
 | `tools` | scriptを持つ通常API名の配列。1件以上。include先は完全名 |
 | `protocolVersions` | 省略時 `2025-11-25` と `2025-06-18`。この2版に対応 |
-| `allowedOrigins` | HTTPで必須。HTTP(S)のOrigin配列。path/query/fragmentを含めない |
+| `allowedOrigins` | HTTPで空でない配列が必須。HTTP(S)のOrigin文字列。scheme・hostは小文字、user情報・path（末尾`/`も含む）・query・fragmentは不可。重複・`*`・`null` というOrigin文字列は不可 |
 | `instructions` | initializeに返す利用説明 |
 | `rateLimit` | `{"requests":120,"window":"1m"}` 等。requestsは1〜10000、windowは1秒〜24時間 |
-| `maxConcurrent` | 1〜256。省略時/0は16 |
+| `maxConcurrent` | 正の整数1〜256。未指定・0は16。負数・257以上は設定エラー。HTTP MCPとOAuthの受付枠に使用し、stdioには適用しない |
 | `oauth` | 下記の通常APIへの役割参照。HTTPのみ |
 | `redirectURIAllowedPrefixes` | OAuthで必須。HTTPSで末尾`/`のredirect URI prefix配列 |
 
-対応メソッドはinitialize・ping・tools/list・tools/callです。HTTPはstatelessで、バッチ要求やセッション管理は提供しません。Toolのtitle・description・securitySchemes・annotations、paramCheck/outCheckのスキーマは参照先APIから解決します。旧 `http` 設定、MCPの `path` / `resource` は使用しません。
+対応メソッドはinitialize・ping・tools/list・tools/callです。HTTPはstatelessで、バッチ要求やセッション管理は提供しません。Toolのtitle・description・securitySchemes・annotations、paramCheck/outCheckのスキーマは参照先APIから解決します。
+
+MCP/OAuthのハンドラーに到達したHTTP要求では、Go側でOriginを検証します。Originが未指定または前後の空白を除いて空なら通過します。指定されている場合は、HTTP(S)のOriginとしての形式を確認したうえで、接続先のscheme・host・portから生成したOrigin、または `allowedOrigins` のいずれかと一致すれば許可します。scheme・hostの大文字小文字は正規化しますが、明示したポートは比較に含まれ、既定ポートの省略と明示は同一視しません。不正形式・未許可OriginはHTTP 403 `forbidden origin` です。これは通常WebSocketの `paramCheck` によるOrigin判断とは別の処理です。CORSプリフライト（`OPTIONS` と `Access-Control-Request-Method`）は手前の共通CORS層で応答し、この判定やOAuth hookの実行には進みません。
+
+MCPの接続URLはAPI名とリクエストのHost/TLS情報から生成します。次の設定項目はURL指定の手段には使えません。
+
+| 設定 | 現在の設定読込時の扱い |
+|---|---|
+| `http`・`resource`・`guard` | API定義JSONの許可フィールドに含まれません。値が空・`null` でも、キーを書けば設定エラーになります。 |
+| `path` | `type: "mcp"` では空でない値を指定すると設定エラーです。空文字列を指定してもMCPの経路は変わりません。public APIの配信パス設定とは別です。 |
+
+これらの設定エラーは、起動時には起動中止、ホットリロード時には候補設定の不採用となります。MCP名とOAuth参照先の名前については [MCP/OAuthのAPI名の制約](#mcp-api-names) を参照してください。
 
 ### OAuth hookを実装する場合
 
@@ -1720,9 +1792,59 @@ OAuth設定は認証処理そのものを生成しません。利用者認証、
 
 OAuthを使う各Toolには `securitySchemes: [{"type":"oauth2","scopes":["example:read"]}]` 等のscopeを宣言し、verifyAccess側のscopesに含めます。hookは `nyanAllParams` の `oauth_hook`、`oauth_api`、`issuer`、`resource`、`scopes` 等を参照できます。HTTP hookにはmethod/query/form/body/cookies/headersが渡り、query/formの各値は、1件なら文字列、同じキーが複数件あれば文字列の配列です。単一値に `[0]` を付けると先頭の1文字になるため、そのまま参照してください。verifyAccessには `authorization`、`tool`、`required_scopes` と `nyan_request` が渡ります。
 
+HTTP hookで使えるヘッダー参照には、次の違いがあります。
+
+| 参照先 | キーと値 |
+|---|---|
+| `nyanAllParams.headers` | `Authorization`・`Content-Type`・`Accept`・`Origin` の4キーだけ。キーはこの大文字小文字で参照します。値は常に文字列で、未受信なら空文字列、同名ヘッダーが複数ある場合は先頭の値です。 |
+| `nyanRequest.headers`（`nyanAllParams.nyan_request.headers` と同じ） | GoのHTTPリクエストのヘッダーマップに含まれる全項目。小文字と標準表記のキーで参照できます。値は1件なら文字列、複数件なら文字列配列です。未受信のキーは存在しません。 |
+
+例えば独自ヘッダーは `nyanRequest.headers["x-custom-token"]` で参照します。HostはGoのヘッダーマップとは別管理なので `nyanRequest.host` を使います。`verifyAccess` には前者の4キーの `headers` は生成せず、元のMCP要求の `nyanRequest.headers` と `nyanAllParams.authorization` を渡します。hookの戻り値に指定する `headers` は送信する応答ヘッダーであり、これらの受信ヘッダーとは別です。
+
 HTTP hookは `{status, contentType, headers, body}` を返します（status省略時200、指定時は100〜599の整数）。例えば拒否応答は `({status:400,contentType:"application/json",body:{error:"invalid_request"}});` です。verifyAccessはHTTP応答ではなく `{authenticated:true,principal:{...}}` または拒否の `{authenticated:false}` を返します。認証成功にはprincipalも必要です。JSオブジェクトと、それをJSON化した文字列を利用できます。チェックの `{success,status,result}` とは別の契約です。
 
 OAuthのscriptと前後チェックは、通常APIより機能を制限したVMで実行します。各参照先APIの `runtime` に `capabilities`（`sql`・`crypto`・`password`）を指定し、`sql`を使う場合は `sqlFiles` に許可SQLファイルを列挙します。`settings` は `nyanRuntimeSettings` から取得できます。例えば `"runtime":{"capabilities":["crypto","password"],"settings":{}}` です。外部HTTP、HostExec、汎用ファイル操作、nyanCallMeは利用できません。各script・前後チェックの開始から15秒の期限を設け、JavaScript本体と戻り値変換中のgetterを監視します。同じ期限をSQLの接続取得・実行にも渡します。SQLを使わないscriptはDB接続を確保しません。期限切れや戻り値変換の例外では、その実行の未コミットSQLをロールバックします。これは各段階の期限であり、複数のチェックと本体を含むHTTP要求全体が15秒で完了する保証ではありません。同期ファイル読み込み、暗号計算、DBドライバ内のキャンセル不能な処理は、処理が戻るまで待つ場合があります。通常API全体を隔離する設定ではありません。
+
+<a id="oauth-runtime-capabilities"></a>
+
+#### OAuth用VMのcapabilitiesと利用可能な関数
+
+この表は、OAuthの役割として実行されるscript・`paramCheck`・`outCheck` に適用します。設定場所は参照先の通常API定義の `runtime` です。MCPサーバー定義そのものや `config.json` に設定するものではありません。同じAPIを通常APIとして実行する経路に、OAuth用VMの機能制限を自動適用する設定でもありません。
+
+| capability | 許可される関数 |
+|---|---|
+| `sql` | `nyanRunSQL`。実行できるSQLファイルは `runtime.sqlFiles` の許可リストに限定します。 |
+| `crypto` | `nyanCrypto.randomBase64URL`・`nyanCrypto.sha256Base64URL`・`nyanCrypto.sha256Hex`・`nyanCrypto.timingSafeEqual`、`nyanRandomBase64URL`、`nyanSHA256Base64URL`、`sha256`、`nyanBase64Encode`、`nyanBase64Decode`。 |
+| `password` | `nyanPassword.hash`・`nyanPassword.verify`、`nyanArgon2idHash`、`nyanArgon2idVerify`。下記のVM受付枠も適用します。 |
+
+未許可の機能は対応するグローバル関数・オブジェクトが `undefined` になります。`capabilities` を未指定または空配列にすると、上の3群はいずれも利用できません。`sha1` は `crypto` を付けてもOAuth用VMでは常に `undefined` です。`nyanGetAPI`・`nyanJsonAPI`・`nyanCallAPI`・`nyanCallMe`・`nyanHostExec`・`nyanGetFile`・`nyanSaveFile`・`nyanWriteTextFile`・`nyanWriteBase64File` も、capabilityの組合せによらず利用できません。
+
+未知のcapability名や同じ名前の重複は設定エラーです。`sql` を指定する場合は空でない `sqlFiles` が必要で、`sql` なしで空でない `sqlFiles` を指定することも設定エラーです。許可SQLファイルのパスは、API定義を書いたJSONファイルの場所を基準に解決します。空のパスや、絶対パスへ正規化した結果が重複する指定も設定エラーです。
+
+<a id="oauth-execution-limits"></a>
+
+#### OAuthの受付制限と実行枠
+
+以下はNyanQLの1プロセス内の制限です。HTTPの受付枠、VMの実行枠、Argon2の計算枠は独立しており、後段の枠が空いていても前段で拒否される場合があります。表の `L` はMCP定義の `maxConcurrent` の実効値で、未指定・0なら16です。
+
+| 対象 | 枠の共有範囲 | 上限 | 満杯の場合 |
+|---|---|---|---|
+| Streamable HTTPのMCP要求 | MCPサーバー名ごと | `L` | 待機せずHTTP 503 `server is busy`、`Retry-After: 1`。 |
+| OAuth `adminUser` のHTTP要求 | MCPサーバー名＋役割ごと | `min(L, 1)` | 待機せずHTTP 503 `OAuth endpoint is busy`、`Retry-After: 1`。 |
+| OAuth `authorize` のHTTP要求 | MCPサーバー名＋役割ごと | `min(L, 2)` | 待機せずHTTP 503 `OAuth endpoint is busy`、`Retry-After: 1`。 |
+| OAuth `token`・`register`・両メタデータのHTTP要求 | MCPサーバー名＋役割ごと | 各役割に `L` | 待機せずHTTP 503 `OAuth endpoint is busy`、`Retry-After: 1`。 |
+| `password` を許可したOAuth用VM | MCP名・API名・役割によらずプロセス全体 | 同時1実行 | スクリプト開始前に `restricted JavaScript runtime is busy` エラー。待機しません。 |
+| Argon2の生成・検証計算 | 通常API・OAuth用VM・関数名によらずプロセス全体 | 合計同時2計算 | 入力検査を通った計算は、枠が空くまで待機します。 |
+
+HTTPのMCP枠とOAuth各役割の枠は別々です。`verifyAccess` は独立したHTTP受付ではなく、MCPの `tools/call` の処理中に呼ばれるため、そのMCP要求の枠を使います。`OPTIONS` は上記の受付枠を使いません。MCP/OAuthのHTTP要求では、レート制限→同時実行枠→本文読み取り・処理の順に進みます。OAuthのレート制限は既述の既定値と `rateLimit` を併用し、HTTP 429を返す条件であり、同時実行枠のHTTP 503とは別です。
+
+レート制限は、MCPではサーバー名、OAuthではサーバー名＋役割を基準に、直接接続している送信元IPごとに数えます。送信元IPは `RemoteAddr` のポートを除いた値で、`X-Forwarded-For` からは取得しません。同時実行枠は送信元IPごとには分かれず、そのサーバー名・役割の要求全体で共有します。HTTP同時実行枠は実効上限値ごとにも分かれるため、ホットリロードで上限値を変更した場合、進行中の要求は元の枠を保持し、新しい要求は新上限の枠を使います。進行中の要求を中断して新上限以下へ減らす処理は行いません。
+
+OAuthの `paramCheck`・本体script・`outCheck` は、それぞれ別のVM実行です。`password` が許可されていれば、その段階で実際にパスワード関数を呼ぶかどうかにかかわらず、開始時に同時1件の枠を取得し、段階の終了時に解放します。次の段階が始まるまで同じ要求が枠を予約し続けるわけではありません。`password` を許可していないVMと、通常APIとしての実行にはこのVM受付枠は適用しません。
+
+VM受付で拒否された場合、OAuthのHTTP hookではHTTP 500 `OAuth hook failed` になります。MCPの `verifyAccess` の実行中に拒否された場合は認証判定失敗となり、`tools/call` はHTTP 401と `WWW-Authenticate` の `invalid_token` を返します。これはHTTP受付枠が満杯の場合の503とは異なる、現在の実装の動作です。VMの1件・Argon2の2件は固定値で、`maxConcurrent` を増やしても変更されません。
+
+Argon2の計算枠待ちと計算自体は同期処理です。OAuth用VMの15秒の期限を過ぎても、枠待ちや計算が終わるまで制御が戻らない場合があります。15秒で計算や待機を必ず打ち切る仕様ではありません。
 
 ## JSON-RPC
 
@@ -1787,6 +1909,21 @@ DB接続の暗号化はHTTPのHTTPS設定とは別です。現在のPostgreSQL�
 - `nyan` で始まる名前
 
 `api` は、呼び出すAPI名を指定するために使います。`nyanAllParams` や `nyan_mode` など、`nyan` で始まる名前はNyanQL側の制御用として使われます。
+
+<a id="mcp-api-names"></a>
+
+### MCP/OAuthのAPI名の制約
+
+ここで扱うのはリクエストパラメータ名ではなく、`api.json` のAPI名です。検証対象は、`type: "mcp"` の完全API名（stdio用も含む）と、`oauth` の各役割が参照する完全API名です。任意の通常APIすべてに、同じ名前検査を行うという意味ではありません。
+
+| 条件 | 扱い |
+|---|---|
+| 名前が空、または前後に空白を含む | 不可。OAuth参照値は前後の空白を除去してから検証します。 |
+| 先頭・末尾の `/`、途中の `//`、単独のパス要素 `.`・`..` | 不可。名前は `sub/local_mcp` のように指定します。 |
+| `\`・`?`・`#`・改行・タブ、URLパスとしてエスケープが必要な文字 | 不可。空白・日本語・`%` などを含む名前もこの検証で拒否します。 |
+| 完全API名が `nyan`・`nyan-rpc`・`favicon.ico` | `/nyan`・`/nyan-rpc`・`/favicon.ico` に対応する予約パスなので不可。 |
+
+条件に違反すると、起動時には設定エラー、ホットリロード時には候補設定の不採用となります。`oauth` の各役割には、存在する `type: "api"` の定義を指定する必要があり、1つのMCP定義内で複数の役割に同じAPI名を使うこともできません。これらの名前検査と、組込みHTTPルート（`/nyan/` 配下など）へのリクエストの振り分けは別の処理です。組込みルートをMCP/OAuthの接続先として上書きする設定にはなりません。
 
 ---
 
