@@ -9567,8 +9567,13 @@ func registerNyanFuncsInExecution(vm *goja.Runtime, snapshot *APIConfigSnapshot,
 	jsonAPIFunc := func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
 		jsonData := call.Argument(1).String()
-		username := call.Argument(2).String()
-		password := call.Argument(3).String()
+		var username, password string
+		if len(call.Arguments) >= 3 {
+			username = call.Argument(2).String()
+		}
+		if len(call.Arguments) >= 4 {
+			password = call.Argument(3).String()
+		}
 
 		// 第5引数：ヘッダー情報（オブジェクトまたはJSON文字列）
 		var headers map[string]string

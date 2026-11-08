@@ -1218,6 +1218,22 @@ const response = nyanGetAPI(url); // 認証なし
 // Basic認証が必要なら nyanGetAPI(url, "alice", "password")
 ```
 
+`nyanJsonAPI(url, jsonText, user, pass, headers)`（別名 `nyanCallAPI`）の認証引数も省略可能です。省略した値は空文字列として扱い、`nyanJsonAPI(url, jsonText)` は `nyanJsonAPI(url, jsonText, "", "")` と同じくBasic認証ヘッダーを自動付与しません。ユーザー名だけ指定すると空パスワードでBasic認証を付けます。ユーザー名が空文字列なら、パスワードの指定にかかわらずBasic認証は付けません。戻り値は応答本文の文字列です。
+
+明示的に渡した認証引数は従来どおり文字列に変換します。`undefined`・`null` は引数の省略とは区別し、それぞれ文字列 `"undefined"`・`"null"` になります。
+
+第5引数の `headers` はオブジェクトまたはJSON文字列で指定できます。追加ヘッダーは自動付与するヘッダーより優先され、`Authorization` や `Content-Type` も上書きできます。Basic認証を使わずに追加ヘッダーを渡す場合は、認証引数に `"", ""` を指定してください。
+
+```javascript
+const jsonText = JSON.stringify({ id: 1 });
+nyanJsonAPI(url, jsonText);         // 認証なし
+nyanJsonAPI(url, jsonText, "", ""); // 上と同じ動作
+nyanJsonAPI(url, jsonText, "alice", "password"); // Basic認証
+nyanJsonAPI(url, jsonText, "", "", {
+  Authorization: "Bearer " + token
+});
+```
+
 `nyanRandomBase64URL()` のサイズは、Base64URL変換前のバイト数です。省略時の32バイトは43文字になります。範囲外の値や明示的な `undefined`・`null`、乱数生成の失敗はJavaScript例外になります。`nyanCrypto.randomBase64URL(bytes)` も同じサイズ範囲ですが、引数をちょうど1つ指定する必要があります。
 
 `nyanSaveFile()`・`nyanGetFile()`・`nyanRunSQL()` に渡す相対パスは、起動時に指定した一番親の `api.json` があるフォルダを基準にします。include先のAPIや `nyanCallMe()` で呼び出したAPI、`paramCheck`・`outCheck` の中でも同じ基準です。絶対パスはそのまま使用します。

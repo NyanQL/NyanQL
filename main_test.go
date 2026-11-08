@@ -10710,6 +10710,91 @@ func TestNyanGetAPIArguments(t *testing.T) {
 	}
 }
 
+func TestNyanJsonAPIArguments(t *testing.T) {
+	originalTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	for _, functionName := range []string{"nyanJsonAPI", "nyanCallAPI"} {
+		t.Run(functionName, func(t *testing.T) {
+			for _, tc := range []struct {
+				name, arguments, wantUser, wantPass string
+				wantAuth                            bool
+				wantAuthorization                   string
+				wantHeaders                         map[string]string
+			}{
+				{name: "url_and_body", arguments: `url, body`},
+				{name: "empty_username", arguments: `url, body, ""`},
+				{name: "empty_credentials", arguments: `url, body, "", ""`},
+				{name: "username_only", arguments: `url, body, "alice"`, wantAuth: true, wantUser: "alice"},
+				{name: "credentials", arguments: `url, body, "alice", "secret"`, wantAuth: true, wantUser: "alice", wantPass: "secret"},
+				{name: "password_without_username", arguments: `url, body, "", "secret"`},
+				{name: "explicit_undefined_credentials", arguments: `url, body, undefined, undefined`, wantAuth: true, wantUser: "undefined", wantPass: "undefined"},
+				{name: "explicit_null_credentials", arguments: `url, body, null, null`, wantAuth: true, wantUser: "null", wantPass: "null"},
+				{name: "explicit_undefined_username", arguments: `url, body, undefined, "secret"`, wantAuth: true, wantUser: "undefined", wantPass: "secret"},
+				{name: "explicit_null_username", arguments: `url, body, null, "secret"`, wantAuth: true, wantUser: "null", wantPass: "secret"},
+				{name: "explicit_undefined_password", arguments: `url, body, "alice", undefined`, wantAuth: true, wantUser: "alice", wantPass: "undefined"},
+				{name: "explicit_null_password", arguments: `url, body, "alice", null`, wantAuth: true, wantUser: "alice", wantPass: "null"},
+				{name: "object_headers", arguments: `url, body, "alice", "secret", {"X-Nyan-Test":"yes", "X-Count":7}`, wantAuth: true, wantUser: "alice", wantPass: "secret", wantHeaders: map[string]string{"X-Nyan-Test": "yes", "X-Count": "7"}},
+				{name: "json_headers", arguments: `url, body, "alice", "secret", '{"X-Nyan-Test":"json"}'`, wantAuth: true, wantUser: "alice", wantPass: "secret", wantHeaders: map[string]string{"X-Nyan-Test": "json"}},
+				{name: "bearer_without_basic_auth", arguments: `url, body, "", "", {Authorization:"Bearer token"}`, wantAuthorization: "Bearer token"},
+				{name: "object_headers_override", arguments: `url, body, "alice", "secret", {Authorization:"Bearer object-token", "Content-Type":"application/custom+json"}`, wantAuthorization: "Bearer object-token", wantHeaders: map[string]string{"Content-Type": "application/custom+json"}},
+				{name: "json_headers_override", arguments: `url, body, "alice", "secret", '{"Authorization":"Bearer json-token"}'`, wantAuthorization: "Bearer json-token"},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					const endpoint = "https://jsonapi.test/data?mode=full"
+					const body = `{"message":"猫 & value"}`
+					requests := 0
+					http.DefaultTransport = getAPIArgumentTestTransport(func(request *http.Request) (*http.Response, error) {
+						requests++
+						if request.Method != http.MethodPost || request.URL.String() != endpoint {
+							t.Errorf("unexpected request: %s %s", request.Method, request.URL)
+						}
+						data, err := io.ReadAll(request.Body)
+						_ = request.Body.Close()
+						if err != nil || string(data) != body {
+							t.Errorf("request body=%q err=%v, want %q", data, err, body)
+						}
+						contentType := "application/json"
+						if value, ok := tc.wantHeaders["Content-Type"]; ok {
+							contentType = value
+						}
+						if got := request.Header.Get("Content-Type"); got != contentType {
+							t.Errorf("Content-Type=%q, want %q", got, contentType)
+						}
+						user, pass, ok := request.BasicAuth()
+						if ok != tc.wantAuth || user != tc.wantUser || pass != tc.wantPass {
+							t.Errorf("BasicAuth=(%q, %q, %t), want (%q, %q, %t)", user, pass, ok, tc.wantUser, tc.wantPass, tc.wantAuth)
+						}
+						if !tc.wantAuth && request.Header.Get("Authorization") != tc.wantAuthorization {
+							t.Errorf("Authorization=%q, want %q", request.Header.Get("Authorization"), tc.wantAuthorization)
+						}
+						for name, want := range tc.wantHeaders {
+							if got := request.Header.Get(name); got != want {
+								t.Errorf("header %s=%q, want %q", name, got, want)
+							}
+						}
+						return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("post-response")), Request: request}, nil
+					})
+					vm := goja.New()
+					registerNyanFuncs(vm, nil, nil, nil)
+					if err := vm.Set("url", endpoint); err != nil {
+						t.Fatal(err)
+					}
+					if err := vm.Set("body", body); err != nil {
+						t.Fatal(err)
+					}
+					result, err := vm.RunString(functionName + "(" + tc.arguments + ")")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if result.String() != "post-response" || requests != 1 {
+						t.Fatalf("result=%s requests=%d, want response body from one request", result, requests)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestCheckStatusContract(t *testing.T) {
 	resetJavascriptInclude(t)
 	for _, tc := range []struct {
