@@ -278,7 +278,8 @@ HTTP 200で次のJSONが返ります（キーの順序は問いません）。�
 | `BasicAuth` | API呼び出し時のBasic認証ユーザ名とパスワードです。 |
 | `APIHotReload` | `api.json` の定期的な変更確認を設定します。省略時も有効です。 |
 | `webSocketLimits` | 全チャネル合計のWebSocket受入接続数の上限です。省略時は128件です。[設定仕様](#websocket-connection-limits)を参照してください。 |
-| `oauthRuntime` | OAuth用VMの混雑時の応答を選択します。省略時は従来の応答を維持します。[混雑応答の設定](#oauth-runtime-busy-response)を参照してください。 |
+| `oauthRuntime` | 互換用のMCPサーバー用OAuth設定です。新しい設定は `api.json` のMCP定義の `oauthRuntime` に記述します。[優先順位](#script-runtime-timeouts)を参照してください。 |
+| `scheduleRuntime` | 互換用の制限付きscheduleの既定期限です。新しい設定は `api.json` のschedule定義の `runtime.timeout` に記述します。[優先順位](#script-runtime-timeouts)を参照してください。 |
 | `sqlResultLimits` | SQL結果ごとの行数・JSONバイト数の上限です。省略時は10,000行・4MiBです。 |
 | `javascript_include` | `check` や `script` の実行前に読み込む共通JavaScriptです。 |
 | `javascript_include_cache` | `true`で共通JSのソースを起動時に読み込み、再起動まで保持します。省略時は`false`です。 |
@@ -470,6 +471,61 @@ NyanQL独自の固定最大値は設けません。設定可能な数値の上�
 `api.json` には、API名と、実行するSQLまたはJavaScriptの対応を書きます。
 
 各 `api.json` 内の相対パスは、その定義が書かれているJSONファイルの場所を基準にして扱われます。対象はincludeの `path`、`sql`、`script`、`paramCheck`、`outCheck`、public APIの `path` です。
+
+<a id="script-runtime-timeouts"></a>
+
+### JavaScriptの実行期限（NyanQL）
+
+`api.json` の各定義で実行期限を設定します。MCPサーバー用OAuthは `type: "mcp"` の `oauthRuntime.timeout`、定期実行ジョブは `type: "schedule"` の `runtime.timeout` に指定します。
+
+OAuthが設定済みのMCPサーバー定義に追加する項目の例です。MCPの `oauth` と同じ階層に置きます。参照先の通常API定義には置きません。
+
+```json
+"oauthRuntime": {
+  "timeout": "60s",
+  "busyResponse": "legacy"
+}
+```
+
+次は定期実行ジョブの期限を5分にする例です。
+
+```json
+{
+  "dailyJob": {
+    "type": "schedule",
+    "script": "./javascript/daily_job.js",
+    "trigger": {"type": "cron", "value": "0 10 * * *"},
+    "runtime": {"timeout": "5m"}
+  }
+}
+```
+
+| 設定 | 適用対象 | API側と互換用のconfig側の両方で省略した場合 |
+|---|---|---|
+| MCP定義の `oauthRuntime.timeout` | そのMCPサーバーのOAuth経路で実行する各 `paramCheck`・本体script・`outCheck`。`verifyAccess` とメタデータAPIのチェックも含む | 各実行に15秒 |
+| schedule定義の `runtime.timeout` | そのジョブの1回の実行 | 既存の制限付きVMを使うジョブは15秒。それ以外は期限なし |
+
+scheduleでは `runtime.capabilities`・`runtime.sqlFiles`・`runtime.settings` のいずれかに内容があると、従来どおり制限付きVMで実行します。`runtime.timeout` だけの指定は、利用可能な関数を制限せず、実行期限だけを設定します。`runtime` を省略したジョブや、各項目が空で期限も未指定のジョブに、新たな実行期限は加わりません。同梱 `api.json` のサンプルジョブは、従来の期限なしの動作を保つため `"timeout": "0s"` を指定しています。
+
+通常API・JSON-RPC・通常WebSocket・MCP Toolの本体・`ws_client` にも、この変更による一律の期限を追加しません。`type: "api"` のAPIでも、MCP設定の `oauth` から呼び出す経路ではMCP用OAuthの期限を適用します。Go側はトークンの種類やJavaScript内部の処理内容を解析して期限を選びません。`runtime.timeout` はschedule専用であり、他のtypeに非nullの値を指定すると設定エラーです。`oauthRuntime` はOAuthが設定された `type: "mcp"` 専用です。
+
+| `timeout` の指定 | 動作 |
+|---|---|
+| 省略・`null`（親オブジェクトの省略・`null`・`{}` も含む） | 下記の互換用設定と、従来の既定動作を引き継ぐ |
+| 正の時間文字列（例：`"60s"`・`"5m"`・`"1h"`・`"500ms"`） | 指定時間を実行期限にする |
+| 単位のない正の数値文字列・JSON数値（例：`"1"`・`1`・`"1.5"`・`1.5`） | 秒として扱う。`"1"`・`1` は `"1s"`、`"1.5"`・`1.5` は `"1500ms"` と同じ |
+| `"0s"`・`"0"`・`0` | この実行期限を設けず、完了まで待つ |
+| 負数・空文字列・真偽値・配列・オブジェクト・不明な単位・指数表記（例：`1e3`）・範囲外 | 設定エラー |
+
+単位の省略はMCPの `oauthRuntime.timeout` とscheduleの `runtime.timeout` の両方で使用でき、互換用のconfig設定にも適用します。例えば `"runtime": {"timeout": 60}` は60秒の期限です。整数・小数を受け付け、文字列の前後の空白は許可します。正の値は1ナノ秒以上で、Goの `time.Duration` の上限（`"2562047h47m16.854775807s"`、秒では `9223372036.854775807`）まで指定できます。1ナノ秒未満の正数は無期限として扱わず設定エラーにします。単位付きの既存表記も引き続き有効です。この省略規則は他の時間設定には適用しません。`httpTimeouts` では `"0s"` が既定値を意味しますが、ここでは実行期限なしを意味します。
+
+後方互換のため、`config.json` の `oauthRuntime.timeout`・`oauthRuntime.busyResponse`・`scheduleRuntime.timeout` も読み込みます。MCP側では項目ごとに、API定義の非nullの値 → config側の値 → 既定値（15秒・`"legacy"`）の順で決めます。例えばAPI側に `timeout` だけ書いた場合、`busyResponse` はconfig側から引き継ぎます。schedule側では、明示した `runtime.timeout` を最優先し、省略・nullの場合に限り、既存の制限付きVMを使うジョブだけが `config.json` の `scheduleRuntime.timeout`（省略時15秒）を使います。それ以外のジョブは従来どおり期限なしです。新しい設定は `api.json` に記述してください。
+
+`api.json` とinclude先の変更は、`APIHotReload` が有効なら再読み込み後の要求・ジョブ実行から適用します。実行中の期限は変更しません。不正な設定への変更は再読み込みに失敗し、直前の有効な設定を維持します。ホットリロード無効時とstdioでは再起動が必要です。互換用の `config.json` 設定の変更にも再起動が必要です。
+
+期限は実行開始からの経過時間で、共通JS・本体scriptの読み込みやVMの準備、JavaScript本体、戻り値変換、SQLの接続取得・実行を含みます。早く正常終了すればその時点で結果を返します。MCP用OAuthではチェックと本体の各段階が独立した期限を持ち、HTTP要求全体の合計時間を制限するものではありません。期限切れは実行エラーとして扱い、その実行の未コミットSQLをロールバックします。前の段階で既にコミットしたSQLは取り消しません。期限切れを `oauthRuntime.busyResponse` による混雑応答へ変換することもありません。
+
+期限の延長や `"0s"` の指定は、HTTPの `httpTimeouts`、SQL接続プールの最大30秒の空き待ち、呼び出し元からのキャンセルなどを解除しません。Go側で実行中の同期処理は途中で中断できない場合があり、指定時間を過ぎてもその処理が戻るまでエラー応答を返せないことがあります。
 
 ### api.jsonを複数ファイルに分ける
 
@@ -1120,7 +1176,7 @@ OAuthのHTTP要求でも `nyan_mode=checkOnly` を指定すると、入力チェ
 
 OAuthのHTTP経路では、役割ごとの既定上限（管理者ユーザー作成・クライアント登録は毎分10回、認可は毎分30回、その他は毎分60回）と、`rateLimit` に指定した回数・期間を両方適用します。いずれかに達するとHTTP 429を返し、`Retry-After` は両方の枠が利用可能になるまでの待ち秒数です。レート制限で拒否された要求は枠を消費しません。
 
-前後チェックと本体は、それぞれ新しいOAuth用VMで実行します。参照先APIの `runtime.capabilities`、SQLファイルの許可リスト、戻り値変換とDB接続取得・実行にも適用する実行ごとの15秒の期限とトランザクションを使います。既存の `javascript_include` も読み込みます。各段階に入力情報のコピーを渡すため、チェック内でのパラメータ書換えを後段の入力変更には使えません。チェックや本体で既に完了したDB更新などは、後続の拒否では取り消しません。
+前後チェックと本体は、それぞれ新しいOAuth用VMで実行します。参照先APIの `runtime.capabilities`、SQLファイルの許可リスト、戻り値変換とDB接続取得・実行にも適用する実行ごとの期限（既定15秒）とトランザクションを使います。期限は `api.json` のMCPサーバー定義の `oauthRuntime.timeout` で変更できます（[設定仕様](#script-runtime-timeouts)）。既存の `javascript_include` も読み込みます。各段階に入力情報のコピーを渡すため、チェック内でのパラメータ書換えを後段の入力変更には使えません。チェックや本体で既に完了したDB更新などは、後続の拒否では取り消しません。
 
 出力チェックの `nyanAllParams.nyan_output` には、送信予定の本文全体を文字列の `body` として渡し、`status`、`contentType`、検証済みの `headers`、`bodyBase64`、本文バイト数も渡します。`headers` のキーはHTTPの標準表記（`Location`、`Set-Cookie` など）で、値は1件なら文字列、複数件なら配列です。これらを書き換えても送信内容は変わりません。`verifyAccess` ではHTTP応答の代わりに認証判定全体のJSONを `body` に渡し、検査用の `status` は200とします。
 
@@ -1241,6 +1297,10 @@ JSON.stringify({
 | `nyanCrypto.sha256Hex(text)` | 同じSHA-256を小文字の16進文字列（64文字）で返します。引数はちょうど1つ必要です。 |
 | `nyanCrypto.timingSafeEqual(a, b)` | 2つの値を文字列化して比較し、真偽値を返します。引数はちょうど2つ必要です。比較方法は下記を参照してください。 |
 | `nyanSHA256Base64URL(value)` | 文字列のSHA-256を、パディングなしのBase64URL文字列で返します。引数省略時は `TypeError`。明示した空文字列は有効です。 |
+| `nyanArgon2idHash(password)` | パスワードから、計算条件・salt・ハッシュを含む文字列を生成します。戻り値全体を保存します。[生成・検証の使い方](#argon2idハッシュの生成と検証)を参照してください。 |
+| `nyanArgon2idVerify(password, encodedHash)` | 入力パスワードを保存済みの文字列全体と照合し、一致時に `true`、不一致・不正形式・範囲外では `false` を返します。 |
+| `nyanPassword.hash(password)` | `nyanArgon2idHash` と同じ生成処理です。引数はちょうど1つ必要です。 |
+| `nyanPassword.verify(password, encodedHash)` | `nyanArgon2idVerify` と同じ検証処理です。引数はちょうど2つ必要です。 |
 | `nyanSaveFile(base64, path)` | Base64文字列をデコードし、一番親の `api.json` のフォルダを基準に保存します。 |
 | `nyanWriteTextFile(path, text)` | UTF-8テキストを保存します。成功時true、失敗時例外。 |
 | `nyanWriteBase64File(path, base64)` | 標準Base64をデコードして保存します。成功時true、失敗時例外。 |
@@ -1341,7 +1401,63 @@ Push先には、呼び出し元の処理後のパラメータとリクエスト�
 
 `nyanArgon2idHash(password)` と `nyanArgon2idVerify(password, encodedHash)` の計算・検証条件はNyanQL・Nyan8・NyanPUIで共通です。
 
-新規生成は従来どおり `m=65536,t=3,p=2`（メモリ64 MiB）、ソルト16バイト、ハッシュ32バイトです。生成するパスワードは1〜4096バイト。ランダムなソルトを使うため、同じパスワードでも生成するハッシュ文字列は通常異なります。
+これらは、利用者の登録・パスワード変更時のハッシュ生成と、ログイン時のパスワード照合に使う同期関数です。NyanQLでは `nyanPassword.hash(password)` / `nyanPassword.verify(password, encodedHash)` も同じ生成・検証処理を使います。対象アカウントの選択、DBへの保存・取得、照合後のログイン許可やセッション発行はアプリケーションのJavaScriptで実装します。
+
+MCP自体の必須機能ではありません。Go側がMCP呼び出しや `access_token`・`refresh_token` の発行・検証に伴って自動的にArgon2を実行することはなく、JavaScriptがこれらの関数を呼んだ場合に実行します。通常APIからも利用でき、capabilitiesで制限する実行環境では `password` の許可が必要です。
+
+#### 戻り値と保存する値
+
+生成関数は、成功時に**計算条件・salt・ハッシュをまとめた1本の文字列（PHC形式）**を返します。オブジェクトや、計算結果のバイト列を返す関数ではありません。形式は次のとおりです。`<…>` は説明用の表記で、実際にはBase64文字列が入ります。
+
+```text
+$argon2id$v=19$m=65536,t=3,p=2$<saltのBase64文字列>$<ハッシュのBase64文字列>
+```
+
+| 部分 | 現在の生成設定での内容 |
+|---|---|
+| `argon2id` | 使用するアルゴリズム |
+| `v=19` | Argon2のバージョン |
+| `m=65536` | 計算に使うメモリ量。単位はKiBで、65536 KiBは64 MiB |
+| `t=3` | 反復回数。秒数やタイムアウト値ではありません |
+| `p=2` | 1回の計算内部の並列度 |
+| salt | 暗号学的乱数で生成した16バイトを、パディングなしの標準Base64にした22文字 |
+| ハッシュ | 計算結果32バイトを、パディングなしの標準Base64にした43文字 |
+
+現在の生成設定では、区切りの `$` を含めて**全体で97文字のASCII文字列**です。生成するパスワードは1〜4096バイトです。
+
+**DBには生成関数の戻り値全体を、対象アカウントのレコードに保存します。** 例えば `users.password_hash` 列に、先頭の `$argon2id$` から末尾までをそのまま保存します。末尾のハッシュ部分だけを抜き出すと、照合に必要なsaltと計算条件が失われます。保存先は `TEXT` など、文字列全体を切り詰めずに保持できる型を使います。検証で受け付けるsaltやハッシュの長さは生成設定より広いため、97文字を受理可能な保存値全体の長さの上限とは扱わないでください。
+
+`encodedHash` は、DBに保存したこの文字列全体を指します。クライアントから受け取った値を照合基準にせず、サーバー側で対象アカウントのDBレコードから取得します。生成関数はDBに自動保存しません。平文パスワードは保存せず、平文・生成した文字列ともログやAPI応答へ含めないようにします。
+
+#### 登録・変更とログインの利用手順
+
+以下は生成・検証部分の抜粋です。`password` と `inputPassword` は、アプリケーション側で文字列型・必須項目・長さの入力チェックを済ませた値とします。DBへの書き込みと読み出しは別途実装します。
+
+登録・パスワード変更時は、新しいパスワードから生成した文字列全体を保存します。対象アカウントを更新できるかどうかの判断もアプリケーション側で行います。
+
+```javascript
+const encodedHash = nyanArgon2idHash(password);
+// encodedHash全体を、対象アカウントのpassword_hash列に保存する。
+// 保存にはSQLのパラメータを使い、値をSQL文字列へ直接連結しない。
+```
+
+ログイン時は、リクエストのユーザー名などでアカウントを検索し、そのレコードに保存された値と入力パスワードを照合します。次の `user` はサーバー側でDBから取得したアカウントのオブジェクトで、アカウントが見つからなかった場合は `null` とします。
+
+```javascript
+const matched = user !== null &&
+  nyanArgon2idVerify(inputPassword, user.password_hash);
+// matchedを使い、アプリケーション側でログインの許可・拒否を判断する。
+```
+
+上の呼び出しは、それぞれ `nyanPassword.hash(password)` と `nyanPassword.verify(inputPassword, user.password_hash)` にも置き換えられます。検証関数は保存済みの文字列からsaltと計算条件を取り出し、入力パスワードを同じ条件で再計算して照合します。ログイン時に `hash(inputPassword)` を呼び直し、生成した文字列と保存値を直接比較する方法は使いません。
+
+#### saltとサイト共通の秘密値（pepper）
+
+saltはハッシュ生成のたびに暗号学的乱数で新しく生成し、戻り値に含めます。各アカウントで生成した戻り値を保存すれば、それぞれの保存値が個別のsaltを持ちます。同じパスワードでも生成する文字列は通常異なり、同じアカウントのパスワードを再生成した場合もsaltは変わります。アプリケーション側でsaltを別途生成・保存したり、検証時に別引数で渡したりする必要はありません。
+
+saltは秘密鍵ではなく、ハッシュと一緒に保存する値です。サイト共通の秘密値であるpepperとは役割が異なります。**現在の関数にはpepperを指定する引数・設定や、自動的に組み込む処理はありません。** pepperによる追加保護を採用する場合は、パスワードDBとは別の秘密値管理、生成・検証の両方への適用、既存の保存値との互換性をアプリケーション側で設計する必要があります。一般的なsaltとpepperの役割は [OWASPのPassword Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#peppering) を参照してください。
+
+#### 検証で受け付ける形式と引数
 
 検証では、ハッシュに記録された条件を使い、以下の範囲を受け付けます。新規生成の設定とは独立しています。
 
@@ -1359,15 +1475,11 @@ Push先には、呼び出し元の処理後のパラメータとリクエスト�
 
 PHC文字列は `$argon2id$v=19$m=65536,t=3,p=2$ソルト$ハッシュ` の形で、パラメータは `m,t,p` の順序、符号・先頭ゼロのない10進整数とします。余分な文字・空白・項目は拒否します。ソルトとハッシュはパディングなしの標準Base64で、改行・Base64URL・非正規の末尾ビットを拒否します。
 
-検証関数は一致時に `true`、不一致・不正形式・範囲外・長すぎるパスワードでは `false` を返します。検証時の空文字列は従来どおり照合対象にできますが、生成関数は空パスワードを拒否します。引数の省略・型変換に関する既存のJavaScriptラッパーの仕様は今回変更していません。
+検証関数は一致時に `true`、不一致・不正形式・範囲外・長すぎるパスワードでは `false` を返します。検証時の空文字列は従来どおり照合対象にできますが、生成関数は空パスワードを拒否します。生成時の空文字列・長すぎるパスワード・乱数生成の失敗はJavaScript例外になります。
 
-形式・上限の検査はArgon2計算前に行い、1プロセス内の生成・検証を合わせて同時2件までに制限します。この計算枠は、通常APIとOAuth用VM、`nyanArgon2idHash`・`nyanArgon2idVerify`・`nyanPassword.hash`・`nyanPassword.verify` のすべてで共有します。枠が埋まっている場合、検査を通った計算は空きができるまで待機します。記録された `m` や `t` が大きいハッシュは、標準設定よりメモリや処理時間を使います。
-
-NyanQLのOAuth用VMには計算枠とは別に、`password` capabilityを持つVM全体を1プロセスで同時1件までにする受付制限があります。この受付は待機せず、競合した実行をスクリプト開始前にエラーにします。そのため「Argon2の計算枠では待機する」ことから「OAuth要求もすべて待機する」と解釈しないでください。適用単位・処理順・HTTP応答は [OAuthの受付制限と実行枠](#oauth-execution-limits) に示します。
+NyanQLの `nyanPassword.hash` / `nyanPassword.verify` は、引数がそれぞれちょうど1個・2個でない場合にJavaScript例外になります。`nyanArgon2idHash` / `nyanArgon2idVerify` は引数個数を検査せず、余分な引数は使いません。4関数とも、使用する引数はJavaScriptの文字列に変換してから処理します。個数検査を通った明示的な `undefined`・`null` はそれぞれ `"undefined"`・`"null"` になり、`nyanArgon2idHash` / `nyanArgon2idVerify` の省略した引数も `"undefined"` になります。引数個数の検査を、パスワードの必須入力・文字列型の検査の代わりにはできません。
 
 既存の標準ハッシュはそのまま利用できます。ハッシュの自動再生成・保存やパスワード再設定は行いません。QL/Nyan8で以前読めた非正規の表記は拒否されるため、外部から取り込んだハッシュは上記形式を確認してください。生成・検証条件を変更するconfig.json項目を追加したものではありません。
-
-`nyanPassword.hash(password)` / `nyanPassword.verify(password, encodedHash)` も同じ生成・検証処理を使います。引数はそれぞれちょうど1個・2個で、個数の過不足はJavaScript例外です。capabilitiesで制限する実行環境では、`password` の許可が必要です。
 
 ### 共通ファイル保存：nyanWriteTextFile / nyanWriteBase64File
 
@@ -1415,7 +1527,7 @@ nyanWriteBase64File("./files/hello.bin", "aGVsbG8="); // hello のバイト列�
 
 ## scriptでのトランザクション
 
-`script` を使うAPIでは、最初のSQL実行時にトランザクションを開始します。SQLを使わないscriptはDB接続を確保しません。接続プールの空き待ちは最大30秒で、呼び出し元のキャンセルやOAuthの15秒の期限が先に来た場合はそちらを優先します。
+`script` を使うAPIでは、最初のSQL実行時にトランザクションを開始します。SQLを使わないscriptはDB接続を確保しません。接続プールの空き待ちは最大30秒で、呼び出し元のキャンセルや、そのJavaScriptに適用される[実行期限](#script-runtime-timeouts)が先に来た場合はそちらを優先します。
 
 script内で `nyanRunSQL()` を何度呼んでも、同じトランザクションの中で実行されます。`nyanCallMe()` の子API・孫APIのSQL、script、前後チェックもこのトランザクションを共有します。子APIは親の未コミット更新を参照でき、接続上限が1でも別接続の空きを待ちません。子APIの `paramCheck`・`outCheck` は、戻り値のgetter評価中も親scriptのキャンセルに従います。
 
@@ -1628,6 +1740,8 @@ scriptの結果は前後の空白・改行を除去してから扱います。�
 
 この例では、毎日10:00に `./javascript/daily_job.js` が実行されます。`type: "schedule"` の定義はHTTP APIとしては公開されないため、外部リクエストから直接実行されません。
 
+各ジョブの `runtime.timeout` に `"5m"` などを指定すると、そのジョブの実行期限を設定できます。`"0s"` は期限なしです。`runtime.timeout` だけの指定で関数の利用制限は加わりません。省略時は従来の動作を維持し、上の例は期限なし、`runtime.capabilities`・`runtime.sqlFiles`・`runtime.settings` に内容があるジョブは既定15秒です。互換用のconfig設定との優先順位やホットリロードの扱いは [JavaScriptの実行期限](#script-runtime-timeouts) を参照してください。
+
 scheduleでは `paramCheck`・`outCheck` は不要であり、実行しません。これらにスクリプトを指定すると、起動時・ホットリロード時の設定読み込みで、ジョブ名と対象項目を含むWARNログ（`schedule_check_ignored`）を出力します。ログには、その指定は不要で適用できず、実行されないことと、設定の削除を案内します。互換名の `check`・`paramcheck`・`outcheck` も同じ扱いです。ジョブ自体の登録・実行は継続し、定期実行のたびにこの警告を繰り返すことはありません。script内から `nyanCallMe()` で通常APIを呼ぶ場合は、呼び出し先APIのチェックが通常どおり適用されます。
 
 scheduleがinclude先にある場合、ジョブ名と `nyanAllParams.nyan_job_name` には `sub/dailyJob` のような完全名が入ります。mountを削除すると、その配下のジョブも次回以降実行されません。
@@ -1765,6 +1879,7 @@ curl http://127.0.0.1:8080/local_mcp \
 | `rateLimit` | `{"requests":120,"window":"1m"}` 等。requestsは1〜10000、windowは1秒〜24時間 |
 | `maxConcurrent` | 正の整数1〜256。未指定・0は16。負数・257以上は設定エラー。HTTP MCPとOAuthの受付枠に使用し、stdioには適用しない |
 | `oauth` | 下記の通常APIへの役割参照。HTTPのみ |
+| `oauthRuntime` | このMCPサーバー用OAuthの `timeout` と `busyResponse`。OAuth設定時に使用できる。[実行期限](#script-runtime-timeouts)と[混雑応答](#oauth-runtime-busy-response)を参照 |
 | `redirectURIAllowedPrefixes` | OAuthで必須。HTTPSで末尾`/`のredirect URI prefix配列 |
 
 対応メソッドはinitialize・ping・tools/list・tools/callです。HTTPはstatelessで、バッチ要求やセッション管理は提供しません。Toolのtitle・description・securitySchemes・annotations、paramCheck/outCheckのスキーマは参照先APIから解決します。
@@ -1804,7 +1919,7 @@ HTTP hookで使えるヘッダー参照には、次の違いがあります。
 
 HTTP hookは `{status, contentType, headers, body}` を返します（status省略時200、指定時は100〜599の整数）。例えば拒否応答は `({status:400,contentType:"application/json",body:{error:"invalid_request"}});` です。verifyAccessはHTTP応答ではなく `{authenticated:true,principal:{...}}` または拒否の `{authenticated:false}` を返します。認証成功にはprincipalも必要です。JSオブジェクトと、それをJSON化した文字列を利用できます。チェックの `{success,status,result}` とは別の契約です。
 
-OAuthのscriptと前後チェックは、通常APIより機能を制限したVMで実行します。各参照先APIの `runtime` に `capabilities`（`sql`・`crypto`・`password`）を指定し、`sql`を使う場合は `sqlFiles` に許可SQLファイルを列挙します。`settings` は `nyanRuntimeSettings` から取得できます。例えば `"runtime":{"capabilities":["crypto","password"],"settings":{}}` です。外部HTTP、HostExec、汎用ファイル操作、nyanCallMeは利用できません。各script・前後チェックの開始から15秒の期限を設け、JavaScript本体と戻り値変換中のgetterを監視します。同じ期限をSQLの接続取得・実行にも渡します。SQLを使わないscriptはDB接続を確保しません。期限切れや戻り値変換の例外では、その実行の未コミットSQLをロールバックします。これは各段階の期限であり、複数のチェックと本体を含むHTTP要求全体が15秒で完了する保証ではありません。同期ファイル読み込み、暗号計算、DBドライバ内のキャンセル不能な処理は、処理が戻るまで待つ場合があります。通常API全体を隔離する設定ではありません。
+OAuthのscriptと前後チェックは、通常APIより機能を制限したVMで実行します。各参照先APIの `runtime` に `capabilities`（`sql`・`crypto`・`password`）を指定し、`sql`を使う場合は `sqlFiles` に許可SQLファイルを列挙します。`settings` は `nyanRuntimeSettings` から取得できます。例えば `"runtime":{"capabilities":["crypto","password"],"settings":{}}` です。外部HTTP、HostExec、汎用ファイル操作、nyanCallMeは利用できません。各script・前後チェックの開始からMCPサーバー定義の `oauthRuntime.timeout` の期限（既定15秒、[設定で変更可能](#script-runtime-timeouts)）を設け、JavaScript本体と戻り値変換中のgetterを監視します。同じ期限をSQLの接続取得・実行にも渡します。SQLを使わないscriptはDB接続を確保しません。期限切れや戻り値変換の例外では、その実行の未コミットSQLをロールバックします。これは各段階の期限であり、複数のチェックと本体を含むHTTP要求全体が設定時間内に完了する保証ではありません。同期ファイル読み込み、暗号計算、DBドライバ内のキャンセル不能な処理は、処理が戻るまで待つ場合があります。通常API全体を隔離する設定ではありません。
 
 <a id="oauth-runtime-capabilities"></a>
 
@@ -1843,15 +1958,15 @@ HTTPのMCP枠とOAuth各役割の枠は別々です。`verifyAccess` は独立�
 
 OAuthの `paramCheck`・本体script・`outCheck` は、それぞれ別のVM実行です。`password` が許可されていれば、その段階で実際にパスワード関数を呼ぶかどうかにかかわらず、開始時に同時1件の枠を取得し、段階の終了時に解放します。次の段階が始まるまで同じ要求が枠を予約し続けるわけではありません。`password` を許可していないVMと、通常APIとしての実行にはこのVM受付枠は適用しません。
 
-VM受付で拒否された場合、既定ではOAuthのHTTP hookはHTTP 500 `OAuth hook failed` を返します。MCPの `verifyAccess` の実行中に拒否された場合は認証判定失敗となり、`tools/call` はHTTP 401と `WWW-Authenticate` の `invalid_token` を返します。`config.json` の `oauthRuntime.busyResponse` を `"serviceUnavailable"` にすると、このVM受付の混雑をHTTP 503として区別できます。詳細は [混雑応答の設定](#oauth-runtime-busy-response) を参照してください。VMの1件・Argon2の2件は固定値で、`maxConcurrent` や `busyResponse` を変更しても件数は変わりません。
+VM受付で拒否された場合、既定ではOAuthのHTTP hookはHTTP 500 `OAuth hook failed` を返します。MCPの `verifyAccess` の実行中に拒否された場合は認証判定失敗となり、`tools/call` はHTTP 401と `WWW-Authenticate` の `invalid_token` を返します。`api.json` のMCPサーバー定義の `oauthRuntime.busyResponse` を `"serviceUnavailable"` にすると、このVM受付の混雑をHTTP 503として区別できます。詳細は [混雑応答の設定](#oauth-runtime-busy-response) を参照してください。VMの1件・Argon2の2件は固定値で、`maxConcurrent` や `busyResponse` を変更しても件数は変わりません。
 
-Argon2の計算枠待ちと計算自体は同期処理です。OAuth用VMの15秒の期限を過ぎても、枠待ちや計算が終わるまで制御が戻らない場合があります。15秒で計算や待機を必ず打ち切る仕様ではありません。
+Argon2の計算枠待ちと計算自体は同期処理です。OAuth用VMの設定された実行期限（既定15秒）を過ぎても、枠待ちや計算が終わるまで制御が戻らない場合があります。設定時間で計算や待機を必ず打ち切る仕様ではありません。
 
 <a id="oauth-runtime-busy-response"></a>
 
-#### OAuth用VMの混雑応答を設定する
+#### MCPサーバー用OAuthの混雑応答を設定する
 
-`config.json` のトップレベルに次の設定を追加すると、Go側のOAuth用VM受付枠が満杯の場合にHTTP 503を返します。全MCPサーバーのOAuth経路で共通です。`api.json` の `oauth` や各APIの `runtime` に指定する項目ではありません。
+`busyResponse` は、MCPサーバー用OAuthのJavaScriptを実行する枠が満杯で、実行を受け付けられない場合の応答を選ぶ項目です。実行期限や認証の許可・拒否を選ぶ設定ではありません。`api.json` の既存の `type: "mcp"` 定義内で、`oauth` と同じ階層に次の項目を追加すると、そのMCPサーバーの該当する混雑をHTTP 503で返します。受付枠自体は引き続きプロセス内で共有し、MCPサーバーごとに枠を増やす設定ではありません。
 
 ```json
 "oauthRuntime": {
@@ -1861,11 +1976,12 @@ Argon2の計算枠待ちと計算自体は同期処理です。OAuth用VMの15�
 
 | `busyResponse` の指定 | 動作 |
 |---|---|
-| 未指定・`null`・`"legacy"` | 従来どおり、OAuth HTTP hookは500、MCP `verifyAccess` は401・`invalid_token`。既存の応答本文・認証要求ヘッダーも維持します。 |
+| 未指定・`null` | 互換用の `config.json` の `oauthRuntime.busyResponse` を引き継ぎ、省略時は `"legacy"`。 |
+| `"legacy"` | 従来どおり、OAuth HTTP hookは500、MCP `verifyAccess` は401・`invalid_token`。既存の応答本文・認証要求ヘッダーも維持します。 |
 | `"serviceUnavailable"` | Goの専用VM混雑エラーに限り、両経路とも503に変更します。 |
 | 上記以外の文字列（空文字列・大文字小文字違い・前後空白を含む値も含む）、数値・真偽値・配列・オブジェクト | 設定エラーで起動しません。 |
 
-`oauthRuntime` 自体が未指定・`null`・`{}` の場合も従来の動作です。サンプルの `config.json` は `"legacy"` を明記しています。設定変更の反映にはサービスの再起動が必要で、`APIHotReload` の対象ではありません。
+MCP定義の `oauthRuntime` 自体が未指定・`null`・`{}` の場合も互換用のconfig設定を引き継ぎます。新旧両方で省略すれば従来の動作です。同じオブジェクトの `timeout` は実行期限の設定で、混雑時の応答とは独立しています。MCP定義側の設定はホットリロードに対応します。詳細は [優先順位と反映時期](#script-runtime-timeouts) を参照してください。
 
 503モードのOAuth HTTP hookは、本文 `OAuth runtime is busy`（末尾改行付き）のテキスト応答になります。MCPの `tools/call` は要求IDを保持したJSON-RPC応答で、`result.isError: true` と同じ文言のテキストcontentを返します。この混雑応答には `WWW-Authenticate` ヘッダーと `mcp/www_authenticate` メタデータを付けません。`verifyAccess` を完了できなかった場合はToolの入力チェック・本体を実行しません。
 

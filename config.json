@@ -30,9 +30,6 @@
   "webSocketLimits": {
     "maxConnections": 128
   },
-  "oauthRuntime": {
-    "busyResponse": "legacy"
-  },
   "BasicAuth": {
     "Username": "neko",
     "Password": "nyan"

@@ -162,14 +162,15 @@ func (limits WebSocketLimitsConfig) connectionLimit() int {
 	return defaultWebSocketConnections
 }
 
-// OAuthRuntimeConfig controls how runtime admission failures reach clients.
-// The zero value preserves the historical HTTP responses.
-type OAuthRuntimeConfig struct {
-	BusyResponse string `json:"busyResponse,omitempty"`
+// MCPOAuthRuntimeConfig controls MCP server OAuth hook deadlines and busy responses.
+// The zero value preserves the historical deadline and HTTP responses.
+type MCPOAuthRuntimeConfig struct {
+	BusyResponse string                 `json:"busyResponse,omitempty"`
+	Timeout      *scriptTimeoutDuration `json:"timeout,omitempty"`
 }
 
-func (runtimeConfig *OAuthRuntimeConfig) UnmarshalJSON(data []byte) error {
-	type plain OAuthRuntimeConfig
+func (runtimeConfig *MCPOAuthRuntimeConfig) UnmarshalJSON(data []byte) error {
+	type plain MCPOAuthRuntimeConfig
 	decoded := plain{BusyResponse: "legacy"}
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return fmt.Errorf("oauthRuntime: %w", err)
@@ -179,8 +180,97 @@ func (runtimeConfig *OAuthRuntimeConfig) UnmarshalJSON(data []byte) error {
 	default:
 		return fmt.Errorf("oauthRuntime.busyResponse must be legacy or serviceUnavailable")
 	}
-	*runtimeConfig = OAuthRuntimeConfig(decoded)
+	*runtimeConfig = MCPOAuthRuntimeConfig(decoded)
 	return nil
+}
+
+// ScheduleRuntimeConfig applies only to schedules using a restricted runtime.
+type ScheduleRuntimeConfig struct {
+	Timeout *scriptTimeoutDuration `json:"timeout,omitempty"`
+}
+
+// Per-server values inherit the legacy config.json defaults independently.
+type MCPOAuthRuntimeOverride struct {
+	BusyResponse *string                `json:"busyResponse,omitempty"`
+	Timeout      *scriptTimeoutDuration `json:"timeout,omitempty"`
+}
+
+func (runtimeConfig *MCPOAuthRuntimeOverride) UnmarshalJSON(data []byte) error {
+	type plain MCPOAuthRuntimeOverride
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return fmt.Errorf("oauthRuntime: %w", err)
+	}
+	if decoded.BusyResponse != nil && *decoded.BusyResponse != "legacy" && *decoded.BusyResponse != "serviceUnavailable" {
+		return fmt.Errorf("oauthRuntime.busyResponse must be legacy or serviceUnavailable")
+	}
+	*runtimeConfig = MCPOAuthRuntimeOverride(decoded)
+	return nil
+}
+
+func effectiveMCPOAuthRuntime(server APIConfig) MCPOAuthRuntimeConfig {
+	result := config.MCPOAuthRuntime
+	if server.OAuthRuntime != nil {
+		if server.OAuthRuntime.Timeout != nil {
+			result.Timeout = server.OAuthRuntime.Timeout
+		}
+		if server.OAuthRuntime.BusyResponse != nil {
+			result.BusyResponse = *server.OAuthRuntime.BusyResponse
+		}
+	}
+	return result
+}
+
+// A nil timeout preserves the existing deadline; explicit zero disables it.
+// Unitless decimal strings and JSON numbers are interpreted as seconds.
+type scriptTimeoutDuration time.Duration
+
+func (duration *scriptTimeoutDuration) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	var text string
+	if len(data) > 0 && data[0] == '"' {
+		if err := json.Unmarshal(data, &text); err != nil {
+			return fmt.Errorf("script runtime timeout: %w", err)
+		}
+	} else {
+		var seconds json.Number
+		if err := json.Unmarshal(data, &seconds); err != nil {
+			return fmt.Errorf("script runtime timeout requires seconds or a duration string such as 15s or 5m: %w", err)
+		}
+		text = seconds.String()
+	}
+	text = strings.TrimSpace(text)
+	if text != "" && strings.Trim(text, "+-.0123456789") == "" {
+		text += "s"
+	}
+	value, err := time.ParseDuration(text)
+	if err != nil || value < 0 || strings.HasPrefix(text, "-") {
+		return fmt.Errorf("script runtime timeout requires non-negative seconds or a duration such as 15s, 5m or 0s (exponent notation is not supported)")
+	}
+	if value == 0 && strings.ContainsAny(text, "123456789") {
+		return fmt.Errorf("script runtime timeout must be zero or at least 1ns")
+	}
+	*duration = scriptTimeoutDuration(value)
+	return nil
+}
+
+func (duration scriptTimeoutDuration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(duration).String())
+}
+
+func (duration *scriptTimeoutDuration) value() time.Duration {
+	if duration == nil {
+		return defaultRestrictedScriptRuntime
+	}
+	return time.Duration(*duration)
+}
+
+func cloneScriptTimeout(duration *scriptTimeoutDuration) *scriptTimeoutDuration {
+	if duration == nil {
+		return nil
+	}
+	cloned := *duration
+	return &cloned
 }
 
 // Avoid net/http draining a body that the rejected client may never send.
@@ -330,7 +420,8 @@ type Config struct {
 	HTTPTimeouts           HTTPTimeoutsConfig    `json:"httpTimeouts"`
 	ReceiveLimits          ReceiveLimitsConfig   `json:"receiveLimits"`
 	WebSocketLimits        WebSocketLimitsConfig `json:"webSocketLimits"`
-	OAuthRuntime           OAuthRuntimeConfig    `json:"oauthRuntime"`
+	MCPOAuthRuntime        MCPOAuthRuntimeConfig `json:"oauthRuntime"`
+	ScheduleRuntime        ScheduleRuntimeConfig `json:"scheduleRuntime"`
 	SQLResultLimits        SQLResultLimitsConfig `json:"sqlResultLimits"`
 	Name                   string                `json:"name"`
 	Profile                string                `json:"profile"`
@@ -377,33 +468,34 @@ type LogConfig struct {
 }
 
 type APIConfig struct {
-	SQL                        []string             `json:"sql,omitempty"`
-	Script                     string               `json:"script,omitempty"`
-	Path                       string               `json:"path,omitempty"`
-	ParamCheck                 string               `json:"paramCheck,omitempty"`
-	Check                      string               `json:"check,omitempty"` // Deprecated: use ParamCheck. Kept as a compatibility alias.
-	OutCheck                   string               `json:"outCheck,omitempty"`
-	Push                       string               `json:"push,omitempty"`
-	Trigger                    TriggerConfig        `json:"trigger,omitempty"`
-	Description                string               `json:"description"`
-	Title                      string               `json:"title,omitempty"`
-	Type                       string               `json:"type,omitempty"`
-	ConnectURL                 string               `json:"connectURL,omitempty"`
-	Runtime                    APIRuntimeConfig     `json:"runtime,omitempty"`
-	Transport                  string               `json:"transport,omitempty"`
-	ProtocolVersions           []string             `json:"protocolVersions,omitempty"`
-	Resource                   string               `json:"resource,omitempty"`
-	Guard                      MCPGuardConfig       `json:"guard,omitempty"`
-	Tools                      []MCPToolConfig      `json:"tools,omitempty"`
-	Instructions               string               `json:"instructions,omitempty"`
-	AllowedOrigins             []string             `json:"allowedOrigins,omitempty"`
-	RateLimit                  *HTTPRateLimitConfig `json:"rateLimit,omitempty"`
-	MaxConcurrent              int                  `json:"maxConcurrent,omitempty"`
-	RedirectURIAllowedPrefixes []string             `json:"redirectURIAllowedPrefixes,omitempty"`
-	OAuth                      MCPOAuthConfig       `json:"oauth,omitempty"`
-	SecuritySchemes            []MCPSecurityScheme  `json:"securitySchemes,omitempty"`
-	Annotations                MCPToolAnnotations   `json:"annotations,omitempty"`
-	Scopes                     []string             `json:"scopes,omitempty"`
+	SQL                        []string                 `json:"sql,omitempty"`
+	Script                     string                   `json:"script,omitempty"`
+	Path                       string                   `json:"path,omitempty"`
+	ParamCheck                 string                   `json:"paramCheck,omitempty"`
+	Check                      string                   `json:"check,omitempty"` // Deprecated: use ParamCheck. Kept as a compatibility alias.
+	OutCheck                   string                   `json:"outCheck,omitempty"`
+	Push                       string                   `json:"push,omitempty"`
+	Trigger                    TriggerConfig            `json:"trigger,omitempty"`
+	Description                string                   `json:"description"`
+	Title                      string                   `json:"title,omitempty"`
+	Type                       string                   `json:"type,omitempty"`
+	ConnectURL                 string                   `json:"connectURL,omitempty"`
+	Runtime                    APIRuntimeConfig         `json:"runtime,omitempty"`
+	Transport                  string                   `json:"transport,omitempty"`
+	ProtocolVersions           []string                 `json:"protocolVersions,omitempty"`
+	Resource                   string                   `json:"resource,omitempty"`
+	Guard                      MCPGuardConfig           `json:"guard,omitempty"`
+	Tools                      []MCPToolConfig          `json:"tools,omitempty"`
+	Instructions               string                   `json:"instructions,omitempty"`
+	AllowedOrigins             []string                 `json:"allowedOrigins,omitempty"`
+	RateLimit                  *HTTPRateLimitConfig     `json:"rateLimit,omitempty"`
+	MaxConcurrent              int                      `json:"maxConcurrent,omitempty"`
+	RedirectURIAllowedPrefixes []string                 `json:"redirectURIAllowedPrefixes,omitempty"`
+	OAuth                      MCPOAuthConfig           `json:"oauth,omitempty"`
+	OAuthRuntime               *MCPOAuthRuntimeOverride `json:"oauthRuntime,omitempty"`
+	SecuritySchemes            []MCPSecurityScheme      `json:"securitySchemes,omitempty"`
+	Annotations                MCPToolAnnotations       `json:"annotations,omitempty"`
+	Scopes                     []string                 `json:"scopes,omitempty"`
 }
 
 type HTTPRateLimitConfig struct {
@@ -415,6 +507,7 @@ type APIRuntimeConfig struct {
 	Capabilities []string               `json:"capabilities,omitempty"`
 	SQLFiles     []string               `json:"sqlFiles,omitempty"`
 	Settings     map[string]interface{} `json:"settings,omitempty"`
+	Timeout      *scriptTimeoutDuration `json:"timeout,omitempty"`
 }
 
 type MCPGuardConfig struct {
@@ -458,35 +551,36 @@ type TriggerConfig struct {
 
 func (apiConfig *APIConfig) UnmarshalJSON(data []byte) error {
 	type apiConfigJSON struct {
-		SQL                        []string             `json:"sql,omitempty"`
-		Script                     string               `json:"script,omitempty"`
-		Path                       string               `json:"path,omitempty"`
-		ParamCheck                 string               `json:"paramCheck,omitempty"`
-		ParamCheckLower            string               `json:"paramcheck,omitempty"`
-		Check                      string               `json:"check,omitempty"`
-		OutCheck                   string               `json:"outCheck,omitempty"`
-		OutCheckLower              string               `json:"outcheck,omitempty"`
-		Push                       string               `json:"push,omitempty"`
-		Trigger                    TriggerConfig        `json:"trigger,omitempty"`
-		Description                string               `json:"description"`
-		Title                      string               `json:"title,omitempty"`
-		Type                       string               `json:"type,omitempty"`
-		ConnectURL                 string               `json:"connectURL,omitempty"`
-		Runtime                    APIRuntimeConfig     `json:"runtime,omitempty"`
-		Transport                  string               `json:"transport,omitempty"`
-		ProtocolVersions           []string             `json:"protocolVersions,omitempty"`
-		Resource                   string               `json:"resource,omitempty"`
-		Guard                      MCPGuardConfig       `json:"guard,omitempty"`
-		Tools                      []string             `json:"tools,omitempty"`
-		Instructions               string               `json:"instructions,omitempty"`
-		AllowedOrigins             []string             `json:"allowedOrigins,omitempty"`
-		RateLimit                  *HTTPRateLimitConfig `json:"rateLimit,omitempty"`
-		MaxConcurrent              int                  `json:"maxConcurrent,omitempty"`
-		RedirectURIAllowedPrefixes []string             `json:"redirectURIAllowedPrefixes,omitempty"`
-		OAuth                      MCPOAuthConfig       `json:"oauth,omitempty"`
-		SecuritySchemes            []MCPSecurityScheme  `json:"securitySchemes,omitempty"`
-		Annotations                MCPToolAnnotations   `json:"annotations,omitempty"`
-		Scopes                     []string             `json:"scopes,omitempty"`
+		SQL                        []string                 `json:"sql,omitempty"`
+		Script                     string                   `json:"script,omitempty"`
+		Path                       string                   `json:"path,omitempty"`
+		ParamCheck                 string                   `json:"paramCheck,omitempty"`
+		ParamCheckLower            string                   `json:"paramcheck,omitempty"`
+		Check                      string                   `json:"check,omitempty"`
+		OutCheck                   string                   `json:"outCheck,omitempty"`
+		OutCheckLower              string                   `json:"outcheck,omitempty"`
+		Push                       string                   `json:"push,omitempty"`
+		Trigger                    TriggerConfig            `json:"trigger,omitempty"`
+		Description                string                   `json:"description"`
+		Title                      string                   `json:"title,omitempty"`
+		Type                       string                   `json:"type,omitempty"`
+		ConnectURL                 string                   `json:"connectURL,omitempty"`
+		Runtime                    APIRuntimeConfig         `json:"runtime,omitempty"`
+		Transport                  string                   `json:"transport,omitempty"`
+		ProtocolVersions           []string                 `json:"protocolVersions,omitempty"`
+		Resource                   string                   `json:"resource,omitempty"`
+		Guard                      MCPGuardConfig           `json:"guard,omitempty"`
+		Tools                      []string                 `json:"tools,omitempty"`
+		Instructions               string                   `json:"instructions,omitempty"`
+		AllowedOrigins             []string                 `json:"allowedOrigins,omitempty"`
+		RateLimit                  *HTTPRateLimitConfig     `json:"rateLimit,omitempty"`
+		MaxConcurrent              int                      `json:"maxConcurrent,omitempty"`
+		RedirectURIAllowedPrefixes []string                 `json:"redirectURIAllowedPrefixes,omitempty"`
+		OAuth                      MCPOAuthConfig           `json:"oauth,omitempty"`
+		OAuthRuntime               *MCPOAuthRuntimeOverride `json:"oauthRuntime,omitempty"`
+		SecuritySchemes            []MCPSecurityScheme      `json:"securitySchemes,omitempty"`
+		Annotations                MCPToolAnnotations       `json:"annotations,omitempty"`
+		Scopes                     []string                 `json:"scopes,omitempty"`
 	}
 
 	var raw apiConfigJSON
@@ -530,6 +624,7 @@ func (apiConfig *APIConfig) UnmarshalJSON(data []byte) error {
 	apiConfig.MaxConcurrent = raw.MaxConcurrent
 	apiConfig.RedirectURIAllowedPrefixes = raw.RedirectURIAllowedPrefixes
 	apiConfig.OAuth = raw.OAuth
+	apiConfig.OAuthRuntime = raw.OAuthRuntime
 	apiConfig.SecuritySchemes = raw.SecuritySchemes
 	apiConfig.Annotations = raw.Annotations
 	apiConfig.Scopes = raw.Scopes
@@ -690,7 +785,7 @@ const (
 	maxConfiguredHTTPResponseBytes   = 4 << 20
 	defaultSQLJSONRows               = 10000
 	defaultSQLJSONBytes              = 4 << 20
-	maxRestrictedScriptRuntime       = 15 * time.Second
+	defaultRestrictedScriptRuntime   = 15 * time.Second
 	defaultWebSocketConnections      = 128
 	webSocketWriteTimeout            = 5 * time.Second
 )
@@ -1499,7 +1594,7 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 	params["nyan_mode"] = mode
 	result, err := invokeMCPOAuthHook(snapshot, serverName, serverConfig, runtimeURLs, role, params)
 	if err != nil {
-		if prepareOAuthRuntimeBusyResponse(w, err) {
+		if prepareOAuthRuntimeBusyResponse(w, err, serverConfig) {
 			http.Error(w, "OAuth runtime is busy", http.StatusServiceUnavailable)
 			return
 		}
@@ -2297,7 +2392,7 @@ func handleMCPToolCall(snapshot *APIConfigSnapshot, w http.ResponseWriter, r *ht
 	principal := interface{}(map[string]interface{}{"anonymous": true, "transport": "streamable_http"})
 	if mcpOAuthConfigured(serverConfig.OAuth) {
 		verifiedPrincipal, authenticated, forbidden, err := validateMCPAccessToken(snapshot, serverName, serverConfig, runtimeURLs, r, toolConfig.API, requiredScopes)
-		if prepareOAuthRuntimeBusyResponse(w, err) {
+		if prepareOAuthRuntimeBusyResponse(w, err, serverConfig) {
 			writeMCPResultWithStatus(w, request.ID, mcpToolErrorResult("OAuth runtime is busy", nil), http.StatusServiceUnavailable)
 			return
 		}
@@ -2552,10 +2647,11 @@ func (err *oauthRuntimeBusyError) Unwrap() error { return errRestrictedRuntimeBu
 // could repeat its effects, even if the next stage could not acquire a VM.
 type oauthScriptExecution struct {
 	completedStage bool
+	runtime        MCPOAuthRuntimeConfig
 }
 
 func (execution *oauthScriptExecution) run(snapshot *APIConfigSnapshot, path string, params map[string]interface{}, runtimeConfig APIRuntimeConfig) (string, error) {
-	result, err := runScriptWithRuntimeWithSnapshot(snapshot, []string{path}, params, runtimeConfig, true)
+	result, err := runScriptInExecutionWithTimeout(context.Background(), snapshot, []string{path}, params, runtimeConfig, true, nil, execution.runtime.Timeout.value())
 	if errors.Is(err, errRestrictedRuntimeBusy) {
 		return "", &oauthRuntimeBusyError{BeforeExecution: !execution.completedStage}
 	}
@@ -2565,8 +2661,8 @@ func (execution *oauthScriptExecution) run(snapshot *APIConfigSnapshot, path str
 	return result, err
 }
 
-func prepareOAuthRuntimeBusyResponse(w http.ResponseWriter, err error) bool {
-	if config.OAuthRuntime.BusyResponse != "serviceUnavailable" || !errors.Is(err, errRestrictedRuntimeBusy) {
+func prepareOAuthRuntimeBusyResponse(w http.ResponseWriter, err error, server APIConfig) bool {
+	if effectiveMCPOAuthRuntime(server).BusyResponse != "serviceUnavailable" || !errors.Is(err, errRestrictedRuntimeBusy) {
 		return false
 	}
 	var busy *oauthRuntimeBusyError
@@ -2734,7 +2830,7 @@ func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverCo
 	runtimeConfig.Settings["scopes"] = append([]string(nil), snapshot.Definitions[serverConfig.OAuth.VerifyAccess].Scopes...)
 	runtimeConfig.Settings["redirectURIAllowedPrefixes"] = append([]string(nil), serverConfig.RedirectURIAllowedPrefixes...)
 	checkPath := getParamCheckScriptPath(definition)
-	scriptExecution := &oauthScriptExecution{}
+	scriptExecution := &oauthScriptExecution{runtime: effectiveMCPOAuthRuntime(serverConfig)}
 	if execution.CheckOnly && checkPath == "" {
 		return execution, fmt.Errorf("OAuth API has no input check")
 	}
@@ -3437,7 +3533,7 @@ func validateAPIConfigKnownFields(apiKey string, rawDefinition json.RawMessage) 
 		"sql", "script", "path", "paramCheck", "paramcheck", "check", "outCheck", "outcheck",
 		"push", "trigger", "title", "description", "type", "connectURL", "runtime", "transport",
 		"protocolVersions", "tools", "instructions", "allowedOrigins", "redirectURIAllowedPrefixes",
-		"rateLimit", "maxConcurrent", "oauth", "securitySchemes", "annotations", "scopes",
+		"rateLimit", "maxConcurrent", "oauth", "oauthRuntime", "securitySchemes", "annotations", "scopes",
 	))
 	if err != nil {
 		return fmt.Errorf("decode api JSON: %w", err)
@@ -3448,7 +3544,12 @@ func validateAPIConfigKnownFields(apiKey string, rawDefinition json.RawMessage) 
 		}
 	}
 	if raw, exists := topLevel["runtime"]; exists {
-		if _, err := decodeKnownJSONObject(raw, "definition "+strconv.Quote(apiKey)+".runtime", stringSet("capabilities", "sqlFiles", "settings")); err != nil {
+		if _, err := decodeKnownJSONObject(raw, "definition "+strconv.Quote(apiKey)+".runtime", stringSet("capabilities", "sqlFiles", "settings", "timeout")); err != nil {
+			return fmt.Errorf("decode api JSON: %w", err)
+		}
+	}
+	if raw, exists := topLevel["oauthRuntime"]; exists {
+		if _, err := decodeKnownJSONObject(raw, "definition "+strconv.Quote(apiKey)+".oauthRuntime", stringSet("timeout", "busyResponse")); err != nil {
 			return fmt.Errorf("decode api JSON: %w", err)
 		}
 	}
@@ -3573,9 +3674,12 @@ func validateConfiguredAPIExtensions(definitions map[string]APIConfig) error {
 
 func validateAPIConfigFieldPlacement(apiName string, apiConfig APIConfig) error {
 	definitionType := getAPIType(apiConfig)
+	if apiConfig.Runtime.Timeout != nil && definitionType != apiTypeSchedule {
+		return fmt.Errorf("configuration error for API %q: runtime.timeout is only allowed when type is %q", apiName, apiTypeSchedule)
+	}
 	hasMCPFields := apiConfig.Transport != "" || len(apiConfig.ProtocolVersions) > 0 || len(apiConfig.Tools) > 0 ||
 		apiConfig.Instructions != "" || len(apiConfig.AllowedOrigins) > 0 || apiConfig.RateLimit != nil ||
-		apiConfig.MaxConcurrent != 0 || len(apiConfig.RedirectURIAllowedPrefixes) > 0 || mcpOAuthConfigured(apiConfig.OAuth)
+		apiConfig.MaxConcurrent != 0 || len(apiConfig.RedirectURIAllowedPrefixes) > 0 || mcpOAuthConfigured(apiConfig.OAuth) || apiConfig.OAuthRuntime != nil
 	if definitionType != apiTypeMCP && hasMCPFields {
 		return fmt.Errorf("configuration error for API %q: MCP fields are only allowed when type is %q", apiName, apiTypeMCP)
 	}
@@ -3638,6 +3742,9 @@ func validateMCPServerConfig(apiName string, apiConfig APIConfig, definitions ma
 		return fmt.Errorf("configuration error for MCP server %q: protocolVersions contains no implemented version", apiName)
 	}
 	oauthEnabled := mcpOAuthConfigured(apiConfig.OAuth)
+	if apiConfig.OAuthRuntime != nil && !oauthEnabled {
+		return fmt.Errorf("configuration error for MCP server %q: oauthRuntime requires oauth configuration", apiName)
+	}
 	if oauthEnabled {
 		if apiConfig.Transport != "streamable_http" {
 			return fmt.Errorf("configuration error for MCP server %q: oauth requires streamable_http", apiName)
@@ -4260,6 +4367,16 @@ func consumeJSONValue(decoder *json.Decoder, path string) error {
 
 func cloneAPIConfig(apiConfig APIConfig) APIConfig {
 	cloned := apiConfig
+	cloned.Runtime.Timeout = cloneScriptTimeout(apiConfig.Runtime.Timeout)
+	if apiConfig.OAuthRuntime != nil {
+		runtimeConfig := *apiConfig.OAuthRuntime
+		runtimeConfig.Timeout = cloneScriptTimeout(runtimeConfig.Timeout)
+		if runtimeConfig.BusyResponse != nil {
+			response := *runtimeConfig.BusyResponse
+			runtimeConfig.BusyResponse = &response
+		}
+		cloned.OAuthRuntime = &runtimeConfig
+	}
 	cloned.SQL = append([]string(nil), apiConfig.SQL...)
 	if apiConfig.RateLimit != nil {
 		rateLimit := *apiConfig.RateLimit
@@ -4396,6 +4513,7 @@ func newLoadedAPIConfigSnapshot(rootPath string, files map[string]APIConfig, sou
 
 func cloneScheduleJobConfig(config scheduleJobConfig) scheduleJobConfig {
 	cloned := config
+	cloned.runtime.Timeout = cloneScriptTimeout(config.runtime.Timeout)
 	cloned.runtime.Capabilities = append([]string(nil), config.runtime.Capabilities...)
 	cloned.runtime.SQLFiles = append([]string(nil), config.runtime.SQLFiles...)
 	if config.runtime.Settings != nil {
@@ -5393,19 +5511,25 @@ func (runtime *scheduleRuntime) run() {
 			"nyan_schedule_trigger":      latest.trigger.Value,
 			"nyan_schedule_time":         next.Format(time.RFC3339),
 		}
-		var result string
-		var err error
-		if len(latest.runtime.Capabilities) > 0 || len(latest.runtime.SQLFiles) > 0 || len(latest.runtime.Settings) > 0 {
-			result, err = runScriptWithRuntimeWithSnapshot(currentAPISnapshot(), []string{latest.scriptPath}, params, latest.runtime, true)
-		} else {
-			result, err = runScript([]string{latest.scriptPath}, params)
-		}
+		result, err := runScheduleScriptWithSnapshot(currentAPISnapshot(), latest, params)
 		if err != nil {
 			logServiceError(slog.LevelError, "schedule_failed", err, "job", latest.name)
 			continue
 		}
 		serviceLog(slog.LevelInfo, "schedule_completed", "job", latest.name, "result_bytes", len(result))
 	}
+}
+
+func runScheduleScriptWithSnapshot(snapshot *APIConfigSnapshot, job scheduleJobConfig, params map[string]interface{}) (string, error) {
+	restricted := len(job.runtime.Capabilities) > 0 || len(job.runtime.SQLFiles) > 0 || len(job.runtime.Settings) > 0
+	var timeout time.Duration
+	if restricted {
+		timeout = config.ScheduleRuntime.Timeout.value()
+	}
+	if job.runtime.Timeout != nil {
+		timeout = job.runtime.Timeout.value()
+	}
+	return runScriptInExecutionWithTimeout(context.Background(), snapshot, []string{job.scriptPath}, params, job.runtime, restricted, nil, timeout)
 }
 
 func buildWSClientConfigs(files map[string]APIConfig, execDir string) (map[string]wsClientConfig, error) {
@@ -8205,12 +8329,20 @@ func interruptScriptOnCancellation(ctx context.Context, vm *goja.Runtime) func()
 	}
 }
 
-func runScriptInExecution(ctx context.Context, snapshot *APIConfigSnapshot, scriptPaths []string, params map[string]interface{}, runtimeConfig APIRuntimeConfig, restricted bool, execution *sqlExecution) (result string, resultErr error) {
+func runScriptInExecution(ctx context.Context, snapshot *APIConfigSnapshot, scriptPaths []string, params map[string]interface{}, runtimeConfig APIRuntimeConfig, restricted bool, execution *sqlExecution) (string, error) {
+	var timeout time.Duration
+	if restricted {
+		timeout = config.MCPOAuthRuntime.Timeout.value()
+	}
+	return runScriptInExecutionWithTimeout(ctx, snapshot, scriptPaths, params, runtimeConfig, restricted, execution, timeout)
+}
+
+func runScriptInExecutionWithTimeout(ctx context.Context, snapshot *APIConfigSnapshot, scriptPaths []string, params map[string]interface{}, runtimeConfig APIRuntimeConfig, restricted bool, execution *sqlExecution, timeout time.Duration) (result string, resultErr error) {
 	owner := execution == nil
 	if owner {
-		if restricted {
+		if timeout > 0 {
 			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, maxRestrictedScriptRuntime)
+			ctx, cancel = context.WithTimeout(ctx, timeout)
 			defer cancel()
 		}
 		execution = &sqlExecution{ctx: ctx}

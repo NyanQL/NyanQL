@@ -4718,8 +4718,10 @@ func TestNewAPIConfigSnapshotDeepClonesConfiguredExtensions(t *testing.T) {
 	readOnly := true
 	destructive := false
 	openWorld := false
+	timeout, busy := scriptTimeoutDuration(time.Minute), "serviceUnavailable"
 	original := APIConfig{
 		Type:             apiTypeMCP,
+		OAuthRuntime:     &MCPOAuthRuntimeOverride{Timeout: &timeout, BusyResponse: &busy},
 		RateLimit:        &HTTPRateLimitConfig{Requests: 50, Window: "1m"},
 		MaxConcurrent:    4,
 		Runtime:          APIRuntimeConfig{Capabilities: []string{"crypto"}, SQLFiles: []string{"/sql/original.sql"}, Settings: map[string]interface{}{"nested": map[string]interface{}{"value": "original"}, "items": []interface{}{"first"}}},
@@ -4735,6 +4737,12 @@ func TestNewAPIConfigSnapshotDeepClonesConfiguredExtensions(t *testing.T) {
 		}},
 	}
 	snapshot := newAPIConfigSnapshot(map[string]APIConfig{"server": original}, "", [sha256.Size]byte{})
+	job := scheduleJobConfig{runtime: APIRuntimeConfig{Timeout: &timeout}}
+	clonedJob := cloneScheduleJobConfig(job)
+	timeout, busy = 0, "legacy"
+	if got := effectiveMCPOAuthRuntime(snapshot.Definitions["server"]); got.Timeout.value() != time.Minute || got.BusyResponse != "serviceUnavailable" || clonedJob.runtime.Timeout.value() != time.Minute {
+		t.Fatal("runtime options were not deep-cloned")
+	}
 
 	original.Runtime.Capabilities[0] = "sql"
 	original.Runtime.SQLFiles[0] = "/sql/mutated.sql"
@@ -5824,7 +5832,7 @@ if (nyanRuntimeSettings.issuer !== "https://service.example") throw new Error("m
 	return definitions, server, mark, stages
 }
 
-func TestOAuthRuntimeConfiguration(t *testing.T) {
+func TestMCPOAuthRuntimeConfiguration(t *testing.T) {
 	for _, tc := range []struct {
 		input, want string
 		bad         bool
@@ -5852,8 +5860,8 @@ func TestOAuthRuntimeConfiguration(t *testing.T) {
 				}
 				return
 			}
-			if err != nil || cfg.OAuthRuntime.BusyResponse != tc.want {
-				t.Fatalf("config=%+v err=%v", cfg.OAuthRuntime, err)
+			if err != nil || cfg.MCPOAuthRuntime.BusyResponse != tc.want {
+				t.Fatalf("config=%+v err=%v", cfg.MCPOAuthRuntime, err)
 			}
 			encoded, err := json.Marshal(cfg)
 			if err != nil {
@@ -5866,11 +5874,456 @@ func TestOAuthRuntimeConfiguration(t *testing.T) {
 	}
 }
 
+func TestScriptRuntimeTimeoutConfiguration(t *testing.T) {
+	for _, field := range []string{"oauthRuntime", "scheduleRuntime"} {
+		for _, tc := range []struct {
+			value string
+			want  time.Duration
+			bad   bool
+		}{
+			{`null`, 15 * time.Second, false},
+			{`{}`, 15 * time.Second, false},
+			{`{"timeout":null}`, 15 * time.Second, false},
+			{`{"timeout":"60s"}`, time.Minute, false},
+			{`{"timeout":"5m"}`, 5 * time.Minute, false},
+			{`{"timeout":" 500ms "}`, 500 * time.Millisecond, false},
+			{`{"timeout":"0s"}`, 0, false},
+			{`{"timeout":"0"}`, 0, false},
+			{`{"timeout":0}`, 0, false},
+			{`{"timeout":"1"}`, time.Second, false},
+			{`{"timeout":1}`, time.Second, false},
+			{`{"timeout":"60"}`, time.Minute, false},
+			{`{"timeout":60}`, time.Minute, false},
+			{`{"timeout":" 1.5 "}`, 1500 * time.Millisecond, false},
+			{`{"timeout":1.5}`, 1500 * time.Millisecond, false},
+			{`{"timeout":0.000000001}`, time.Nanosecond, false},
+			{`{"timeout":"0.000000001"}`, time.Nanosecond, false},
+			{`{"timeout":0.0000000001}`, 0, true},
+			{`{"timeout":"0.0000000001"}`, 0, true},
+			{`{"timeout":"0.1ns"}`, 0, true},
+			{`{"timeout":"-0s"}`, 0, true},
+			{`{"timeout":-0}`, 0, true},
+			{`{"timeout":"-0"}`, 0, true},
+			{`{"timeout":"2562047h47m16.854775807s"}`, time.Duration(1<<63 - 1), false},
+			{`{"timeout":"2562047h47m16.854775808s"}`, 0, true},
+			{`{"timeout":"9223372036.854775807"}`, time.Duration(1<<63 - 1), false},
+			{`{"timeout":9223372036.854775807}`, time.Duration(1<<63 - 1), false},
+			{`{"timeout":"9223372036.854775808"}`, 0, true},
+			{`{"timeout":9223372036.854775808}`, 0, true},
+			{`{"timeout":"-1s"}`, 0, true},
+			{`{"timeout":"-1"}`, 0, true},
+			{`{"timeout":-1}`, 0, true},
+			{`{"timeout":""}`, 0, true},
+			{`{"timeout":" "}`, 0, true},
+			{`{"timeout":"1m30"}`, 0, true},
+			{`{"timeout":"1e3"}`, 0, true},
+			{`{"timeout":1e3}`, 0, true},
+			{`{"timeout":"NaN"}`, 0, true},
+			{`{"timeout":"Inf"}`, 0, true},
+			{`{"timeout":false}`, 0, true},
+			{`{"timeout":{}}`, 0, true},
+			{`{"timeout":[]}`, 0, true},
+			{`[]`, 0, true},
+		} {
+			input := fmt.Sprintf(`{%q:%s}`, field, tc.value)
+			t.Run(input, func(t *testing.T) {
+				var cfg Config
+				err := json.Unmarshal([]byte(input), &cfg)
+				if tc.bad {
+					if err == nil {
+						t.Fatal("invalid script runtime timeout accepted")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantOAuth, wantSchedule := 15*time.Second, 15*time.Second
+				if field == "oauthRuntime" {
+					wantOAuth = tc.want
+				} else {
+					wantSchedule = tc.want
+				}
+				for pass := 0; pass < 2; pass++ {
+					if cfg.MCPOAuthRuntime.Timeout.value() != wantOAuth || cfg.ScheduleRuntime.Timeout.value() != wantSchedule {
+						t.Fatalf("timeouts changed: oauth=%v schedule=%v", cfg.MCPOAuthRuntime.Timeout.value(), cfg.ScheduleRuntime.Timeout.value())
+					}
+					encoded, err := json.Marshal(cfg)
+					if err != nil {
+						t.Fatal(err)
+					}
+					cfg = Config{}
+					if err := json.Unmarshal(encoded, &cfg); err != nil {
+						t.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+	var omitted Config
+	if err := json.Unmarshal([]byte(`{}`), &omitted); err != nil || omitted.MCPOAuthRuntime.Timeout.value() != 15*time.Second || omitted.ScheduleRuntime.Timeout.value() != 15*time.Second {
+		t.Fatalf("omitted settings changed the historical deadlines: %+v err=%v", omitted, err)
+	}
+}
+
+func setTestScriptRuntimeTimeouts(t *testing.T, oauth, schedule string) {
+	t.Helper()
+	oldOAuth, oldSchedule := config.MCPOAuthRuntime, config.ScheduleRuntime
+	t.Cleanup(func() { config.MCPOAuthRuntime, config.ScheduleRuntime = oldOAuth, oldSchedule })
+	var cfg Config
+	if err := json.Unmarshal([]byte(fmt.Sprintf(`{"oauthRuntime":{"timeout":%q},"scheduleRuntime":{"timeout":%q}}`, oauth, schedule)), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	config.MCPOAuthRuntime, config.ScheduleRuntime = cfg.MCPOAuthRuntime, cfg.ScheduleRuntime
+}
+
+func TestScriptRuntimeTimeoutScope(t *testing.T) {
+	resetJavascriptInclude(t)
+	loop := `const until=Date.now()+150; while(Date.now()<until){}; ({ok:true});`
+	script := writeTestScript(t, loop)
+	short, long, unlimited := scriptTimeoutDuration(20*time.Millisecond), scriptTimeoutDuration(time.Second), scriptTimeoutDuration(0)
+	for _, tc := range []struct {
+		name, oauth, schedule string
+		restricted            bool
+		wantError             bool
+	}{
+		{"oauth_short", "20ms", "1s", true, true},
+		{"oauth_long", "1s", "1ns", true, false},
+		{"oauth_disabled", "0s", "1ns", true, false},
+		{"ordinary_api", "1ns", "1ns", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setTestScriptRuntimeTimeouts(t, tc.oauth, tc.schedule)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			body, err := runScriptInExecution(ctx, nil, []string{script}, nil, APIRuntimeConfig{}, tc.restricted, nil)
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
+					t.Fatalf("expected deadline error: %s %v", body, err)
+				}
+			} else if err != nil || body != `{"ok":true}` {
+				t.Fatalf("unexpected result: %s %v", body, err)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name, timeout string
+		runtime       APIRuntimeConfig
+		wantError     bool
+	}{
+		{"restricted_short", "20ms", APIRuntimeConfig{Settings: map[string]interface{}{"value": 1}}, true},
+		{"restricted_long", "1s", APIRuntimeConfig{Capabilities: []string{"crypto"}}, false},
+		{"restricted_disabled", "0s", APIRuntimeConfig{Settings: map[string]interface{}{"value": 1}}, false},
+		{"ordinary_schedule", "1ns", APIRuntimeConfig{}, false},
+		{"explicit_short", "1s", APIRuntimeConfig{Timeout: &short}, true},
+		{"explicit_long", "1ns", APIRuntimeConfig{Timeout: &long, Settings: map[string]interface{}{"value": 1}}, false},
+		{"explicit_disabled", "1ns", APIRuntimeConfig{Timeout: &unlimited, Settings: map[string]interface{}{"value": 1}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setTestScriptRuntimeTimeouts(t, "1ns", tc.timeout)
+			body, err := runScheduleScriptWithSnapshot(nil, scheduleJobConfig{scriptPath: script, runtime: tc.runtime}, nil)
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
+					t.Fatalf("expected schedule deadline error: %s %v", body, err)
+				}
+			} else if err != nil || body != `{"ok":true}` {
+				t.Fatalf("unexpected schedule result: %s %v", body, err)
+			}
+		})
+	}
+}
+
+func TestScriptRuntimeTimeoutBeyondHistoricalLimit(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestScriptRuntimeTimeouts(t, "1ns", "1ns")
+	long, unlimited := scriptTimeoutDuration(30*time.Second), scriptTimeoutDuration(0)
+	script := writeTestScript(t, `nyanAllParams.wait(); ({ok:true});`)
+	// Exercise both settings past the old 15-second deadline without busy-looping.
+	// Each VM receives its own callback and parameter map; config stays read-only.
+	results := make(chan error, 2)
+	for _, scheduled := range []bool{false, true} {
+		go func(scheduled bool) {
+			params := map[string]interface{}{"wait": func() { time.Sleep(16 * time.Second) }}
+			var body string
+			var err error
+			if scheduled {
+				job := scheduleJobConfig{scriptPath: script, runtime: APIRuntimeConfig{Timeout: &unlimited, Settings: map[string]interface{}{"enabled": true}}}
+				body, err = runScheduleScriptWithSnapshot(nil, job, params)
+			} else {
+				execution := &oauthScriptExecution{runtime: effectiveMCPOAuthRuntime(APIConfig{OAuthRuntime: &MCPOAuthRuntimeOverride{Timeout: &long}})}
+				body, err = execution.run(nil, script, params, APIRuntimeConfig{})
+			}
+			if err != nil || body != `{"ok":true}` {
+				results <- fmt.Errorf("schedule=%t: result=%s err=%v", scheduled, body, err)
+			} else {
+				results <- nil
+			}
+		}(scheduled)
+	}
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+func TestScriptRuntimeTimeoutExportAndSQLWait(t *testing.T) {
+	for _, scenario := range []string{"getter", "sql_wait", "parent_cancel"} {
+		t.Run(scenario, func(t *testing.T) {
+			resetJavascriptInclude(t)
+			setTestScriptRuntimeTimeouts(t, "50ms", "1s")
+			code := `({get value(){const until=Date.now()+2000; while(Date.now()<until){}; return 1;}});`
+			runtimeConfig := APIRuntimeConfig{}
+			if scenario == "sql_wait" {
+				database := setTestSQLiteDB(t)
+				held, err := database.Begin()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer held.Rollback()
+				query := filepath.Join(t.TempDir(), "select.sql")
+				writeTestFile(t, query, `SELECT 1;`)
+				code = fmt.Sprintf(`nyanRunSQL(%q);`, query)
+				runtimeConfig = APIRuntimeConfig{Capabilities: []string{"sql"}, SQLFiles: []string{query}}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if scenario == "parent_cancel" {
+				setTestScriptRuntimeTimeouts(t, "0s", "0s")
+				cancel()
+			}
+			started := time.Now()
+			_, err := runScriptInExecution(ctx, nil, []string{writeTestScript(t, code)}, nil, runtimeConfig, true, nil)
+			if err == nil || !strings.Contains(err.Error(), "context") || time.Since(started) > time.Second {
+				t.Fatalf("configured deadline/cancellation was ignored: elapsed=%v err=%v", time.Since(started), err)
+			}
+		})
+	}
+}
+
+func TestOAuthRuntimeTimeoutStages(t *testing.T) {
+	for _, stage := range []string{"paramCheck", "script", "outCheck"} {
+		t.Run(stage, func(t *testing.T) {
+			resetJavascriptInclude(t)
+			setTestScriptRuntimeTimeouts(t, "1s", "1s")
+			config.MCPOAuthRuntime.BusyResponse = "serviceUnavailable"
+			allow := writeTestScript(t, `({success:true,status:200});`)
+			definition := APIConfig{ParamCheck: allow, Script: writeTestScript(t, `({ok:true});`), OutCheck: allow}
+			slow := writeTestScript(t, `const until=Date.now()+2000; while(Date.now()<until){}; ({success:true,status:200});`)
+			switch stage {
+			case "paramCheck":
+				definition.ParamCheck = slow
+			case "script":
+				definition.Script = slow
+			case "outCheck":
+				definition.OutCheck = slow
+			}
+			server := APIConfig{OAuth: MCPOAuthConfig{Token: "token"}}
+			timeout := scriptTimeoutDuration(50 * time.Millisecond)
+			server.OAuthRuntime = &MCPOAuthRuntimeOverride{Timeout: &timeout}
+			started := time.Now()
+			rec := performOAuthRuntimeTestRequest(t, map[string]APIConfig{"token": definition}, server, "oauthToken", "")
+			if rec.Code != http.StatusInternalServerError || rec.Header().Get("Retry-After") != "" || time.Since(started) > time.Second {
+				t.Fatalf("timeout response changed: status=%d headers=%v body=%s elapsed=%v", rec.Code, rec.Header(), rec.Body.String(), time.Since(started))
+			}
+		})
+	}
+}
+
+func TestMCPRuntimeOverrideInheritance(t *testing.T) {
+	setTestScriptRuntimeTimeouts(t, "2m", "1s")
+	config.MCPOAuthRuntime.BusyResponse = "serviceUnavailable"
+	for _, tc := range []struct {
+		input, busy string
+		timeout     time.Duration
+	}{
+		{`null`, "serviceUnavailable", 2 * time.Minute},
+		{`{}`, "serviceUnavailable", 2 * time.Minute},
+		{`{"timeout":null,"busyResponse":null}`, "serviceUnavailable", 2 * time.Minute},
+		{`{"timeout":"5s"}`, "serviceUnavailable", 5 * time.Second},
+		{`{"timeout":"5"}`, "serviceUnavailable", 5 * time.Second},
+		{`{"timeout":5}`, "serviceUnavailable", 5 * time.Second},
+		{`{"timeout":"0"}`, "serviceUnavailable", 0},
+		{`{"timeout":0}`, "serviceUnavailable", 0},
+		{`{"busyResponse":"legacy"}`, "legacy", 2 * time.Minute},
+		{`{"timeout":"0s","busyResponse":"legacy"}`, "legacy", 0},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			var server APIConfig
+			if err := json.Unmarshal([]byte(`{"type":"mcp","oauthRuntime":`+tc.input+`}`), &server); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				got := effectiveMCPOAuthRuntime(server)
+				if got.Timeout.value() != tc.timeout || got.BusyResponse != tc.busy {
+					t.Fatalf("incorrect inheritance: timeout=%v busy=%s", got.Timeout.value(), got.BusyResponse)
+				}
+				encoded, err := json.Marshal(server)
+				if err != nil {
+					t.Fatal(err)
+				}
+				server = APIConfig{}
+				if err := json.Unmarshal(encoded, &server); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestAPIRuntimeTimeoutFieldValidation(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		bad   bool
+	}{
+		{`{"type":"schedule","runtime":{"timeout":"5m"}}`, false},
+		{`{"type":"schedule","runtime":{"timeout":"0s"}}`, false},
+		{`{"type":"schedule","runtime":{"timeout":null}}`, false},
+		{`{"type":"schedule","runtime":{"timeout":15}}`, false},
+		{`{"type":"schedule","runtime":{"timeout":"15"}}`, false},
+		{`{"type":"schedule","runtime":{"timeout":0}}`, false},
+		{`{"type":"schedule","runtime":{"timeout":"0"}}`, false},
+		{`{"type":"schedule","runtime":{"timeout":"-1s"}}`, true},
+		{`{"type":"schedule","runtime":{"timeouts":"15s"}}`, true},
+		{`{"type":"api","runtime":{"timeout":"15s"}}`, true},
+		{`{"type":"ws_client","runtime":{"timeout":"15s"}}`, true},
+		{`{"type":"mcp","runtime":{"timeout":"15s"}}`, true},
+		{`{"type":"mcp","oauthRuntime":{"timeout":"1m","busyResponse":"legacy"}}`, false},
+		{`{"type":"mcp","oauthRuntime":{"timeout":15}}`, false},
+		{`{"type":"mcp","oauthRuntime":{"timeout":"15"}}`, false},
+		{`{"type":"mcp","oauthRuntime":{"timeout":0}}`, false},
+		{`{"type":"mcp","oauthRuntime":{"timeout":"0"}}`, false},
+		{`{"type":"mcp","oauthRuntime":{"busyResponse":"wrong"}}`, true},
+		{`{"type":"mcp","oauthRuntime":{"busyResponse":503}}`, true},
+		{`{"type":"mcp","oauthRuntime":{"timeout":"-1s"}}`, true},
+		{`{"type":"mcp","oauthRuntime":{"timeoutSeconds":15}}`, true},
+		{`{"type":"api","oauthRuntime":{"timeout":"15s"}}`, true},
+		{`{"type":"schedule","oauthRuntime":{}}`, true},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			var definition APIConfig
+			err := json.Unmarshal([]byte(tc.input), &definition)
+			if err == nil {
+				err = validateAPIConfigKnownFields("example", json.RawMessage(tc.input))
+			}
+			if err == nil {
+				err = validateAPIConfigFieldPlacement("example", definition)
+			}
+			if (err != nil) != tc.bad {
+				t.Fatalf("invalid placement or value: err=%v wantError=%t", err, tc.bad)
+			}
+		})
+	}
+}
+
+func TestMCPRuntimeBusyOverridePerServer(t *testing.T) {
+	for _, role := range []string{"oauthToken", "oauthValidateAccessToken"} {
+		for _, mode := range []string{"legacy", "serviceUnavailable"} {
+			t.Run(role+"/"+mode, func(t *testing.T) {
+				globalMode := "legacy"
+				if mode == "legacy" {
+					globalMode = "serviceUnavailable"
+				}
+				setTestOAuthBusyResponse(t, globalMode)
+				definitions, server, _, _ := newOAuthChecksFixture(t)
+				definition := definitions[mcpOAuthAPIForRole(server, role)]
+				definition.Runtime.Capabilities = append(definition.Runtime.Capabilities, "password")
+				definitions[mcpOAuthAPIForRole(server, role)] = definition
+				server.OAuthRuntime = &MCPOAuthRuntimeOverride{BusyResponse: &mode}
+				release := holdTestOAuthPasswordSlot(t)
+				defer release()
+				rec := performOAuthRuntimeTestRequest(t, definitions, server, role, "")
+				want := http.StatusServiceUnavailable
+				if mode == "legacy" {
+					want = http.StatusInternalServerError
+					if role == "oauthValidateAccessToken" {
+						want = http.StatusUnauthorized
+					}
+				}
+				if rec.Code != want {
+					t.Fatalf("per-server response ignored: status=%d body=%s", rec.Code, rec.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestScheduleTimeoutOnlyPreservesFunctions(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestScriptRuntimeTimeouts(t, "1ns", "1ns")
+	code := `if(typeof nyanCallMe!=="function" || typeof nyanGetAPI!=="function") throw new Error("functions restricted"); ({ok:true});`
+	var definition APIConfig
+	if err := json.Unmarshal([]byte(`{"type":"schedule","runtime":{"timeout":1}}`), &definition); err != nil {
+		t.Fatal(err)
+	}
+	if definition.Runtime.Timeout.value() != time.Second {
+		t.Fatal("unitless schedule timeout was not interpreted as seconds")
+	}
+	body, err := runScheduleScriptWithSnapshot(nil, scheduleJobConfig{scriptPath: writeTestScript(t, code), runtime: definition.Runtime}, nil)
+	if err != nil || body != `{"ok":true}` {
+		t.Fatalf("timeout changed available functions: %s %v", body, err)
+	}
+}
+
+func TestAPIRuntimeTimeoutHotReload(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "api.json")
+	writeTestFile(t, filepath.Join(dir, "script.js"), `({success:true,status:200,result:{ok:true}});`)
+	writeConfig := func(timeout string) {
+		writeTestFile(t, path, fmt.Sprintf(`{
+			"auth_meta":{"type":"api"},
+			"resource_meta":{"type":"api"},
+			"authorize":{"script":"script.js"},
+			"token":{"script":"script.js"},
+			"register":{"script":"script.js"},
+			"verify":{"script":"script.js","scopes":["read"]},
+			"tool":{"script":"script.js","scopes":["read"]},
+			"mcp":{"type":"mcp","transport":"streamable_http","allowedOrigins":["https://example.com"],
+				"redirectURIAllowedPrefixes":["https://example.com/"],"tools":["tool"],
+				"oauth":{"authorizationServerMetadata":"auth_meta","protectedResourceMetadata":"resource_meta","authorize":"authorize","token":"token","register":"register","verifyAccess":"verify"},
+				"oauthRuntime":{"timeout":%s,"busyResponse":"serviceUnavailable"}},
+			"job":{"type":"schedule","script":"script.js","trigger":{"type":"cron","value":"0 0 1 1 *"},"runtime":{"timeout":%s}}
+		}`, timeout, timeout))
+	}
+	writeConfig(`"5m"`)
+	initial := loadTestAPIConfig(t, path)
+	setTestAPISnapshot(t, initial.Snapshot)
+	oldManager := backgroundRuntimes
+	manager := newBackgroundRuntimeManager()
+	backgroundRuntimes = manager
+	manager.reconcile(initial.Snapshot.Schedules, nil)
+	t.Cleanup(func() { manager.reconcile(nil, nil); backgroundRuntimes = oldManager })
+	manager.mu.Lock()
+	job := manager.schedules["job"]
+	manager.mu.Unlock()
+	writeConfig(`0`)
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(path, initial.Snapshot.Files)
+	if err != nil || !reloaded {
+		t.Fatalf("runtime-only change did not reload: reloaded=%t err=%v", reloaded, err)
+	}
+	current := currentAPISnapshot()
+	if effectiveMCPOAuthRuntime(current.Definitions["mcp"]).Timeout.value() != 0 || current.Schedules["job"].runtime.Timeout.value() != 0 {
+		t.Fatal("updated runtime values were not published")
+	}
+	updated, active := job.currentConfig()
+	if !active || updated.runtime.Timeout.value() != 0 {
+		t.Fatal("schedule runtime did not receive the new timeout")
+	}
+	if initial.Snapshot.Schedules["job"].runtime.Timeout.value() != 5*time.Minute || effectiveMCPOAuthRuntime(initial.Snapshot.Definitions["mcp"]).Timeout.value() != 5*time.Minute {
+		t.Fatal("reload mutated the previous snapshot")
+	}
+	writeConfig(`"invalid"`)
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(path, observed)
+	if err == nil || reloaded || currentAPISnapshot() != current {
+		t.Fatalf("invalid runtime replaced the active snapshot: reloaded=%t err=%v", reloaded, err)
+	}
+}
+
 func setTestOAuthBusyResponse(t *testing.T, mode string) {
 	t.Helper()
-	old := config.OAuthRuntime
-	config.OAuthRuntime = OAuthRuntimeConfig{BusyResponse: mode}
-	t.Cleanup(func() { config.OAuthRuntime = old })
+	old := config.MCPOAuthRuntime
+	config.MCPOAuthRuntime = MCPOAuthRuntimeConfig{BusyResponse: mode}
+	t.Cleanup(func() { config.MCPOAuthRuntime = old })
 }
 
 func holdTestOAuthPasswordSlot(t *testing.T) func() {
@@ -6008,7 +6461,7 @@ func TestOAuthRuntimeBusyAfterCompletedStage(t *testing.T) {
 				t.Fatalf("busy error lost: %v", err)
 			}
 			rec := httptest.NewRecorder()
-			if !prepareOAuthRuntimeBusyResponse(rec, fmt.Errorf("wrapped: %w", err)) || rec.Header().Get("Retry-After") != "" {
+			if !prepareOAuthRuntimeBusyResponse(rec, fmt.Errorf("wrapped: %w", err), APIConfig{}) || rec.Header().Get("Retry-After") != "" {
 				t.Fatalf("late busy response suggests retry: %v", rec.Header())
 			}
 			if got := stages(); got != previous {
