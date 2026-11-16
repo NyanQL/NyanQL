@@ -520,7 +520,6 @@ type MCPOAuthConfig struct {
 	Authorize                   string `json:"authorize,omitempty"`
 	Token                       string `json:"token,omitempty"`
 	Register                    string `json:"register,omitempty"`
-	AdminUser                   string `json:"adminUser,omitempty"`
 	VerifyAccess                string `json:"verifyAccess,omitempty"`
 }
 
@@ -1107,7 +1106,7 @@ func findMCPOAuthAPIForRequest(snapshot *APIConfigSnapshot, r *http.Request) (st
 			{mcp.OAuth.AuthorizationServerMetadata, "authorizationServerMetadata"},
 			{mcp.OAuth.ProtectedResourceMetadata, "protectedResourceMetadata"},
 			{mcp.OAuth.Authorize, "oauthAuthorize"}, {mcp.OAuth.Token, "oauthToken"},
-			{mcp.OAuth.Register, "oauthRegister"}, {mcp.OAuth.AdminUser, "oauthAdminUser"},
+			{mcp.OAuth.Register, "oauthRegister"},
 		}
 		for _, candidate := range roles {
 			if candidate.api == "" {
@@ -1336,7 +1335,6 @@ type mcpRuntimeURLs struct {
 	AuthorizationEndpoint       string
 	TokenEndpoint               string
 	RegistrationEndpoint        string
-	AdminUserEndpoint           string
 }
 
 type rejectingJSONSchemaLoader struct{}
@@ -1491,7 +1489,6 @@ func deriveMCPRuntimeURLs(r *http.Request, serverName string, serverConfig APICo
 		ProtectedResourceMetadata:   pathFor(serverConfig.OAuth.ProtectedResourceMetadata),
 		AuthorizationEndpoint:       pathFor(serverConfig.OAuth.Authorize),
 		TokenEndpoint:               pathFor(serverConfig.OAuth.Token), RegistrationEndpoint: pathFor(serverConfig.OAuth.Register),
-		AdminUserEndpoint: pathFor(serverConfig.OAuth.AdminUser),
 	}, nil
 }
 
@@ -1529,25 +1526,6 @@ func handleMCPOAuthHTTPRequest(snapshot *APIConfigSnapshot, w http.ResponseWrite
 		closeUnreadRequestBody(w, r)
 		w.WriteHeader(http.StatusNoContent)
 		return
-	}
-	if role == "oauthAdminUser" {
-		remoteHost := r.RemoteAddr
-		if host, _, splitErr := net.SplitHostPort(r.RemoteAddr); splitErr == nil {
-			remoteHost = host
-		}
-		remoteIP := net.ParseIP(strings.TrimSpace(remoteHost))
-		if remoteIP == nil || !remoteIP.IsLoopback() {
-			closeUnreadRequestBody(w, r)
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		username, password, ok := r.BasicAuth()
-		if !ok || !timingSafeStringEqual(username, config.BasicAuth.Username) || !timingSafeStringEqual(password, config.BasicAuth.Password) {
-			w.Header().Set("WWW-Authenticate", `Basic realm="NyanQL OAuth administration", charset="UTF-8"`)
-			closeUnreadRequestBody(w, r)
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
 	}
 	if !mcpOAuthMethodAllowed(role, r.Method) {
 		w.Header().Set("Allow", mcpOAuthAllowedMethods(role))
@@ -1642,7 +1620,7 @@ func validateMCPOAuthContentType(role string, r *http.Request) error {
 		return err
 	}
 	switch role {
-	case "oauthRegister", "oauthAdminUser":
+	case "oauthRegister":
 		if mediaType != "application/json" {
 			return fmt.Errorf("JSON is required")
 		}
@@ -1657,7 +1635,7 @@ func validateMCPOAuthContentType(role string, r *http.Request) error {
 func mcpOAuthRateLimitAllows(serverName string, serverConfig APIConfig, role, remoteAddress string, now time.Time) (bool, time.Duration) {
 	requests := 60
 	switch role {
-	case "oauthAdminUser", "oauthRegister":
+	case "oauthRegister":
 		requests = 10
 	case "oauthAuthorize":
 		requests = 30
@@ -1669,8 +1647,6 @@ func mcpOAuthRateLimitAllows(serverName string, serverConfig APIConfig, role, re
 func mcpOAuthMaxConcurrent(serverConfig APIConfig, role string) int {
 	limit := configuredMCPMaxConcurrent(serverConfig)
 	switch role {
-	case "oauthAdminUser":
-		return min(limit, 1)
 	case "oauthAuthorize":
 		return min(limit, 2)
 	default:
@@ -2614,8 +2590,6 @@ func mcpOAuthAPIForRole(serverConfig APIConfig, role string) string {
 		return serverConfig.OAuth.Token
 	case "oauthRegister":
 		return serverConfig.OAuth.Register
-	case "oauthAdminUser":
-		return serverConfig.OAuth.AdminUser
 	case "oauthValidateAccessToken":
 		return serverConfig.OAuth.VerifyAccess
 	default:
@@ -2798,7 +2772,7 @@ func invokeMCPOAuthHook(snapshot *APIConfigSnapshot, serverName string, serverCo
 		"authorization_server_metadata_url": runtimeURLs.AuthorizationServerMetadata,
 		"protected_resource_metadata_url":   runtimeURLs.ProtectedResourceMetadata,
 		"authorization_endpoint":            runtimeURLs.AuthorizationEndpoint, "token_endpoint": runtimeURLs.TokenEndpoint,
-		"registration_endpoint": runtimeURLs.RegistrationEndpoint, "admin_user_endpoint": runtimeURLs.AdminUserEndpoint,
+		"registration_endpoint":         runtimeURLs.RegistrationEndpoint,
 		"scopes":                        append([]string(nil), snapshot.Definitions[serverConfig.OAuth.VerifyAccess].Scopes...),
 		"redirect_uri_allowed_prefixes": append([]string(nil), serverConfig.RedirectURIAllowedPrefixes...),
 	}
@@ -3480,7 +3454,6 @@ func decodeAPIConfigDefinition(apiKey string, rawDefinition json.RawMessage, api
 	apiConfig.OAuth.Authorize = strings.TrimSpace(apiConfig.OAuth.Authorize)
 	apiConfig.OAuth.Token = strings.TrimSpace(apiConfig.OAuth.Token)
 	apiConfig.OAuth.Register = strings.TrimSpace(apiConfig.OAuth.Register)
-	apiConfig.OAuth.AdminUser = strings.TrimSpace(apiConfig.OAuth.AdminUser)
 	apiConfig.OAuth.VerifyAccess = strings.TrimSpace(apiConfig.OAuth.VerifyAccess)
 	for index := range apiConfig.RedirectURIAllowedPrefixes {
 		apiConfig.RedirectURIAllowedPrefixes[index] = strings.TrimSpace(apiConfig.RedirectURIAllowedPrefixes[index])
@@ -3555,7 +3528,7 @@ func validateAPIConfigKnownFields(apiKey string, rawDefinition json.RawMessage) 
 	}
 	if raw, exists := topLevel["oauth"]; exists {
 		if _, err := decodeKnownJSONObject(raw, "definition "+strconv.Quote(apiKey)+".oauth", stringSet(
-			"authorizationServerMetadata", "protectedResourceMetadata", "authorize", "token", "register", "adminUser", "verifyAccess",
+			"authorizationServerMetadata", "protectedResourceMetadata", "authorize", "token", "register", "verifyAccess",
 		)); err != nil {
 			return fmt.Errorf("decode api JSON: %w", err)
 		}
@@ -3639,9 +3612,6 @@ func validateConfiguredAPIExtensions(definitions map[string]APIConfig) error {
 				routes[routePath] = apiName
 				if mcpOAuthConfigured(apiConfig.OAuth) {
 					publicOAuth := []string{apiConfig.OAuth.AuthorizationServerMetadata, apiConfig.OAuth.ProtectedResourceMetadata, apiConfig.OAuth.Authorize, apiConfig.OAuth.Token, apiConfig.OAuth.Register}
-					if apiConfig.OAuth.AdminUser != "" {
-						publicOAuth = append(publicOAuth, apiConfig.OAuth.AdminUser)
-					}
 					for _, oauthAPI := range publicOAuth {
 						if owner, exists := oauthOwners[oauthAPI]; exists && owner != apiName {
 							return fmt.Errorf("configuration error: OAuth API %q is owned by MCP servers %q and %q", oauthAPI, owner, apiName)
@@ -3811,7 +3781,7 @@ func canonicalAPIEndpointPath(apiName string) (string, error) {
 
 func mcpOAuthConfigured(oauth MCPOAuthConfig) bool {
 	return oauth.AuthorizationServerMetadata != "" || oauth.ProtectedResourceMetadata != "" || oauth.Authorize != "" ||
-		oauth.Token != "" || oauth.Register != "" || oauth.AdminUser != "" || oauth.VerifyAccess != ""
+		oauth.Token != "" || oauth.Register != "" || oauth.VerifyAccess != ""
 }
 
 func validateMCPOAuthConfig(mcpName string, mcp APIConfig, definitions map[string]APIConfig) error {
@@ -3836,12 +3806,6 @@ func validateMCPOAuthConfig(mcpName string, mcp APIConfig, definitions map[strin
 		{"token", mcp.OAuth.Token, false},
 		{"register", mcp.OAuth.Register, false},
 		{"verifyAccess", mcp.OAuth.VerifyAccess, false},
-	}
-	if mcp.OAuth.AdminUser != "" {
-		references = append(references, struct {
-			label, name string
-			metadata    bool
-		}{"adminUser", mcp.OAuth.AdminUser, false})
 	}
 	seen := map[string]string{}
 	for _, reference := range references {

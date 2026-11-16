@@ -5285,6 +5285,98 @@ func TestNyan8CompatibleMCPRejectsLegacyAndInvalidTransportFormats(t *testing.T)
 	}
 }
 
+func TestMCPConfigRejectsRemovedAdminUser(t *testing.T) {
+	for _, value := range []string{`"oauth/admin/users"`, `""`, `null`, `{}`, `[]`, `true`, `1`} {
+		t.Run(value, func(t *testing.T) {
+			data := []byte(`{"mcp":{"type":"mcp","oauth":{"adminUser":` + value + `}}}`)
+			path := filepath.Join(t.TempDir(), "api.json")
+			writeTestFile(t, path, string(data))
+			_, err := loadAPIConfigFile(path)
+			if err == nil || !strings.Contains(err.Error(), `unsupported field "adminUser"`) {
+				t.Fatalf("removed OAuth setting must be rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestOAuthAdministrationRoutesRemoved(t *testing.T) {
+	definitions, server, _, stages := newOAuthChecksFixture(t)
+	definitions["mcp"] = server
+	setTestSQLFiles(t, definitions)
+	for _, target := range []string{"/oauth/admin/users", "/?api=oauth/admin/users", "/admin", "/?api=admin"} {
+		req := httptest.NewRequest(http.MethodPost, "https://service.example"+target, strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+		rec := httptest.NewRecorder()
+		unifiedHandler(rec, req)
+		if rec.Code != http.StatusNotFound || stages() != "" {
+			t.Fatalf("removed route %s: status=%d stages=%q body=%s", target, rec.Code, stages(), rec.Body.String())
+		}
+	}
+}
+
+func TestApplicationManagedUserAPI(t *testing.T) {
+	for _, route := range []string{"http", "root", "websocket", "nyanCallMe"} {
+		for _, session := range []string{"", "member-session", "manager-session"} {
+			t.Run(route+"/"+session, func(t *testing.T) {
+				definitions, server, mark, stages := newOAuthChecksFixture(t)
+				if _, err := db.Exec(`CREATE TABLE app_sessions (token TEXT PRIMARY KEY, role TEXT);
+INSERT INTO app_sessions VALUES ('member-session', 'member'), ('manager-session', 'manager');`); err != nil {
+					t.Fatal(err)
+				}
+				lookup := filepath.Join(t.TempDir(), "session.sql")
+				writeTestFile(t, lookup, `SELECT role FROM app_sessions WHERE token = /*token*/'';`)
+				definitions["mcp"] = server
+				definitions["oauth/admin/users"] = APIConfig{
+					ParamCheck: writeTestScript(t, mark("input")+fmt.Sprintf(`
+const rows = nyanRunSQL(%q, {token:nyanRequest.cookies.session || ""}) || [];
+const allowed = rows.length === 1 && rows[0].role === "manager";
+({success:allowed,status:allowed ? 200 : 403});`, lookup)),
+					Script:   writeTestScript(t, mark("body")+`({success:true,status:201,result:{username:nyanAllParams.username}});`),
+					OutCheck: writeTestScript(t, mark("output")+`({success:true,status:200});`),
+				}
+				definitions["forward"] = APIConfig{Script: writeTestScript(t, `nyanCallMe({api:"oauth/admin/users",username:nyanAllParams.username,admin:true,role:"manager"});`)}
+				setTestSQLFiles(t, definitions)
+				target := "/oauth/admin/users"
+				if route == "root" {
+					target = "/?api=oauth/admin/users"
+				} else if route == "nyanCallMe" {
+					target = "/forward"
+				}
+				const body = `{"api":"oauth/admin/users","username":"new-user","admin":true,"role":"manager"}`
+				req := httptest.NewRequest(http.MethodPost, "https://service.example"+target, strings.NewReader(body))
+				req.RemoteAddr = "192.0.2.10:1234"
+				req.Header.Set("Content-Type", "application/json")
+				req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
+				if session != "" {
+					req.AddCookie(&http.Cookie{Name: "session", Value: session})
+				}
+				var response map[string]interface{}
+				wantStatus, wantStages := http.StatusForbidden, "input"
+				if session == "manager-session" {
+					wantStatus, wantStages = http.StatusCreated, "input,body,output"
+				}
+				if route == "websocket" {
+					response = decodeTestJSONObject(t, executeWebSocketAPIMessage(req, []byte(body)))
+				} else {
+					rec := httptest.NewRecorder()
+					unifiedHandler(rec, req)
+					if rec.Code != wantStatus {
+						t.Fatalf("HTTP status=%d want=%d body=%s", rec.Code, wantStatus, rec.Body.String())
+					}
+					response = decodeTestJSONObject(t, rec.Body.Bytes())
+				}
+				if response["status"] != float64(wantStatus) || stages() != wantStages {
+					t.Fatalf("response=%v stages=%q want=%q", response, stages(), wantStages)
+				}
+				if session == "manager-session" && response["result"].(map[string]interface{})["username"] != "new-user" {
+					t.Fatalf("normal API request/response contract changed: %v", response)
+				}
+			})
+		}
+	}
+}
+
 func TestNyan8CompatibleMCPStdioLifecycleAndPrincipal(t *testing.T) {
 	resetJavascriptInclude(t)
 	setTestSQLiteDB(t)
@@ -5801,6 +5893,7 @@ func newOAuthChecksFixture(t *testing.T) (map[string]APIConfig, APIConfig, func(
 	const restrictions = `
 if (typeof nyanHostExec !== "undefined" || typeof nyanCallMe !== "undefined" || typeof nyanGetAPI !== "undefined" || typeof nyanSaveFile !== "undefined" || typeof nyanCrypto !== "undefined") throw new Error("unrestricted OAuth VM");
 if (nyanRuntimeSettings.issuer !== "https://service.example") throw new Error("missing runtime settings");
+if (Object.prototype.hasOwnProperty.call(nyanAllParams, "admin_user_endpoint")) throw new Error("removed administration endpoint was injected");
 `
 	definition := APIConfig{
 		ParamCheck: writeTestScript(t, restrictions+mark("input")+allow),
@@ -5809,7 +5902,7 @@ if (nyanRuntimeSettings.issuer !== "https://service.example") throw new Error("m
 		Runtime:    APIRuntimeConfig{Capabilities: []string{"sql"}, SQLFiles: []string{markerSQL}},
 	}
 	definitions := map[string]APIConfig{}
-	for _, name := range []string{"authorize", "token", "register", "admin", "auth_meta", "resource_meta", "verify"} {
+	for _, name := range []string{"authorize", "token", "register", "auth_meta", "resource_meta", "verify"} {
 		definitions[name] = definition
 	}
 	for _, name := range []string{"auth_meta", "resource_meta"} {
@@ -5827,7 +5920,7 @@ if (nyanRuntimeSettings.issuer !== "https://service.example") throw new Error("m
 		Scopes:     []string{"tool:read"},
 	}
 	server := APIConfig{Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocolVersion20251125}, Tools: []MCPToolConfig{{API: "tool"}}, OAuth: MCPOAuthConfig{
-		AuthorizationServerMetadata: "auth_meta", ProtectedResourceMetadata: "resource_meta", Authorize: "authorize", Token: "token", Register: "register", AdminUser: "admin", VerifyAccess: "verify",
+		AuthorizationServerMetadata: "auth_meta", ProtectedResourceMetadata: "resource_meta", Authorize: "authorize", Token: "token", Register: "register", VerifyAccess: "verify",
 	}}
 	return definitions, server, mark, stages
 }
@@ -6342,7 +6435,7 @@ func performOAuthRuntimeTestRequest(t *testing.T, definitions map[string]APIConf
 	t.Helper()
 	apiName := mcpOAuthAPIForRole(server, role)
 	method, contentType, body := http.MethodPost, "application/x-www-form-urlencoded", "value=1"
-	if role == "oauthRegister" || role == "oauthAdminUser" {
+	if role == "oauthRegister" {
 		contentType, body = "application/json", `{"value":1}`
 	}
 	if role == "oauthAuthorize" || isMCPOAuthMetadataRole(role) {
@@ -6365,7 +6458,6 @@ func performOAuthRuntimeTestRequest(t *testing.T, definitions map[string]APIConf
 		req.Header.Set("Authorization", "Bearer good")
 		handleMCPRequestWithSnapshot(snapshot, rec, req, t.Name(), server)
 	} else {
-		req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
 		handleMCPOAuthHTTPRequest(snapshot, rec, req, t.Name(), server, apiName, role)
 	}
 	return rec
@@ -6373,7 +6465,7 @@ func performOAuthRuntimeTestRequest(t *testing.T, definitions map[string]APIConf
 
 func TestOAuthRuntimeBusyResponses(t *testing.T) {
 	for _, mode := range []string{"", "legacy", "serviceUnavailable"} {
-		for _, role := range []string{"oauthAuthorize", "oauthToken", "oauthRegister", "oauthAdminUser", "authorizationServerMetadata", "protectedResourceMetadata", "oauthValidateAccessToken"} {
+		for _, role := range []string{"oauthAuthorize", "oauthToken", "oauthRegister", "authorizationServerMetadata", "protectedResourceMetadata", "oauthValidateAccessToken"} {
 			for _, first := range []string{"input", "without_input", "check_only"} {
 				t.Run(mode+"/"+role+"/"+first, func(t *testing.T) {
 					setTestOAuthBusyResponse(t, mode)
@@ -6517,7 +6609,7 @@ func TestOAuthRuntimeBusyModePreservesScriptDecisions(t *testing.T) {
 }
 
 func TestOAuthChecksHTTPRoutes(t *testing.T) {
-	for _, role := range []string{"oauthAuthorize", "oauthToken", "oauthRegister", "oauthAdminUser", "authorizationServerMetadata", "protectedResourceMetadata"} {
+	for _, role := range []string{"oauthAuthorize", "oauthToken", "oauthRegister", "authorizationServerMetadata", "protectedResourceMetadata"} {
 		for _, test := range []string{"allowed", "output_non_200_success", "input_denied", "output_denied", "input_exception", "output_exception", "invalid_input", "invalid_output", "missing_file", "check_only", "check_only_denied", "check_only_missing", "check_alias"} {
 			t.Run(role+"/"+test, func(t *testing.T) {
 				definitions, server, mark, stages := newOAuthChecksFixture(t)
@@ -6565,7 +6657,7 @@ func TestOAuthChecksHTTPRoutes(t *testing.T) {
 				definitions[apiName] = definition
 				snapshot := newAPIConfigSnapshot(definitions, "", [sha256.Size]byte{})
 				method, contentType, body := http.MethodPost, "application/x-www-form-urlencoded", "value=1"
-				if role == "oauthRegister" || role == "oauthAdminUser" {
+				if role == "oauthRegister" {
 					contentType, body = "application/json", `{"value":1}`
 				}
 				if role == "oauthAuthorize" || isMCPOAuthMetadataRole(role) {
@@ -6578,7 +6670,6 @@ func TestOAuthChecksHTTPRoutes(t *testing.T) {
 				req := httptest.NewRequest(method, target, strings.NewReader(body))
 				req.Header.Set("Content-Type", contentType)
 				req.RemoteAddr = "127.0.0.1:1234"
-				req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
 				rec := httptest.NewRecorder()
 				handleMCPOAuthHTTPRequest(snapshot, rec, req, t.Name(), server, apiName, role)
 				if rec.Code != wantStatus || stages() != wantStages {
@@ -6696,7 +6787,6 @@ func TestOAuthCheckOnlyHTTPValidation(t *testing.T) {
 		name, role, method, contentType, query, body string
 		status                                       int
 		stages                                       string
-		noAdminAuth                                  bool
 	}{
 		{name: "query", role: "oauthAuthorize", method: "GET", query: "?nyan_mode=checkOnly", status: 200, stages: "input"},
 		{name: "form", role: "oauthToken", method: "POST", contentType: "application/x-www-form-urlencoded", body: "nyan_mode=checkOnly", status: 200, stages: "input"},
@@ -6713,7 +6803,6 @@ func TestOAuthCheckOnlyHTTPValidation(t *testing.T) {
 		{name: "duplicate_json_key", role: "oauthRegister", method: "POST", contentType: "application/json", body: `{"nyan_mode":"checkOnly","nyan_mode":""}`, status: 400},
 		{name: "invalid_form", role: "oauthToken", method: "POST", contentType: "application/x-www-form-urlencoded", query: "?nyan_mode=checkOnly", body: "value=%", status: 400},
 		{name: "oversized_request", role: "oauthRegister", method: "POST", contentType: "application/json", query: "?nyan_mode=checkOnly", body: strings.Repeat("x", int(defaultReceiveBytes)+1), status: 413},
-		{name: "admin_auth", role: "oauthAdminUser", method: "POST", contentType: "application/json", body: `{"nyan_mode":"checkOnly"}`, status: 401, noAdminAuth: true},
 		{name: "options", role: "oauthAuthorize", method: "OPTIONS", query: "?nyan_mode=checkOnly", status: 204},
 		{name: "metadata_options", role: "protectedResourceMetadata", method: "OPTIONS", query: "?nyan_mode=checkOnly", status: 204},
 	} {
@@ -6723,9 +6812,6 @@ func TestOAuthCheckOnlyHTTPValidation(t *testing.T) {
 			req := httptest.NewRequest(test.method, "https://service.example/"+apiName+test.query, strings.NewReader(test.body))
 			req.RemoteAddr = "127.0.0.1:1234"
 			req.Header.Set("Content-Type", test.contentType)
-			if !test.noAdminAuth {
-				req.SetBasicAuth(config.BasicAuth.Username, config.BasicAuth.Password)
-			}
 			rec := httptest.NewRecorder()
 			handleMCPOAuthHTTPRequest(newAPIConfigSnapshot(definitions, "", [sha256.Size]byte{}), rec, req, t.Name(), server, apiName, test.role)
 			if rec.Code != test.status || stages() != test.stages {
@@ -7068,10 +7154,6 @@ func TestOAuthSQLiteEndToEndWithRealAssets(t *testing.T) {
 	testDB := setTestSQLiteDB(t)
 	migrateOAuthTestDatabase(t, testDB)
 
-	oldConfig := config
-	config.BasicAuth = BasicAuthConfig{Username: "admin", Password: "bootstrap-secret"}
-	t.Cleanup(func() { config = oldConfig })
-
 	targetScript := writeTestScript(t, `
 JSON.stringify({
   success: true,
@@ -7123,26 +7205,13 @@ JSON.stringify({
 		t.Fatalf("authorization server metadata = %#v", authorizationMetadataBody)
 	}
 
-	bootstrap := performOAuthTestHTTPRequest(t, http.MethodPost, "/oauth/admin/users", "application/json", `{
-		"username":"integration-user",
-		"password":"correct horse battery staple",
-		"display_name":"Integration User"
-	}`, func(req *http.Request) {
-		req.SetBasicAuth("admin", "bootstrap-secret")
-	})
-	if bootstrap.Code != http.StatusOK {
-		t.Fatalf("bootstrap status = %d; body=%s", bootstrap.Code, bootstrap.Body.String())
-	}
-	bootstrapBody := decodeTestJSONObject(t, bootstrap.Body.Bytes())
-	if bootstrapBody["success"] != true {
-		t.Fatalf("bootstrap response = %#v", bootstrapBody)
-	}
-	var passwordHash string
-	if err := testDB.QueryRow(`SELECT password_hash FROM oauth_users WHERE username = ?`, "integration-user").Scan(&passwordHash); err != nil {
+	// User provisioning belongs to the application; seed the test account directly.
+	passwordHash, err := hashPasswordArgon2ID("correct horse battery staple")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if passwordHash == "correct horse battery staple" || !strings.HasPrefix(passwordHash, "$argon2id$") {
-		t.Fatalf("stored password hash = %q", passwordHash)
+	if _, err := testDB.Exec(`INSERT INTO oauth_users(username, password_hash) VALUES (?, ?)`, "integration-user", passwordHash); err != nil {
+		t.Fatal(err)
 	}
 
 	const callbackURL = "https://chatgpt.com/connector/oauth/integration-callback"
@@ -8386,13 +8455,6 @@ func newOAuthIntegrationTestSnapshot(t *testing.T, targetScript string) *APIConf
 					"revoke_refresh_tokens_in_family.sql",
 					"revoke_access_tokens_in_refresh_family.sql",
 				),
-			},
-		},
-		"oauth_bootstrap_user": {
-			Script: oauthTestAssetPath(t, "javascript", "oauth", "bootstrap_user.js"),
-			Runtime: APIRuntimeConfig{
-				Capabilities: []string{"sql", "password"},
-				SQLFiles:     oauthTestSQLAssetPaths(t, "upsert_user.sql"),
 			},
 		},
 		"oauth_verify_access": {
@@ -13450,7 +13512,6 @@ func TestReceiveAdmissionOAuthEarlyRejectionEOF(t *testing.T) {
 		{"method", "POST", "authorizationServerMetadata", "", 405},
 		{"options", "OPTIONS", "oauthToken", "", 204},
 		{"content_type", "POST", "oauthToken", "Content-Type: text/plain\r\n", 415},
-		{"admin_auth", "POST", "oauthAdminUser", "", 401},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, name := newReceiveAdmissionHandler(t, false)

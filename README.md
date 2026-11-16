@@ -1166,7 +1166,7 @@ OAuth参照先APIの `paramCheck`（別名 `check`）と `outCheck` も実行し
 
 | 対象 | 実行順序 |
 |---|---|
-| `authorize` / `token` / `register` / `adminUser` | 入力チェック → 本体スクリプト → 出力チェック → HTTP応答 |
+| `authorize` / `token` / `register` | 入力チェック → 本体スクリプト → 出力チェック → HTTP応答 |
 | `authorizationServerMetadata` / `protectedResourceMetadata` | 入力チェック → Goによるメタデータ生成 → 出力チェック → HTTP応答。参照先の本体スクリプトは実行しません |
 | `verifyAccess` | 入力チェック → トークン検証スクリプト → 出力チェック → 認証判定 |
 
@@ -1904,7 +1904,6 @@ OAuth設定は認証処理そのものを生成しません。利用者認証、
 | `authorizationServerMetadata` / `protectedResourceMetadata` | Goがメタデータを生成するAPI。script不要 |
 | `authorize` / `token` / `register` | 認可・token・クライアント登録を行うscript付きAPI |
 | `verifyAccess` | access tokenと要求scopeを検証するscript付きAPI。API定義の `scopes` に許可scopeを列挙 |
-| `adminUser` | 任意の管理用API。設定時はloopbackからの接続とconfigのBasic認証が必要 |
 
 OAuthを使う各Toolには `securitySchemes: [{"type":"oauth2","scopes":["example:read"]}]` 等のscopeを宣言し、verifyAccess側のscopesに含めます。hookは `nyanAllParams` の `oauth_hook`、`oauth_api`、`issuer`、`resource`、`scopes` 等を参照できます。HTTP hookにはmethod/query/form/body/cookies/headersが渡り、query/formの各値は、1件なら文字列、同じキーが複数件あれば文字列の配列です。単一値に `[0]` を付けると先頭の1文字になるため、そのまま参照してください。verifyAccessには `authorization`、`tool`、`required_scopes` と `nyan_request` が渡ります。
 
@@ -1918,6 +1917,32 @@ HTTP hookで使えるヘッダー参照には、次の違いがあります。
 例えば独自ヘッダーは `nyanRequest.headers["x-custom-token"]` で参照します。HostはGoのヘッダーマップとは別管理なので `nyanRequest.host` を使います。`verifyAccess` には前者の4キーの `headers` は生成せず、元のMCP要求の `nyanRequest.headers` と `nyanAllParams.authorization` を渡します。hookの戻り値に指定する `headers` は送信する応答ヘッダーであり、これらの受信ヘッダーとは別です。
 
 HTTP hookは `{status, contentType, headers, body}` を返します（status省略時200、指定時は100〜599の整数）。例えば拒否応答は `({status:400,contentType:"application/json",body:{error:"invalid_request"}});` です。verifyAccessはHTTP応答ではなく `{authenticated:true,principal:{...}}` または拒否の `{authenticated:false}` を返します。認証成功にはprincipalも必要です。JSオブジェクトと、それをJSON化した文字列を利用できます。チェックの `{success,status,result}` とは別の契約です。
+
+#### 利用者管理と旧 `oauth.adminUser` からの移行
+
+NyanQLはOAuth専用の利用者管理API・管理者判定を提供しません。利用者の作成・更新、管理者の認証・認可、最初の管理者の登録方法はアプリケーション側で実装します。OAuthの `register` はクライアント登録（DCR）であり、利用者登録の代わりにはなりません。
+
+旧 `oauth.adminUser` は廃止しました。空文字列・`null` を含め、キーが残ったAPI設定は読み込みエラーになります。起動時は起動中止、ホットリロード時は候補設定を採用せず既存の定義を維持します。専用のloopback判定・Basic認証・受付制限と、hookへの `admin_user_endpoint` の注入も廃止しています。
+
+移行は次の順に行ってください。
+
+1. MCP定義の `oauth.adminUser` を削除します。管理APIが不要なら、その参照先のAPI定義と呼び出しも削除します。既存のユーザーレコード・パスワードハッシュ・tokenを、この変更のために削除する必要はありません。
+2. 管理APIを使い続ける場合は、通常の `type: "api"` として定義し、`paramCheck` でアプリの認証・認可を行います。`nyanRequest.cookies` や独自ヘッダーのセッションを検証し、サーバー側の記録から管理権限を確認してください。利用者が送った `admin`・`role` 等の値をそのまま権限判定には使いません。拒否時は例えば `({success:false,status:403,error:"Forbidden"});` を返せます。通常APIの `paramCheck` はHTTP・JSON-RPC・WebSocket・`nyanCallMe()` のAPI実行で適用されます。
+3. 旧管理script・前後チェック・呼び出し元の入出力を、下表の通常APIの形式に合わせます。管理API名を維持すればURLも維持できますが、`oauth.adminUser` だけを消して旧scriptをそのまま残す移行はしないでください。
+4. 必要なHTTPメソッド・Origin・接続元の制限をアプリ側で定義します。旧管理経路の毎分10件・同時1件の制限も引き継がれないため、必要に応じてアプリや前段プロキシで制御します。通常APIにはOAuth用のVM機能制限・`runtime.sqlFiles` の許可リスト・`oauthRuntime.timeout` は適用されません。
+
+| 旧管理hookでの参照・戻り値 | 通常APIへの移行 |
+|---|---|
+| `nyanAllParams.body.username` などのJSON本文 | `nyanAllParams.username` など通常のAPIパラメータ。HTTP本文そのものは `nyanRequest.json` で参照できます。 |
+| `nyanAllParams.method`・`headers`・`cookies` など | `nyanRequest.method`・`nyanRequest.headers`・`nyanRequest.cookies` などを使用します。 |
+| `oauth_hook === "oauthAdminUser"` による分岐 | 通常APIのscriptとして管理処理を呼び出します。OAuth専用の役割・URL情報には依存しない構成にします。 |
+| `admin_user_endpoint` | アプリ側で管理APIのURLを定め、呼び出し元を更新します。 |
+| `{status:200,contentType:"application/json",body:{success:true,result:...}}` | 例えば `({success:true,status:200,result:...});` を返します。通常APIはJSON全体を応答本文にし、OAuth形式の `body` の取り出しや `headers` のHTTPヘッダー化は行いません。 |
+| OAuth用の `runtime.settings`・注入済み `nyanRuntimeSettings` | 必要な設定値はアプリの共通JavaScriptやDB等から取得する構成にします。 |
+
+NyanQLの `config.json` の `BasicAuth` は、通常HTTP・JSON-RPC・WebSocketのAPI実行で引き続き使います。今回の移行では削除しません。通常HTTP APIの呼び出しにはBasic認証を付け、アプリ独自の管理セッションにはCookieや別ヘッダー等を使います。`Authorization` にBearerだけを指定すると通常APIのBasic認証を通過しません。Basic認証の通過に加えて、アプリ側で管理権限を確認してください。最初の管理者は、アプリのセットアップ処理や運用用CLIなどで登録できます。
+
+#### OAuth scriptの実行環境
 
 OAuthのscriptと前後チェックは、通常APIより機能を制限したVMで実行します。各参照先APIの `runtime` に `capabilities`（`sql`・`crypto`・`password`）を指定し、`sql`を使う場合は `sqlFiles` に許可SQLファイルを列挙します。`settings` は `nyanRuntimeSettings` から取得できます。例えば `"runtime":{"capabilities":["crypto","password"],"settings":{}}` です。外部HTTP、HostExec、汎用ファイル操作、nyanCallMeは利用できません。各script・前後チェックの開始からMCPサーバー定義の `oauthRuntime.timeout` の期限（既定15秒、[設定で変更可能](#script-runtime-timeouts)）を設け、JavaScript本体と戻り値変換中のgetterを監視します。同じ期限をSQLの接続取得・実行にも渡します。SQLを使わないscriptはDB接続を確保しません。期限切れや戻り値変換の例外では、その実行の未コミットSQLをロールバックします。これは各段階の期限であり、複数のチェックと本体を含むHTTP要求全体が設定時間内に完了する保証ではありません。同期ファイル読み込み、暗号計算、DBドライバ内のキャンセル不能な処理は、処理が戻るまで待つ場合があります。通常API全体を隔離する設定ではありません。
 
@@ -1946,7 +1971,6 @@ OAuthのscriptと前後チェックは、通常APIより機能を制限したVM�
 | 対象 | 枠の共有範囲 | 上限 | 満杯の場合 |
 |---|---|---|---|
 | Streamable HTTPのMCP要求 | MCPサーバー名ごと | `L` | 待機せずHTTP 503 `server is busy`、`Retry-After: 1`。 |
-| OAuth `adminUser` のHTTP要求 | MCPサーバー名＋役割ごと | `min(L, 1)` | 待機せずHTTP 503 `OAuth endpoint is busy`、`Retry-After: 1`。 |
 | OAuth `authorize` のHTTP要求 | MCPサーバー名＋役割ごと | `min(L, 2)` | 待機せずHTTP 503 `OAuth endpoint is busy`、`Retry-After: 1`。 |
 | OAuth `token`・`register`・両メタデータのHTTP要求 | MCPサーバー名＋役割ごと | 各役割に `L` | 待機せずHTTP 503 `OAuth endpoint is busy`、`Retry-After: 1`。 |
 | `password` を許可したOAuth用VM | MCP名・API名・役割によらずプロセス全体 | 同時1実行 | スクリプト開始前に `restricted JavaScript runtime is busy` エラー。待機しません。 |
