@@ -112,7 +112,7 @@ GitHub Releasesから、使っているOSに合うファイルをダウンロー
 
 https://github.com/NyanQL/NyanQL/releases
 
-ソースからビルドする場合は、[go.mod](go.mod)に記載されたGoバージョン（現時点では1.26.9）と、対象OS/CPU向けのC/C++コンパイラを用意してください。SQLite・DuckDBのネイティブ依存があるためCGOが必要です。macOSはXcode Command Line Tools、LinuxはC/C++開発ツール、Windowsは対応するMinGW-w64等が必要です。別OS向けのビルドには対応するクロスコンパイラも必要です。DBTypeを変更してもビルド時のネイティブ依存はなくなりません。
+ソースからビルドする場合は、[go.mod](go.mod)に記載されたGoバージョン（現時点では1.27.4）と、対象OS/CPU向けのC/C++コンパイラを用意してください。SQLite・DuckDBのネイティブ依存があるためCGOが必要です。macOSはXcode Command Line Tools、LinuxはC/C++開発ツール、Windowsは対応するMinGW-w64等が必要です。別OS向けのビルドには対応するクロスコンパイラも必要です。DBTypeを変更してもビルド時のネイティブ依存はなくなりません。
 
 ```bash
 git clone https://github.com/NyanQL/NyanQL.git
@@ -277,12 +277,14 @@ HTTP 200で次のJSONが返ります（キーの順序は問いません）。�
 | `ConnMaxLifetimeSeconds` | DB接続を再利用できる最大時間（整数、秒）。正数ならその時間、未指定・0・負数なら経過時間による破棄を設定しません。 |
 | `BasicAuth` | API呼び出し時のBasic認証ユーザ名とパスワードです。 |
 | `APIHotReload` | `api.json` の定期的な変更確認を設定します。省略時も有効です。 |
-| `webSocketLimits` | 全チャネル合計のWebSocket受入接続数の上限です。省略時は128件です。[設定仕様](#websocket-connection-limits)を参照してください。 |
+| `websocket` | 全チャネル合計のWebSocket受入接続数の上限です。省略時は128件です。[設定仕様](#websocket-connection-limits)を参照してください。 |
 | `oauthRuntime` | 互換用のMCPサーバー用OAuth設定です。新しい設定は `api.json` のMCP定義の `oauthRuntime` に記述します。[優先順位](#script-runtime-timeouts)を参照してください。 |
 | `scheduleRuntime` | 互換用の制限付きscheduleの既定期限です。新しい設定は `api.json` のschedule定義の `runtime.timeout` に記述します。[優先順位](#script-runtime-timeouts)を参照してください。 |
 | `sqlResultLimits` | SQL結果ごとの行数・JSONバイト数の上限です。省略時は10,000行・4MiBです。 |
 | `javascript_include` | `check` や `script` の実行前に読み込む共通JavaScriptです。 |
 | `javascript_include_cache` | `true`で共通JSのソースを起動時に読み込み、再起動まで保持します。省略時は`false`です。 |
+
+通常のHTTP/HTTPS起動では、`certPath`・`keyPath` は環境変数の展開後の値で判定します。両方を省略するか両方が空文字列ならHTTP、両方にファイルパスがあればHTTPSを使用します。片方だけにパスがある場合、または指定ファイルが存在しない・通常ファイルでない場合は起動エラーです。証明書・秘密鍵の内容が不正な場合もHTTPS起動時にエラーとなり、HTTPへ切り替えません。従来、片方だけ指定してHTTPで起動していた設定は、HTTPを使うなら両方を省略または空に、HTTPSを使うなら両方を正しく指定してください。
 
 `config.json` 内の相対パスは、`config.json` がある場所を基準にして扱われます。対象は `CertPath`、`KeyPath`、SQLite/DuckDB の `DBName`、`log.Filename`、`javascript_include` です。
 
@@ -445,17 +447,19 @@ MCP stdioの入力には、別途 [stdioのメッセージ上限](#mcp-stdio-lim
 
 ### WebSocketの同時接続数上限
 
-`config.json` のトップレベルに `webSocketLimits` を追加し、`maxConnections` に受入接続数の上限を整数で指定します。以下は512件に増やす例です。128未満の正数を指定すれば上限を減らせます。
+開発版の旧設定名 `webSocketLimits` は `websocket` に変更しました。旧名は接続数設定として読み込まれないため、使用している場合は変更してください。
+
+`config.json` のトップレベルに `websocket` を追加し、`maxConnections` に受入接続数の上限を整数で指定します。以下は512件に増やす例です。128未満の正数を指定すれば上限を減らせます。
 
 ```json
-"webSocketLimits": {
+"websocket": {
   "maxConnections": 512
 }
 ```
 
 | 指定 | 動作 |
 |---|---|
-| `webSocketLimits` を省略・`null`・`{}` | 従来どおり128件 |
+| `websocket` を省略・`null`・`{}` | 従来どおり128件 |
 | `maxConnections` を省略・`0`・`null` | 従来どおり128件。無制限や接続禁止の指定にはならない |
 | `maxConnections` が正の整数 | 指定件数まで許可 |
 | 負数・小数・文字列（`"512"` 等）・真偽値・Goの `int` の範囲外 | 設定エラーで起動しない |
@@ -471,6 +475,21 @@ NyanQL独自の固定最大値は設けません。設定可能な数値の上�
 `api.json` には、API名と、実行するSQLまたはJavaScriptの対応を書きます。
 
 各 `api.json` 内の相対パスは、その定義が書かれているJSONファイルの場所を基準にして扱われます。対象はincludeの `path`、`sql`、`script`、`paramCheck`、`outCheck`、public APIの `path` です。
+
+### 設定内のパスに環境変数を使う
+
+次のファイル・ディレクトリのパスでは、`$変数名` または `${変数名}` を起動元の環境変数の値に置き換えます。
+
+| 設定ファイル | 対応項目 |
+| --- | --- |
+| `api.json` | `script`、`sql` の各要素、`paramCheck`（互換名 `paramcheck`・`check` を含む）、`outCheck`（`outcheck` を含む）、public / include の `path`、`runtime.sqlFiles` の各要素 |
+| `config.json` | `certPath`、`keyPath`、`javascript_include` の各要素、`log.Filename`、SQLite / DuckDB の `DBName` |
+
+たとえば起動前に `export APP_DIRECTORY="/opt/myapp"` と設定し、API定義に `"paramCheck": "${APP_DIRECTORY}/checks/permission.js"` と書くと、`/opt/myapp/checks/permission.js` を使います。展開は設定の読み込み時に一度だけ行い、値に含まれる別の `$変数名` を再展開しません。展開後の相対パスは、その項目を書いたJSONファイルのディレクトリを基準にします。
+
+未設定の変数と空の変数は、どちらも空文字列に置き換わります。`paramCheck`・`outCheck`（互換名も同様）は、省略した場合だけチェックなしとして扱います。指定した値が `null`・空文字列・空白のみの場合や、環境変数の展開後に空になる場合は設定エラーです。チェックを使わない場合は項目を削除してください。従来、空文字列・`null`・空の環境変数でチェックを無効化していた設定は修正が必要です。正式名に有効なパスがあっても、併記した互換名に空値があれば拒否します。数値・真偽値・配列・オブジェクトもパスとしては受け付けません。起動時の設定エラーは起動を中止し、ホットリロード時のエラーは直前の正常な設定を維持します。`${APP_DIRECTORY}/checks/permission.js` の変数部分だけが空なら、結果は `/checks/permission.js` であり、パス全体は空になりません。チェック実行時に対象ファイルが存在しなければエラーになります。
+
+JSON全体を置き換える機能ではありません。説明文、パス以外の値、JavaScriptのファイル操作関数に渡す文字列は対象外です。WebSocketの `connectURL` は従来の `"env:変数名"` を使用します。`.env` は自動では読み込みません。起動済みプロセスに外部からの `export` の変更は反映されないため、環境変数の変更には再起動が必要です。
 
 <a id="script-runtime-timeouts"></a>
 
@@ -1282,6 +1301,7 @@ JSON.stringify({
 |---|---|
 | `nyanAllParams` | 実行中のAPIのパラメータです。予約項目 `nyan_request` にはサーバーが取得した元リクエスト情報が入ります。 |
 | `nyanRequest` | JavaScriptから直接参照できる元リクエスト情報です。`nyanAllParams.nyan_request` と同じデータを参照します。 |
+| `nyanGetRequestHeaders()` | 受信ヘッダーを標準表記のキーと文字列の値で取得します。複数値はカンマで結合し、呼出しごとに独立したオブジェクトを返します。 |
 | `nyanAcceptedParamsKeys` | SQLコメントから拾った受け付けパラメータ名です。主にcheckで使います。 |
 | `nyanRunSQL(path, params)` | 一番親の `api.json` のフォルダを基準にSQLファイルを実行します。scriptでは同じトランザクション内で実行されます。 |
 | `nyanGetAPI(url, user, pass)` | 外部APIへGETリクエストを送ります。 |
@@ -1364,6 +1384,10 @@ JSON.stringify(execution);
 以前は非0終了でスクリプトが中断していたため、既存の呼び出しでは戻り値の `success` / `exit_code` を確認してください。非0終了だけではAPIの処理やトランザクションを自動中断しません。結果をそのままAPIの応答にすると、既存のPush判定がトップレベルの `success:false` を検出してPushを停止します。スクリプトが失敗を処理して最終的に `success:true` の応答を返した場合は、その最終応答でPushを判定します。
 
 ### リクエスト情報と内部呼び出し・Push
+
+`nyanGetRequestHeaders()` はNyan8・NyanPUIと同様の取得関数です。例えば `nyanGetRequestHeaders()["Authorization"]` で参照します。キーは `Authorization` / `Content-Type` などの標準表記、値は文字列で、同じヘッダーの複数値は空白を加えずカンマで結合します。未受信のキーは存在しません。Hostはこの関数の対象外で、`nyanRequest.host` を使用します。取得したオブジェクトへの変更は元の情報や次の呼出し結果に影響しません。
+
+通常のチェック・本体、内部呼び出し・Push、HTTP MCPやOAuthの制限付きJavaScriptでも利用でき、追加のcapability指定は不要です。参照元は各実行に引き継がれたリクエスト情報で、WebSocketでは接続時のHTTP情報を使用します。HTTP要求のないstdio・schedule・ws_clientでは `{}` を返します。既存の `nyanRequest.headers` は変更せず、小文字・標準表記のキーと複数値の配列を維持します。
 
 `nyanRequest` は通常HTTP・ルートHTTP・JSON-RPC・publicのチェック・WebSocket・HTTP MCP・OAuthで、サーバーが実際のHTTP要求から生成します。`paramCheck`・本体・`outCheck` から参照できます。外部入力の `nyan_request` はこの情報の代わりに採用しません。WebSocketメッセージでは従来どおり予約名の指定をエラーにし、MCPでは入力スキーマ検証後に利用者の値を除いてから設定します。
 
@@ -1586,7 +1610,7 @@ ws.onmessage = function (event) {
 
 NyanQLのWebSocketサーバでは、先頭の `/` を除いたURLパス全体がチャネル名になります。上の例では、`listItems` がチャネル名です。mount配下の `sub/listItems` をpush先にする場合は、WebSocketも `/sub/listItems` へ接続してください。
 
-通常WebSocketの受入枠は、1プロセス内の全チャネルで既定128件までです。`config.json` の `webSocketLimits.maxConnections` で増減できます。接続済みのクライアントだけでなく、アップグレード前の本文サイズ検証・`paramCheck` の実行中も1枠を使用します。`nyan_mode=checkOnly` の要求もチェック終了まで数えます。満杯の場合は待機せず、`paramCheck` を実行する前にHTTP 503と `too many WebSocket connections` を返します。チェック拒否・アップグレード失敗・接続終了で枠を解放します。チャネル単位の上限ではありません。設定値・再起動要否は [WebSocketの同時接続数上限](#websocket-connection-limits) を参照してください。
+通常WebSocketの受入枠は、1プロセス内の全チャネルで既定128件までです。`config.json` の `websocket.maxConnections` で増減できます。接続済みのクライアントだけでなく、アップグレード前の本文サイズ検証・`paramCheck` の実行中も1枠を使用します。`nyan_mode=checkOnly` の要求もチェック終了まで数えます。満杯の場合は待機せず、`paramCheck` を実行する前にHTTP 503と `too many WebSocket connections` を返します。チェック拒否・アップグレード失敗・接続終了で枠を解放します。チャネル単位の上限ではありません。設定値・再起動要否は [WebSocketの同時接続数上限](#websocket-connection-limits) を参照してください。
 
 この枠はNyanQLが受け付ける接続に適用します。`ws_client` が接続先へ張る外向きの接続は数えません。`ws_client.connectURL` のパスを使ってNyanQLへ接続する購読クライアントは受信接続なので数えます。受信メッセージのバイト上限は、別途 `receiveLimits.webSocketMessageBytes` を使います。
 

@@ -685,7 +685,6 @@ func TestBackgroundCheckSettingsWarnWithoutPreventingRegistration(t *testing.T) 
 				want   []string
 			}{
 				{"none", "", nil},
-				{"empty", `,"paramCheck":"","outCheck":""`, nil},
 				{"input", `,"paramCheck":"missing-input.js"`, []string{"paramCheck"}},
 				{"output", `,"outCheck":"missing-output.js"`, []string{"outCheck"}},
 				{"both", `,"paramCheck":"missing-input.js","outCheck":"missing-output.js"`, []string{"paramCheck", "outCheck"}},
@@ -10844,7 +10843,7 @@ func TestWebSocketEndpointConfiguredUsesCompleteAPIName(t *testing.T) {
 	}
 }
 
-func TestWebSocketLimitsConfiguration(t *testing.T) {
+func TestWebSocketConfiguration(t *testing.T) {
 	maxInt := int(^uint(0) >> 1)
 	for _, tc := range []struct {
 		input string
@@ -10852,20 +10851,20 @@ func TestWebSocketLimitsConfiguration(t *testing.T) {
 		bad   bool
 	}{
 		{`{}`, 128, false},
-		{`{"webSocketLimits":null}`, 128, false},
-		{`{"webSocketLimits":{}}`, 128, false},
-		{`{"webSocketLimits":{"maxConnections":0}}`, 128, false},
-		{`{"webSocketLimits":{"maxConnections":null}}`, 128, false},
-		{`{"webSocketLimits":{"maxConnections":1}}`, 1, false},
-		{`{"webSocketLimits":{"maxConnections":512}}`, 512, false},
-		{fmt.Sprintf(`{"webSocketLimits":{"maxConnections":%d}}`, maxInt), maxInt, false},
-		{`{"webSocketLimits":{"maxConnections":-1}}`, 0, true},
-		{`{"webSocketLimits":{"maxConnections":1.5}}`, 0, true},
-		{`{"webSocketLimits":{"maxConnections":"512"}}`, 0, true},
-		{`{"webSocketLimits":{"maxConnections":true}}`, 0, true},
-		{fmt.Sprintf(`{"webSocketLimits":{"maxConnections":%d}}`, uint64(maxInt)+1), 0, true},
-		{`{"webSocketLimits":[]}`, 0, true},
-		{`{"webSocketLimits":128}`, 0, true},
+		{`{"websocket":null}`, 128, false},
+		{`{"websocket":{}}`, 128, false},
+		{`{"websocket":{"maxConnections":0}}`, 128, false},
+		{`{"websocket":{"maxConnections":null}}`, 128, false},
+		{`{"websocket":{"maxConnections":1}}`, 1, false},
+		{`{"websocket":{"maxConnections":512}}`, 512, false},
+		{fmt.Sprintf(`{"websocket":{"maxConnections":%d}}`, maxInt), maxInt, false},
+		{`{"websocket":{"maxConnections":-1}}`, 0, true},
+		{`{"websocket":{"maxConnections":1.5}}`, 0, true},
+		{`{"websocket":{"maxConnections":"512"}}`, 0, true},
+		{`{"websocket":{"maxConnections":true}}`, 0, true},
+		{fmt.Sprintf(`{"websocket":{"maxConnections":%d}}`, uint64(maxInt)+1), 0, true},
+		{`{"websocket":[]}`, 0, true},
+		{`{"websocket":128}`, 0, true},
 	} {
 		t.Run(tc.input, func(t *testing.T) {
 			var cfg Config
@@ -10879,11 +10878,11 @@ func TestWebSocketLimitsConfiguration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := cfg.WebSocketLimits.connectionLimit(); got != tc.want {
+			if got := cfg.WebSocket.connectionLimit(); got != tc.want {
 				t.Fatalf("limit=%d want %d", got, tc.want)
 			}
 			// Even the maximum accepted integer must be usable at startup.
-			slots := make(chan struct{}, cfg.WebSocketLimits.connectionLimit())
+			slots := make(chan struct{}, cfg.WebSocket.connectionLimit())
 			slots <- struct{}{}
 			<-slots
 		})
@@ -10897,7 +10896,7 @@ func setTestWebSocketConnectionLimit(t *testing.T, input string) {
 		t.Fatal(err)
 	}
 	old := websocketConnectionSlots
-	websocketConnectionSlots = make(chan struct{}, cfg.WebSocketLimits.connectionLimit())
+	websocketConnectionSlots = make(chan struct{}, cfg.WebSocket.connectionLimit())
 	t.Cleanup(func() { websocketConnectionSlots = old })
 }
 
@@ -10920,8 +10919,8 @@ func TestWebSocketConnectionLimitPendingHandshakes(t *testing.T) {
 		limit       int
 	}{
 		{"default", `{}`, 128},
-		{"lowered", `{"webSocketLimits":{"maxConnections":2}}`, 2},
-		{"raised", `{"webSocketLimits":{"maxConnections":129}}`, 129},
+		{"lowered", `{"websocket":{"maxConnections":2}}`, 2},
+		{"raised", `{"websocket":{"maxConnections":129}}`, 129},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setTestWebSocketConnectionLimit(t, tc.input)
@@ -10983,7 +10982,7 @@ func TestWebSocketConnectionLimitPendingHandshakes(t *testing.T) {
 }
 
 func TestWebSocketConnectionLimitEstablishedConnections(t *testing.T) {
-	setTestWebSocketConnectionLimit(t, `{"webSocketLimits":{"maxConnections":1}}`)
+	setTestWebSocketConnectionLimit(t, `{"websocket":{"maxConnections":1}}`)
 	resetJavascriptInclude(t)
 	deny := writeTestScript(t, `({success:false,status:403});`)
 	setTestSQLFiles(t, map[string]APIConfig{"first": {}, "second": {}, "denied": {ParamCheck: deny}})
@@ -11269,9 +11268,10 @@ func TestRequestContextHTTPInternalCallsAndPush(t *testing.T) {
 			oldHub := hub
 			hub = NewHub()
 			t.Cleanup(func() { hub = oldHub })
+			headerCheck := `if (nyanGetRequestHeaders()["User-Agent"] !== "context-test") throw new Error("header context lost");`
 			dir := t.TempDir()
 			pushScript := func(name string) string {
-				return writeTestScript(t, fmt.Sprintf(`
+				return writeTestScript(t, headerCheck+fmt.Sprintf(`
 if (nyanAllParams.onlyInResult !== undefined || nyanAllParams.nyan_output !== undefined) throw new Error("result leaked into Push arguments");
 nyanSaveFile(nyanBase64Encode(JSON.stringify({params:nyanAllParams,request:nyanRequest})), %q);
 nyanRequest.pushMutation = true;
@@ -11279,22 +11279,22 @@ nyanRequest.pushMutation = true;
 			}
 			setTestSQLFiles(t, map[string]APIConfig{
 				"parent": {
-					ParamCheck: writeTestScript(t, `
+					ParamCheck: writeTestScript(t, headerCheck+`
 if (nyanRequest.remoteIP !== "2001:db8::1") throw new Error("spoofed request");
 nyanRequest.checkMarker = true;
 if (nyanAllParams.nyan_request.checkMarker !== true) throw new Error("alias missing");
 nyanAllParams.checked = true;
 ({success:true,status:200});`),
-					Script: writeTestScript(t, `
+					Script: writeTestScript(t, headerCheck+`
 const args = {api:"child", id:2, nyan_request:{remoteIP:"forged"}};
 const child = nyanCallMe(args);
 if (args.nyan_request.remoteIP !== "forged") throw new Error("caller arguments mutated");
 if (!nyanAllParams.checked || !nyanRequest.checkMarker || nyanRequest.pushMutation) throw new Error("context changed");
 ({success:true,child:child,request:nyanRequest,onlyInResult:true});`),
-					OutCheck: writeTestScript(t, `if (!nyanRequest.checkMarker) throw new Error("outCheck lost context"); ({success:true,status:200});`),
+					OutCheck: writeTestScript(t, headerCheck+`if (!nyanRequest.checkMarker) throw new Error("outCheck lost context"); ({success:true,status:200});`),
 					Push:     "parentEvents",
 				},
-				"child": {Script: writeTestScript(t, `
+				"child": {Script: writeTestScript(t, headerCheck+`
 if (nyanAllParams.parentOnly !== undefined || nyanAllParams.checked !== undefined) throw new Error("implicit business arguments");
 if (nyanAllParams.id !== 2 || !nyanRequest.checkMarker) throw new Error("child input changed");
 ({request:nyanRequest,id:nyanAllParams.id});`), Push: "childEvents"},
@@ -11465,6 +11465,7 @@ func TestRequestContextOAuthAndTokenVerification(t *testing.T) {
 			resetJavascriptInclude(t)
 			setTestSQLiteDB(t)
 			validate := `
+if (nyanGetRequestHeaders()["User-Agent"] !== "context-test") throw new Error("OAuth header context lost");
 if (nyanRequest.remoteIP !== "2001:db8::1" || nyanRequest.cookies.session !== "real-cookie" ||
     nyanRequest.headers["user-agent"] !== "context-test" || nyanAllParams.nyan_request.path !== nyanRequest.path) {
   throw new Error("OAuth lost actual request context");
@@ -14688,5 +14689,410 @@ func TestRegressionWSClientReplyWhitespace(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("WebSocket cleanup timed out")
+	}
+}
+
+func TestConfigurationEnvironmentPaths(t *testing.T) {
+	dir := t.TempDir()
+	assets := filepath.Join(t.TempDir(), "assets with spaces")
+	t.Setenv("NYAN_TEST_ASSETS", assets)
+	t.Setenv("NYAN_TEST_CHILD", "sub/api.json")
+	t.Setenv("NYAN_TEST_CHECK", "checks/input.js")
+	t.Setenv("NYAN_TEST_LITERAL", "${NYAN_TEST_SECOND}.js")
+	t.Setenv("NYAN_TEST_SECOND", "must-not-expand")
+	rootPath := filepath.Join(dir, "api.json")
+	writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"$NYAN_TEST_CHILD"}}`)
+	writeTestFile(t, filepath.Join(dir, "sub", "api.json"), `{
+		"sqlAPI":{"sql":["${NYAN_TEST_ASSETS}/query.sql"]},
+		"item":{"script":"${NYAN_TEST_ASSETS}/main.js","paramCheck":"$NYAN_TEST_CHECK","outCheck":"${NYAN_TEST_ASSETS}/out.js","description":"${NYAN_TEST_ASSETS}","runtime":{"capabilities":["sql"],"sqlFiles":["${NYAN_TEST_ASSETS}/allowed.sql"]}},
+		"literal":{"script":"${NYAN_TEST_LITERAL}"},
+		"public":{"type":"public","path":"${NYAN_TEST_ASSETS}/public"}
+	}`)
+	loaded, err := loadAPIConfigFile(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definitions := loaded.Snapshot.Definitions
+	item := definitions["sub/item"]
+	paths := map[string][2]string{
+		"script":     {item.Script, filepath.Join(assets, "main.js")},
+		"paramCheck": {item.ParamCheck, filepath.Join(dir, "sub", "checks", "input.js")},
+		"outCheck":   {item.OutCheck, filepath.Join(assets, "out.js")},
+		"public":     {definitions["sub/public"].Path, filepath.Join(assets, "public")},
+		"literal":    {definitions["sub/literal"].Script, filepath.Join(dir, "sub", "${NYAN_TEST_SECOND}.js")},
+	}
+	paths["sql"] = [2]string{definitions["sub/sqlAPI"].SQL[0], filepath.Join(assets, "query.sql")}
+	paths["runtime.sqlFiles"] = [2]string{item.Runtime.SQLFiles[0], filepath.Join(assets, "allowed.sql")}
+	for name, pair := range paths {
+		if pair[0] != pair[1] {
+			t.Errorf("%s = %q, want %q", name, pair[0], pair[1])
+		}
+	}
+	if item.Description != "${NYAN_TEST_ASSETS}" {
+		t.Fatal("non-path setting was expanded")
+	}
+}
+
+func TestConfigurationEnvironmentConfigPaths(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("NYAN_TEST_CONFIG_DIR", "files")
+	var cfg Config
+	if err := json.Unmarshal([]byte(`{
+		"certPath":"${NYAN_TEST_CONFIG_DIR}/cert.pem",
+		"keyPath":"$NYAN_TEST_CONFIG_DIR/key.pem",
+		"javascript_include":["${NYAN_TEST_CONFIG_DIR}/common.js"],
+		"log":{"Filename":"${NYAN_TEST_CONFIG_DIR}/service.log"},
+		"DBType":"sqlite","DBName":"${NYAN_TEST_CONFIG_DIR}/data.sqlite",
+		"name":"${NYAN_TEST_CONFIG_DIR}"
+	}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	adjustPaths(dir, &cfg)
+	paths := map[string][2]string{
+		"cert":     {cfg.CertPath, filepath.Join(dir, "files", "cert.pem")},
+		"key":      {cfg.KeyPath, filepath.Join(dir, "files", "key.pem")},
+		"include":  {cfg.JavascriptInclude[0], filepath.Join(dir, "files", "common.js")},
+		"log":      {cfg.Log.Filename, filepath.Join(dir, "files", "service.log")},
+		"database": {cfg.DBName, filepath.Join(dir, "files", "data.sqlite")},
+	}
+	for name, pair := range paths {
+		if pair[0] != pair[1] {
+			t.Errorf("%s = %q, want %q", name, pair[0], pair[1])
+		}
+	}
+	if cfg.Name != "${NYAN_TEST_CONFIG_DIR}" {
+		t.Fatal("non-path setting was expanded")
+	}
+}
+
+func TestConfigurationEnvironmentRejectsBlankChecks(t *testing.T) {
+	for _, field := range []string{"paramCheck", "paramcheck", "check", "outCheck", "outcheck"} {
+		for _, value := range []string{`""`, `"  "`, `null`, `false`, `0`, `[]`, `{}`, `"${NYAN_TEST_EMPTY_CHECK}"`, `"$NYAN_TEST_EMPTY_CHECK"`} {
+			for _, unset := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/unset=%t", field, value, unset), func(t *testing.T) {
+					t.Setenv("NYAN_TEST_EMPTY_CHECK", "")
+					if unset {
+						if err := os.Unsetenv("NYAN_TEST_EMPTY_CHECK"); err != nil {
+							t.Fatal(err)
+						}
+					}
+					dir := t.TempDir()
+					rootPath := filepath.Join(dir, "api.json")
+					writeTestFile(t, rootPath, `{"sub":{"type":"include","path":"child.json"}}`)
+					writeTestFile(t, filepath.Join(dir, "child.json"), `{"item":{"script":"main.js","`+field+`":`+value+`}}`)
+					if _, err := loadAPIConfigFile(rootPath); err == nil || !strings.Contains(err.Error(), field) {
+						t.Fatalf("invalid check accepted or error lost field: %v", err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestConfigurationEnvironmentParamCheckHTTP(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	dir := t.TempDir()
+	check := filepath.Join(dir, "input.js")
+	writeTestFile(t, check, `({success:false,status:403,result:{message:"env-check"}});`)
+	t.Setenv("NYAN_TEST_HTTP_CHECK", check)
+	rootPath := filepath.Join(dir, "api.json")
+	writeTestFile(t, rootPath, `{"item":{"script":"missing-body.js","paramCheck":"${NYAN_TEST_HTTP_CHECK}"}}`)
+	loaded, err := loadAPIConfigFile(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setTestAPISnapshot(t, loaded.Snapshot)
+	request := httptest.NewRequest(http.MethodGet, "/item", nil)
+	response := httptest.NewRecorder()
+	handleRequest(response, request)
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "env-check") {
+		t.Fatalf("check did not run: HTTP %d %s", response.Code, response.Body.String())
+	}
+	if err := os.Remove(check); err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	handleRequest(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("missing check did not fail: HTTP %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestConfigurationEnvironmentParamCheckReload(t *testing.T) {
+	t.Setenv("NYAN_TEST_EMPTY_CHECK", "")
+	dir := t.TempDir()
+	rootPath := filepath.Join(dir, "api.json")
+	writeTestFile(t, rootPath, `{"item":{"description":"active"}}`)
+	initial, err := loadAPIConfigFile(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setTestAPISnapshot(t, initial.Snapshot)
+	writeTestFile(t, rootPath, `{"item":{"paramCheck":"${NYAN_TEST_EMPTY_CHECK}"}}`)
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, initial.Snapshot.Files)
+	if err == nil || reloaded || currentAPISnapshot() != initial.Snapshot {
+		t.Fatalf("invalid check replaced active snapshot: reload=%t err=%v", reloaded, err)
+	}
+	writeTestFile(t, rootPath, `{"item":{"paramCheck":"check.js"}}`)
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(rootPath, observed)
+	if err != nil || !reloaded {
+		t.Fatalf("recovery failed: reload=%t err=%v", reloaded, err)
+	}
+}
+
+func TestConfigurationEnvironmentOutCheckHTTP(t *testing.T) {
+	resetJavascriptInclude(t)
+	setTestSQLiteDB(t)
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "body.js"), `({status:200,body:"body-result",result:"body-result"});`)
+	check := filepath.Join(dir, "output.js")
+	writeTestFile(t, check, `({success:false,status:403,result:{message:"env-check"}});`)
+	t.Setenv("NYAN_TEST_HTTP_CHECK", check)
+	rootPath := filepath.Join(dir, "api.json")
+	writeTestFile(t, rootPath, `{"item":{"script":"body.js","outCheck":"${NYAN_TEST_HTTP_CHECK}"}}`)
+	loaded, err := loadAPIConfigFile(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setTestAPISnapshot(t, loaded.Snapshot)
+	request := httptest.NewRequest(http.MethodGet, "/item", nil)
+	response := httptest.NewRecorder()
+	handleRequest(response, request)
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "env-check") {
+		t.Fatalf("check did not run: HTTP %d %s", response.Code, response.Body.String())
+	}
+	if err := os.Remove(check); err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	handleRequest(response, request)
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("missing check did not fail: HTTP %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestConfigurationEnvironmentOutCheckReload(t *testing.T) {
+	t.Setenv("NYAN_TEST_EMPTY_CHECK", "")
+	dir := t.TempDir()
+	rootPath := filepath.Join(dir, "api.json")
+	writeTestFile(t, rootPath, `{"item":{"description":"active"}}`)
+	initial, err := loadAPIConfigFile(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setTestAPISnapshot(t, initial.Snapshot)
+	writeTestFile(t, rootPath, `{"item":{"outCheck":"${NYAN_TEST_EMPTY_CHECK}"}}`)
+	observed, reloaded, err := reloadAPIConfigGraphIfChanged(rootPath, initial.Snapshot.Files)
+	if err == nil || reloaded || currentAPISnapshot() != initial.Snapshot {
+		t.Fatalf("invalid check replaced active snapshot: reload=%t err=%v", reloaded, err)
+	}
+	writeTestFile(t, rootPath, `{"item":{"outCheck":"check.js"}}`)
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(rootPath, observed)
+	if err != nil || !reloaded {
+		t.Fatalf("recovery failed: reload=%t err=%v", reloaded, err)
+	}
+}
+
+func TestConfigurationCheckPathCompatibility(t *testing.T) {
+	t.Setenv("NYAN_TEST_RELATIVE_CHECK", "checks/permission.js")
+	t.Setenv("NYAN_TEST_EMPTY_PREFIX", "")
+	for _, field := range []string{"paramCheck", "paramcheck", "check", "outCheck", "outcheck"} {
+		t.Run(field, func(t *testing.T) {
+			dir := t.TempDir()
+			rootPath := filepath.Join(dir, "api.json")
+			for _, value := range []string{"checks/permission.js", "${NYAN_TEST_RELATIVE_CHECK}", "${NYAN_TEST_EMPTY_PREFIX}/checks/permission.js"} {
+				writeTestFile(t, rootPath, `{"item":{"script":"body.js","`+field+`":`+fmt.Sprintf("%q", value)+`}}`)
+				loaded, err := loadAPIConfigFile(rootPath)
+				if err != nil {
+					t.Fatalf("valid check rejected: %v", err)
+				}
+				entry := loaded.Snapshot.Definitions["item"]
+				got := entry.ParamCheck
+				if field == "outCheck" || field == "outcheck" {
+					got = entry.OutCheck
+				}
+				want := filepath.Join(dir, "checks", "permission.js")
+				if strings.Contains(value, "EMPTY_PREFIX") {
+					want = filepath.FromSlash("/checks/permission.js")
+					if !filepath.IsAbs(want) {
+						want = filepath.Join(dir, want)
+					}
+				}
+				if got != want {
+					t.Fatalf("check path=%q want=%q", got, want)
+				}
+			}
+			// Omission is the supported way to disable either check.
+			writeTestFile(t, rootPath, `{"item":{"script":"body.js"}}`)
+			if _, err := loadAPIConfigFile(rootPath); err != nil {
+				t.Fatalf("omitted checks rejected: %v", err)
+			}
+		})
+	}
+	for _, definition := range []string{
+		`{"paramCheck":"good.js","paramcheck":""}`,
+		`{"paramCheck":"good.js","check":null}`,
+		`{"outCheck":"good.js","outcheck":"${NYAN_TEST_EMPTY_PREFIX}"}`,
+	} {
+		dir := t.TempDir()
+		rootPath := filepath.Join(dir, "api.json")
+		writeTestFile(t, rootPath, `{"item":`+definition+`}`)
+		if _, err := loadAPIConfigFile(rootPath); err == nil {
+			t.Fatal("empty alias was hidden by a valid primary field")
+		}
+	}
+}
+
+func TestTLSPathConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"cert.pem", "key.pem"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("existence check fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("NYAN_TEST_TLS_CERT", "cert.pem")
+	t.Setenv("NYAN_TEST_TLS_KEY", "key.pem")
+	t.Setenv("NYAN_TEST_TLS_BLANK", "")
+	t.Setenv("NYAN_TEST_TLS_UNSET", "")
+	if err := os.Unsetenv("NYAN_TEST_TLS_UNSET"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, config       string
+		wantTLS, wantError bool
+	}{
+		{"omitted", `{}`, false, false},
+		{"empty", `{"certPath":"","keyPath":""}`, false, false},
+		{"null", `{"certPath":null,"keyPath":null}`, false, false},
+		{"empty environment", `{"certPath":"${NYAN_TEST_TLS_BLANK}","keyPath":"$NYAN_TEST_TLS_BLANK"}`, false, false},
+		{"unset environment", `{"certPath":"${NYAN_TEST_TLS_UNSET}","keyPath":"$NYAN_TEST_TLS_UNSET"}`, false, false},
+		{"relative pair", `{"certPath":"cert.pem","keyPath":"key.pem"}`, true, false},
+		{"environment pair", `{"certPath":"${NYAN_TEST_TLS_CERT}","keyPath":"$NYAN_TEST_TLS_KEY"}`, true, false},
+		{"cert only", `{"certPath":"cert.pem"}`, false, true},
+		{"key only", `{"keyPath":"key.pem"}`, false, true},
+		{"empty key", `{"certPath":"cert.pem","keyPath":""}`, false, true},
+		{"empty cert", `{"certPath":"","keyPath":"key.pem"}`, false, true},
+		{"environment key empty", `{"certPath":"${NYAN_TEST_TLS_CERT}","keyPath":"${NYAN_TEST_TLS_UNSET}"}`, false, true},
+		{"environment cert empty", `{"certPath":"${NYAN_TEST_TLS_UNSET}","keyPath":"${NYAN_TEST_TLS_KEY}"}`, false, true},
+		{"missing cert", `{"certPath":"missing.pem","keyPath":"key.pem"}`, false, true},
+		{"missing key", `{"certPath":"cert.pem","keyPath":"missing.pem"}`, false, true},
+		{"both missing", `{"certPath":"missing-cert.pem","keyPath":"missing-key.pem"}`, false, true},
+		{"directory", `{"certPath":".","keyPath":"key.pem"}`, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg Config
+			if err := json.Unmarshal([]byte(tc.config), &cfg); err != nil {
+				t.Fatal(err)
+			}
+			adjustPaths(dir, &cfg)
+			err := validateTLSPaths(cfg.CertPath, cfg.KeyPath)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("error=%v wantError=%t", err, tc.wantError)
+			}
+			if err == nil && (cfg.CertPath != "" && cfg.KeyPath != "") != tc.wantTLS {
+				t.Fatal("wrong HTTP/HTTPS selection")
+			}
+		})
+	}
+}
+
+// Run main in a subprocess so a fatal configuration error cannot end the test runner.
+func TestTLSStartupCommandHelper(t *testing.T) {
+	if os.Getenv("NYAN_TLS_STARTUP_HELPER") != "1" {
+		return
+	}
+	for i, arg := range os.Args {
+		if arg == "--" {
+			os.Args = append([]string{os.Args[0]}, os.Args[i+1:]...)
+			main()
+			os.Exit(0)
+		}
+	}
+	os.Exit(2)
+}
+
+func TestTLSInvalidPathsStopStartup(t *testing.T) {
+	for _, fields := range []string{
+		`"certPath":"cert.pem"`,
+		`"keyPath":"key.pem"`,
+		`"certPath":"cert.pem","keyPath":"${NYAN_TEST_TLS_STARTUP_EMPTY}"`,
+		`"certPath":"missing.pem","keyPath":"key.pem"`,
+		`"certPath":"cert.pem","keyPath":"missing.pem"`,
+	} {
+		t.Run(fields, func(t *testing.T) {
+			t.Setenv("NYAN_TEST_TLS_STARTUP_EMPTY", "")
+			dir := t.TempDir()
+			configPath, apiPath := filepath.Join(dir, "config.json"), filepath.Join(dir, "api.json")
+			for name, body := range map[string]string{
+				"cert.pem": "existence check fixture", "key.pem": "existence check fixture",
+				"api.json": `{}`, "config.json": `{"Port":8080,"log":{"EnableLogging":false},` + fields + `}`,
+			} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestTLSStartupCommandHelper$", "--", "--config", configPath, "--api", apiPath)
+			cmd.Env = append(os.Environ(), "NYAN_TLS_STARTUP_HELPER=1")
+			output, err := cmd.CombinedOutput()
+			if err == nil || ctx.Err() != nil || !strings.Contains(string(output), "tls_config_invalid") {
+				t.Fatalf("startup did not reject invalid TLS: err=%v output=%s", err, output)
+			}
+			if strings.Contains(string(output), "http_server_starting") || strings.Contains(string(output), "api_config_loaded") {
+				t.Fatalf("runtime started before TLS validation: %s", output)
+			}
+		})
+	}
+}
+
+func TestNyanGetRequestHeaders(t *testing.T) {
+	for _, cloned := range []bool{false, true} {
+		for _, restricted := range []bool{false, true} {
+			t.Run(fmt.Sprintf("cloned=%t/restricted=%t", cloned, restricted), func(t *testing.T) {
+				r := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
+				r.Header.Set("Authorization", "Bearer example")
+				r.Header.Add("X-Values", "first")
+				r.Header.Add("X-Values", "second,third")
+				r.Header.Set("X-Empty", "")
+				request := newScriptHTTPRequestContext(r, nil)
+				if cloned {
+					request = cloneJSONCompatibleValue(request).(map[string]interface{})
+				}
+				before, _ := json.Marshal(request)
+				vm := goja.New()
+				registerNyanFuncs(vm, nil, map[string]interface{}{"nyan_request": request}, nil)
+				if restricted {
+					restrictNyanRuntimeCapabilities(vm, nil)
+				}
+				_, err := vm.RunString(`
+const first = nyanGetRequestHeaders();
+if (first.Authorization !== "Bearer example" || first["X-Values"] !== "first,second,third" || first["X-Empty"] !== "") throw new Error("incorrect headers");
+if (Object.keys(first).length !== 3 || "authorization" in first || "Host" in first) throw new Error("extra headers");
+first.Authorization = "changed";
+delete first["X-Values"];
+first.Injected = "value";
+const second = nyanGetRequestHeaders();
+if (second === first || second.Authorization !== "Bearer example" || second["X-Values"] !== "first,second,third" || "Injected" in second) throw new Error("copies not independent");
+if (nyanRequest.headers.authorization !== "Bearer example" || !Array.isArray(nyanRequest.headers["X-Values"]) || nyanRequest.headers["X-Values"].length !== 2) throw new Error("original headers changed");
+`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				after, _ := json.Marshal(request)
+				if string(before) != string(after) {
+					t.Fatal("request context changed")
+				}
+			})
+		}
+	}
+	for _, request := range []map[string]interface{}{nil, newScriptHTTPRequestContext(httptest.NewRequest(http.MethodGet, "/", nil), nil)} {
+		vm := goja.New()
+		registerNyanFuncs(vm, nil, map[string]interface{}{"nyan_request": request}, nil)
+		value, err := vm.RunString(`const headers = nyanGetRequestHeaders(); headers.Test = "changed"; JSON.stringify(nyanGetRequestHeaders());`)
+		if err != nil || value.String() != "{}" {
+			t.Fatalf("empty headers: value=%v err=%v", value, err)
+		}
 	}
 }

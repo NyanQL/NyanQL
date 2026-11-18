@@ -1,6 +1,6 @@
 module NyanQL
 
-go 1.26.9
+go 1.27.4
 
 require (
 	github.com/dop251/goja v0.0.0-20261031103838-cf2ff0ec0b31

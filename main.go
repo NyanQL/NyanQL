@@ -136,26 +136,26 @@ func (limits ReceiveLimitsConfig) webSocketMessageBytes() int64 {
 	return defaultReceiveBytes
 }
 
-// WebSocketLimitsConfig bounds incoming connections across all channels.
+// WebSocketConfig bounds incoming connections across all channels.
 // Zero preserves the existing limit; negative values are configuration errors.
-type WebSocketLimitsConfig struct {
+type WebSocketConfig struct {
 	MaxConnections int `json:"maxConnections"`
 }
 
-func (limits *WebSocketLimitsConfig) UnmarshalJSON(data []byte) error {
-	type plain WebSocketLimitsConfig
+func (limits *WebSocketConfig) UnmarshalJSON(data []byte) error {
+	type plain WebSocketConfig
 	var decoded plain
 	if err := json.Unmarshal(data, &decoded); err != nil {
-		return fmt.Errorf("webSocketLimits: %w", err)
+		return fmt.Errorf("websocket: %w", err)
 	}
 	if decoded.MaxConnections < 0 {
-		return fmt.Errorf("webSocketLimits.maxConnections must be a non-negative integer")
+		return fmt.Errorf("websocket.maxConnections must be a non-negative integer")
 	}
-	*limits = WebSocketLimitsConfig(decoded)
+	*limits = WebSocketConfig(decoded)
 	return nil
 }
 
-func (limits WebSocketLimitsConfig) connectionLimit() int {
+func (limits WebSocketConfig) connectionLimit() int {
 	if limits.MaxConnections > 0 {
 		return limits.MaxConnections
 	}
@@ -419,7 +419,7 @@ func (limits SQLResultLimitsConfig) byteLimit() int {
 type Config struct {
 	HTTPTimeouts           HTTPTimeoutsConfig    `json:"httpTimeouts"`
 	ReceiveLimits          ReceiveLimitsConfig   `json:"receiveLimits"`
-	WebSocketLimits        WebSocketLimitsConfig `json:"webSocketLimits"`
+	WebSocket              WebSocketConfig       `json:"websocket"`
 	MCPOAuthRuntime        MCPOAuthRuntimeConfig `json:"oauthRuntime"`
 	ScheduleRuntime        ScheduleRuntimeConfig `json:"scheduleRuntime"`
 	SQLResultLimits        SQLResultLimitsConfig `json:"sqlResultLimits"`
@@ -549,6 +549,9 @@ type TriggerConfig struct {
 }
 
 func (apiConfig *APIConfig) UnmarshalJSON(data []byte) error {
+	if err := validateCheckPaths(data); err != nil {
+		return err
+	}
 	type apiConfigJSON struct {
 		SQL                        []string                 `json:"sql,omitempty"`
 		Script                     string                   `json:"script,omitempty"`
@@ -905,7 +908,7 @@ func main() {
 		fatalServiceError("config_decode_failed", err, "file", paths.Config.Path)
 	}
 	// config.json is loaded once, before any connections can acquire a slot.
-	websocketConnectionSlots = make(chan struct{}, config.WebSocketLimits.connectionLimit())
+	websocketConnectionSlots = make(chan struct{}, config.WebSocket.connectionLimit())
 	apiHotReloadInterval, err := parseAPIHotReloadInterval(config.APIHotReload.Interval)
 	if err != nil {
 		fatalServiceError("Invalid APIHotReload.Interval: expected a positive duration", err)
@@ -914,6 +917,11 @@ func main() {
 	adjustPaths(configBaseDir, &config)
 	if err := setupLogger(configBaseDir); err != nil {
 		fatalServiceError("Invalid log.Level: expected debug, info, warn, or error", err)
+	}
+	if paths.MCPServer == "" {
+		if err := validateTLSPaths(config.CertPath, config.KeyPath); err != nil {
+			fatalServiceError("tls_config_invalid", err)
+		}
 	}
 	if err := config.prepareJavascriptIncludes(); err != nil {
 		fatalServiceError("javascript_include_load_failed", err)
@@ -3435,13 +3443,11 @@ func decodeAPIConfigDefinition(apiKey string, rawDefinition json.RawMessage, api
 		return APIConfig{}, fmt.Errorf("configuration error for API %q: if script is set, sql cannot be specified", apiKey)
 	}
 	for i, sqlPath := range apiConfig.SQL {
-		if !filepath.IsAbs(sqlPath) {
-			apiConfig.SQL[i] = filepath.Join(apiBaseDir, sqlPath)
-		}
+		apiConfig.SQL[i] = resolveConfigPathFromBase(apiBaseDir, sqlPath)
 	}
-	apiConfig.Script = resolvePathFromBase(apiBaseDir, apiConfig.Script)
-	apiConfig.ParamCheck = resolvePathFromBase(apiBaseDir, apiConfig.ParamCheck)
-	apiConfig.OutCheck = resolvePathFromBase(apiBaseDir, apiConfig.OutCheck)
+	apiConfig.Script = resolveConfigPathFromBase(apiBaseDir, apiConfig.Script)
+	apiConfig.ParamCheck = resolveConfigPathFromBase(apiBaseDir, apiConfig.ParamCheck)
+	apiConfig.OutCheck = resolveConfigPathFromBase(apiBaseDir, apiConfig.OutCheck)
 	apiConfig.Transport = strings.TrimSpace(apiConfig.Transport)
 	apiConfig.Resource = strings.TrimSpace(apiConfig.Resource)
 	apiConfig.Title = strings.TrimSpace(apiConfig.Title)
@@ -3480,7 +3486,7 @@ func decodeAPIConfigDefinition(apiKey string, rawDefinition json.RawMessage, api
 		apiConfig.Runtime.Capabilities[i] = strings.TrimSpace(apiConfig.Runtime.Capabilities[i])
 	}
 	for i := range apiConfig.Runtime.SQLFiles {
-		apiConfig.Runtime.SQLFiles[i] = resolvePathFromBase(apiBaseDir, strings.TrimSpace(apiConfig.Runtime.SQLFiles[i]))
+		apiConfig.Runtime.SQLFiles[i] = resolveConfigPathFromBase(apiBaseDir, strings.TrimSpace(apiConfig.Runtime.SQLFiles[i]))
 	}
 	for toolIndex := range apiConfig.Tools {
 		tool := &apiConfig.Tools[toolIndex]
@@ -3495,9 +3501,7 @@ func decodeAPIConfigDefinition(apiKey string, rawDefinition json.RawMessage, api
 			}
 		}
 	}
-	if apiConfig.Path != "" && !filepath.IsAbs(apiConfig.Path) {
-		apiConfig.Path = filepath.Join(apiBaseDir, apiConfig.Path)
-	}
+	apiConfig.Path = resolveConfigPathFromBase(apiBaseDir, apiConfig.Path)
 	return apiConfig, nil
 }
 
@@ -4178,6 +4182,7 @@ func decodeIncludeDefinition(mountName string, rawDefinition json.RawMessage) (i
 	if strings.TrimSpace(include.Type) != apiTypeInclude {
 		return includeDefinition{}, fmt.Errorf("include %q: type must be %q", mountName, apiTypeInclude)
 	}
+	include.Path = os.ExpandEnv(include.Path)
 	if strings.TrimSpace(include.Path) == "" {
 		return includeDefinition{}, fmt.Errorf("include %q: path is empty", mountName)
 	}
@@ -4713,6 +4718,34 @@ func watchAPIFile(apiFilePath string, interval time.Duration, initialFiles map[s
 			serviceLog(slog.LevelInfo, "api_hot_reload_completed", "api_count", len(currentSQLFiles()))
 		}
 	}
+}
+
+// Expand only configuration filesystem paths, once, before resolving their base.
+// Runtime filenames and non-path settings are not environment templates.
+func resolveConfigPathFromBase(baseDir, pathValue string) string {
+	return resolvePathFromBase(baseDir, os.ExpandEnv(pathValue))
+}
+
+// An explicitly configured check must not silently become an absent check.
+func validateCheckPaths(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, name := range []string{"paramCheck", "paramcheck", "check", "outCheck", "outcheck"} {
+		raw, exists := fields[name]
+		if !exists {
+			continue
+		}
+		var path string
+		if err := json.Unmarshal(raw, &path); err != nil {
+			return fmt.Errorf("%s must be a non-empty file path: %w", name, err)
+		}
+		if strings.TrimSpace(os.ExpandEnv(path)) == "" {
+			return fmt.Errorf("%s must be a non-empty file path after environment expansion; omit it to disable the check", name)
+		}
+	}
+	return nil
 }
 
 func resolvePathFromBase(baseDir, pathValue string) string {
@@ -8963,19 +8996,36 @@ func nyanHostExecWrapper(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	return vm.ToValue(out)
 }
 
+// Both empty paths select HTTP. HTTPS requires both files before startup.
+func validateTLSPaths(certPath, keyPath string) error {
+	if certPath == "" && keyPath == "" {
+		return nil
+	}
+	if certPath == "" || keyPath == "" {
+		return fmt.Errorf("certPath and keyPath must both be configured or both be empty")
+	}
+	for _, field := range []struct{ name, path string }{{"certPath", certPath}, {"keyPath", keyPath}} {
+		info, err := os.Stat(field.path)
+		if err != nil {
+			return fmt.Errorf("invalid %s: %w", field.name, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%s must refer to a regular file", field.name)
+		}
+	}
+	return nil
+}
+
 func adjustPaths(configBaseDir string, config *Config) {
-	if config.CertPath != "" && !filepath.IsAbs(config.CertPath) {
-		config.CertPath = filepath.Join(configBaseDir, config.CertPath)
-	}
-	if config.KeyPath != "" && !filepath.IsAbs(config.KeyPath) {
-		config.KeyPath = filepath.Join(configBaseDir, config.KeyPath)
-	}
+	config.CertPath = resolveConfigPathFromBase(configBaseDir, config.CertPath)
+	config.KeyPath = resolveConfigPathFromBase(configBaseDir, config.KeyPath)
+	config.Log.Filename = resolveConfigPathFromBase(configBaseDir, config.Log.Filename)
 	// sqlite と duckdb の場合、DBName が相対パスなら絶対パスに変換
-	if (config.DatabaseType == "sqlite" || config.DatabaseType == "duckdb") && config.DBName != "" && !filepath.IsAbs(config.DBName) {
-		config.DBName = filepath.Join(configBaseDir, config.DBName)
+	if config.DatabaseType == "sqlite" || config.DatabaseType == "duckdb" {
+		config.DBName = resolveConfigPathFromBase(configBaseDir, config.DBName)
 	}
 	for i, includePath := range config.JavascriptInclude {
-		config.JavascriptInclude[i] = resolvePathFromBase(configBaseDir, includePath)
+		config.JavascriptInclude[i] = resolveConfigPathFromBase(configBaseDir, includePath)
 	}
 }
 
@@ -9711,6 +9761,35 @@ func registerNyanFuncsInExecution(vm *goja.Runtime, snapshot *APIConfigSnapshot,
 	}
 	vm.Set("nyanAcceptedParamsKeys", acceptedParamsKeys)
 	vm.Set("nyanRequest", requestContext)
+	// Return a fresh string-valued map, matching Nyan8/NyanPUI. The existing
+	// nyanRequest.headers keeps its aliases and multi-value arrays.
+	vm.Set("nyanGetRequestHeaders", func() map[string]string {
+		result := make(map[string]string)
+		headers, _ := requestContext["headers"].(map[string]interface{})
+		for name, value := range headers {
+			canonical := http.CanonicalHeaderKey(name)
+			if name != canonical {
+				if _, exists := headers[canonical]; exists {
+					continue
+				}
+			}
+			switch values := value.(type) {
+			case string:
+				result[canonical] = values
+			case []string:
+				result[canonical] = strings.Join(values, ",")
+			case []interface{}:
+				items := make([]string, 0, len(values))
+				for _, item := range values {
+					if text, ok := item.(string); ok {
+						items = append(items, text)
+					}
+				}
+				result[canonical] = strings.Join(items, ",")
+			}
+		}
+		return result
+	})
 	vm.Set("console", map[string]interface{}{
 		"log": func(call goja.FunctionCall) goja.Value {
 			if serviceLogLevel.Level() > slog.LevelDebug {

@@ -27,7 +27,7 @@
     "httpBodyBytes": "20MB",
     "webSocketMessageBytes": "20MB"
   },
-  "webSocketLimits": {
+  "websocket": {
     "maxConnections": 128
   },
   "BasicAuth": {
