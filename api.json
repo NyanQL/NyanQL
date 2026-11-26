@@ -55,6 +55,9 @@
   "schedule_debug_every_minute": {
     "type": "schedule",
     "script": "./javascript/schedule_debug.js",
+    "runtime": {
+      "timeout": "0s"
+    },
     "trigger": {
       "type": "cron",
       "value": "*/10 * * * *"
